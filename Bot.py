@@ -4,6 +4,24 @@ EVALON MASTER PRO - Telegram Bot
 python-telegram-bot[webhooks]==21.3 + Neon PostgreSQL via psycopg2
 """
 
+# ── FUNGUA PORT MARA MOJA — kabla ya imports zote ─────────────
+# Render inahitaji port ifunguliwe haraka sana (ndani ya sekunde 5)
+import os as _os
+import threading as _threading
+from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _BaseHandler
+
+class _H(_BaseHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"EVALON OK")
+    def log_message(self, *a): pass
+
+_PORT = int(_os.environ.get("PORT", 8080))
+_t = _threading.Thread(target=lambda: _HTTPServer(("0.0.0.0", _PORT), _H).serve_forever(), daemon=True)
+_t.start()
+print("PORT {} open.".format(_PORT), flush=True)
+# ─────────────────────────────────────────────────────────────
+
 import random
 import os
 import uuid
@@ -2357,20 +2375,4 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg="📋 *LICENCES*\n\n📅 Monthly Available: {}\n♾️ Lifetime Available: {}\n\n".format(len(s["m_codes"]),len(s["l_codes"]))
             if s["m_codes"]: msg+="*Monthly:*\n"+"\n".join(["`{}`".format(c) for c in s["m_codes"]])+"\n\n"
             if s["l_codes"]: msg+="*Lifetime:*\n"+"\n".join(["`{}`".format(c) for c in s["l_codes"]])
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-        if text=="/listusers":
-            s=get_stats()
-            await update.message.reply_text("👥 *USERS*\n\n👤 Total: {}\n📅 Monthly: {}\n♾️ Lifetime: {}\n🆓 Free: {}".format(s["total"],s["monthly"],s["lifetime"],s["free"]), parse_mode="Markdown")
-            return
-        if text=="/totalusers":
-            s=get_stats()
-            licensed = s["monthly"] + s["lifetime"]
-            await update.message.reply_text(
-                "👥 *TOTAL USERS*\n\n"
-                "📊 All users: *{}*\n"
-                "✅ Licensed: *{}*\n"
-                "🆓 Free trial: *{}*".format(s["total"], licensed, s["free"]),
-                parse_mode="Markdown"
-            )
-   
+            await update.message.reply_text(msg, par
