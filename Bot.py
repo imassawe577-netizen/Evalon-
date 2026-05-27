@@ -878,15 +878,32 @@ def generate_signal(pair):
     dom = max(b, s); tot = max(b+s, 1)
     strength  = min(500, max(300, 250 + indicators_agree*30 + int((dom/tot)*120) + int(random.uniform(-10,10))))
 
+    # --- Volatility / ranging check ---
+    # bb_pos near 0.5 + small ma_diff + small mom = flat/ranging market
+    is_flat = (
+        0.35 <= bb_pos <= 0.65 and
+        abs(ma_diff) < 0.15 and
+        abs(mom) < 0.2
+    )
+
     # Timeframe: nguvu zaidi (indicators nyingi zinakubaliana) = TF fupi (1 min) — bora zaidi
-    if indicators_agree >= 6:
-        timeframe = 1  # Nguvu sana — 1 min
+    if is_flat:
+        # Market flat — force long timeframe or block weak signals
+        if indicators_agree < 5:
+            # Too weak + flat = no signal
+            record_signal(pair, direction)
+            return {"direction": direction, "pair": pair, "timeframe": 0, "strength": strength, "indicators_agree": indicators_agree, "flat": True}
+        else:
+            # Has some confluence but flat — give longer timeframe
+            timeframe = random.choice([3, 4, 5])
+    elif indicators_agree >= 6:
+        timeframe = 1
     elif indicators_agree >= 5:
-        timeframe = random.choice([1, 1, 2])  # Nguvu — mostly 1 min
+        timeframe = random.choice([1, 1, 2])
     elif indicators_agree >= 4:
-        timeframe = random.choice([1, 2])     # Wastani nguvu — 1 au 2 min
+        timeframe = random.choice([1, 2])
     else:
-        timeframe = random.choice([2, 3])     # Wastani — 2 au 3 min
+        timeframe = random.choice([2, 3])
 
     # Session-aware fractal/contrarian override
     session   = _get_session()
@@ -1424,6 +1441,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
 
+            # Flat market block
+            if sig.get("flat") and timeframe == 0:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="❌ *No good signal available.*\n\nMarket is ranging — no clear direction. Try another pair.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
+
             # Trend validation
             trend_dir = get_trend_direction(pair)
             if trend_dir is not None:
@@ -1581,6 +1612,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
             flip_count = 0
+            # Flat market block
+            if sig.get("flat") and timeframe == 0:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="❌ *No good signal available.*\n\nMarket is ranging — no clear direction. Try another pair.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
             # Override with dominant trend if available
             if trend is not None:
                 direction = trend
