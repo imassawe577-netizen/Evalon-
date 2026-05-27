@@ -2684,24 +2684,16 @@ async def run_bot():
     ptb_app.add_handler(MessageHandler(filters.PHOTO, message_handler))
     ptb_app.add_handler(MessageHandler(filters.TEXT, message_handler))
 
-    # Health check endpoint — inahitajika Render ione bot iko alive
-    async def health(request):
-        return web.Response(text="EVALON MASTER PRO OK")
+    # ── Tumia async polling (inafanya kazi ndani ya asyncio.run) ──
+    print("Starting bot polling...")
+    await ptb_app.initialize()
+    await ptb_app.start()
+    await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot polling active.")
 
-    if RENDER_URL:
-        # ── WEBHOOK MODE ───────────────────────────────────────
-        # Port tayari imefunguliwa na main() — webhook itatumia port ile ile
-        # Tunatumia aiohttp kwenye port tofauti (PORT+1) au tumia polling tu
-        # SULUHISHO: tumia polling + health server ya main() peke yake
-        print("Webhook URL found but using polling to avoid port conflict.")
-        print("Polling mode started.")
-        ptb_app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    else:
-        # ── POLLING MODE ───────────────────────────────────────
-        # Port tayari imefunguliwa na main() health server
-        print("Polling mode started.")
-        ptb_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Keepalive — endelea mpaka interrupted
+    while True:
+        await asyncio.sleep(60)
 
 
 def main():
