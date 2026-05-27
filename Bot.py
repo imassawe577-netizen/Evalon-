@@ -140,7 +140,7 @@ def get_pair_stats_all():
 
 def get_best_pair(otc_only=False):
     """Return the pair with highest win rate (minimum 3 total signals).
-    Also filters out flat/ranging pairs by checking market quality for non-OTC pairs.
+    Also uses MTF to verify pair has clear trend (not flat).
     """
     try:
         with get_conn() as conn:
@@ -155,15 +155,7 @@ def get_best_pair(otc_only=False):
             return None
         # Sort by win rate descending
         rows.sort(key=lambda r: r["wins"] / max(r["wins"] + r["losses"], 1), reverse=True)
-        # For non-OTC pairs, skip flat/ranging markets
-        for row in rows:
-            pair = row["pair"]
-            if "OTC" not in pair and pair in YAHOO_SYMBOLS:
-                real = _fetch_real_indicators(pair)
-                if real and real.get("quality", 1.0) < 0.25:
-                    continue  # Skip flat market pairs
-            return pair
-        return rows[0]["pair"]  # Fallback
+        return rows[0]["pair"]
     except Exception as e:
         logging.warning("get_best_pair failed: {}".format(e))
         return None
@@ -257,6 +249,13 @@ def get_buy_image():
 
 def get_sell_image():
     return get_setting("sell_image", DEFAULT_SELL_IMAGE)
+
+def is_otc_enabled():
+    """Returns True if OTC pairs are enabled (default: True)."""
+    return get_setting("otc_enabled", "1") == "1"
+
+def set_otc_enabled(enabled: bool):
+    set_setting("otc_enabled", "1" if enabled else "0")
 
 # ============================================================
 # DATABASE FUNCTIONS
@@ -601,54 +600,237 @@ YAHOO_SYMBOLS = {
     "SMI 20": "^SSMI", "E35EUR": "^STOXX",
 }
 
+def _calc_indicators_from_df(df):
+    """Calculate all indicators from a OHLCV dataframe. Returns dict or None."""
+    if df is None or len(df) < 30:
+        return None
+    close  = df["Close"].squeeze()
+    high   = df["High"].squeeze()
+    low    = df["Low"].squeeze()
+    volume = df["Volume"].squeeze()
+    # RSI
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, 1e-9)
+    rsi   = float((100 - 100 / (1 + rs)).iloc[-1])
+    # MACD
+    ema12     = close.ewm(span=12).mean()
+    ema26     = close.ewm(span=26).mean()
+    macd_line = ema12 - ema26
+    signal_ln = macd_line.ewm(span=9).mean()
+    macd_hist = float((macd_line - signal_ln).iloc[-1])
+    macd_norm = max(-1.0, min(1.0, macd_hist / (close.iloc[-1] * 0.001 + 1e-9)))
+    # Bollinger Bands
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    u = float((sma20 + 2*std20).iloc[-1]); l = float((sma20 - 2*std20).iloc[-1])
+    bb_pos = max(0.0, min(1.0, (float(close.iloc[-1]) - l) / (u - l + 1e-9)))
+    # MA crossover
+    ma9  = float(close.rolling(9).mean().iloc[-1])
+    ma21 = float(close.rolling(21).mean().iloc[-1])
+    ma_diff = max(-1.0, min(1.0, (ma9 - ma21) / (ma21 + 1e-9) * 100))
+    # Momentum
+    mom = max(-1.0, min(1.0, float(close.iloc[-1] - close.iloc[-11]) / (close.iloc[-11] + 1e-9) * 100))
+    # Stochastic
+    low14  = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    sto = max(0.0, min(100.0, float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])))
+    # Volume ratio
+    vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
+    # RSI divergence (simple: last 5 bars — price up, RSI down = bearish div)
+    rsi_series = (100 - 100 / (1 + gain / loss.replace(0, 1e-9)))
+    price_change = float(close.iloc[-1] - close.iloc[-6])
+    rsi_change   = float(rsi_series.iloc[-1] - rsi_series.iloc[-6])
+    divergence = None
+    if price_change > 0 and rsi_change < -3:
+        divergence = "SELL"   # Bearish divergence
+    elif price_change < 0 and rsi_change > 3:
+        divergence = "BUY"    # Bullish divergence
+
+    # Williams Fractal — angalia candles za hivi karibuni
+    # Bullish fractal: low[i] < low[i-2], low[i-1], low[i+1], low[i+2]
+    # Bearish fractal: high[i] > high[i-2], high[i-1], high[i+1], high[i+2]
+    # Tunachunguza fractal zilizoundwa hivi karibuni (candles 3-10 zilizopita)
+    # Candle za mwisho 2 haziwezi kuwa fractals (zinahitaji 2 candles za kulia)
+    fractal_signal = None
+    fractal_strength = 0  # 0=hakuna, 1=fractal 1, 2=fractal 2+ (nguvu zaidi)
+    high_vals = high.values
+    low_vals  = low.values
+    n = len(high_vals)
+    # Scan candles 3..10 zilizopita (index n-5 hadi n-3, kwa sababu tunahitaji i+2 iwe tayari)
+    recent_bull_fractals = []
+    recent_bear_fractals = []
+    for i in range(n - 4, max(n - 15, 4), -1):
+        # Bearish fractal: high ya kati ni kubwa zaidi ya high 4 zinazoizunguka
+        if (high_vals[i] > high_vals[i-2] and high_vals[i] > high_vals[i-1] and
+                high_vals[i] > high_vals[i+1] and high_vals[i] > high_vals[i+2]):
+            recent_bear_fractals.append(i)
+        # Bullish fractal: low ya kati ni ndogo zaidi ya low 4 zinazozunguka
+        if (low_vals[i] < low_vals[i-2] and low_vals[i] < low_vals[i-1] and
+                low_vals[i] < low_vals[i+1] and low_vals[i] < low_vals[i+2]):
+            recent_bull_fractals.append(i)
+    # Price ya sasa iko juu ya bullish fractal = BUY signal
+    # Price ya sasa iko chini ya bearish fractal = SELL signal
+    current_price_val = float(close.iloc[-1])
+    if recent_bull_fractals:
+        latest_bull = float(low_vals[recent_bull_fractals[0]])
+        if current_price_val > latest_bull:
+            fractal_signal = "BUY"
+            fractal_strength = min(2, len(recent_bull_fractals))
+    if recent_bear_fractals:
+        latest_bear = float(high_vals[recent_bear_fractals[0]])
+        if current_price_val < latest_bear:
+            # Bearish fractal inashinda bullish kama zote mbili zipo
+            fractal_signal = "SELL"
+            fractal_strength = min(2, len(recent_bear_fractals))
+    # Kama zote mbili zipo — chagua iliyo karibu zaidi na price ya sasa
+    if recent_bull_fractals and recent_bear_fractals:
+        bull_dist = abs(current_price_val - float(low_vals[recent_bull_fractals[0]]))
+        bear_dist = abs(current_price_val - float(high_vals[recent_bear_fractals[0]]))
+        if bull_dist < bear_dist:
+            fractal_signal = "BUY"
+            fractal_strength = min(2, len(recent_bull_fractals))
+        else:
+            fractal_signal = "SELL"
+            fractal_strength = min(2, len(recent_bear_fractals))
+
+    # Current price
+    current_price = float(close.iloc[-1])
+    direction_raw = "BUY" if ma_diff > 0 and macd_norm > 0 else ("SELL" if ma_diff < 0 and macd_norm < 0 else None)
+    return {
+        "rsi": rsi, "macd": macd_norm, "bb_pos": bb_pos,
+        "ma_diff": ma_diff, "mom": mom, "sto": sto, "vol": vol,
+        "real": True, "current_price": current_price,
+        "divergence": divergence,
+        "fractal_signal": fractal_signal,
+        "fractal_strength": fractal_strength,
+        "direction": direction_raw,
+        "quality": abs(ma_diff) + abs(mom) + abs(macd_norm)
+    }
+
+# OTC → real pair mapping for 1H trend reference
+OTC_TO_REAL = {
+    "EUR/USD OTC": "EUR/USD", "GBP/USD OTC": "GBP/USD", "USD/JPY OTC": "USD/JPY",
+    "USD/CHF OTC": "USD/CHF", "AUD/USD OTC": "AUD/USD", "USD/CAD OTC": "USD/CAD",
+    "NZD/USD OTC": "NZD/USD", "EUR/GBP OTC": "EUR/GBP", "EUR/JPY OTC": "EUR/JPY",
+    "GBP/JPY OTC": "GBP/JPY", "AUD/JPY OTC": "AUD/JPY", "EUR/AUD OTC": "EUR/AUD",
+    "EUR/CAD OTC": "EUR/CAD", "GBP/AUD OTC": "GBP/AUD", "GBP/CAD OTC": "GBP/CAD",
+    "AUD/CAD OTC": "AUD/CAD", "AUD/CHF OTC": "AUD/CHF", "NZD/JPY OTC": "NZD/JPY",
+    "EUR/CHF OTC": "EUR/CHF", "CHF/JPY OTC": "CHF/JPY", "CAD/JPY OTC": "CAD/JPY",
+    "CAD/CHF OTC": "CAD/CHF", "GBP/CHF OTC": "GBP/CHF",
+    "Gold OTC": "Gold", "Silver OTC": "Silver",
+    "Brent Oil OTC": "Brent Oil", "WTI Crude Oil OTC": "WTI Crude Oil",
+    "Bitcoin ETF OTC": "Bitcoin",
+    "US100 OTC": "US100", "SP500 OTC": "SP500",
+    "Ethereum OTC": "Bitcoin",  # Fallback kwa Ethereum
+    "Dogecoin OTC": "Bitcoin",
+}
+
+def _fetch_1h_trend(pair):
+    """
+    Fetch 1H candle data and determine trend direction.
+    For OTC pairs, uses the mapped real pair.
+    Returns: 'BUY', 'SELL', or None (unclear)
+    """
+    # OTC → real pair mapping
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return None
+    try:
+        df = yf.download(symbol, period="5d", interval="1h", progress=False, auto_adjust=True)
+        if df is None or len(df) < 20:
+            return None
+        close = df["Close"].squeeze()
+        # EMA 9 vs EMA 21 on 1H
+        ema9  = float(close.ewm(span=9).mean().iloc[-1])
+        ema21 = float(close.ewm(span=21).mean().iloc[-1])
+        # MACD on 1H
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd_hist = float(((ema12 - ema26) - (ema12 - ema26).ewm(span=9).mean()).iloc[-1])
+        # RSI on 1H
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi_1h = float((100 - 100 / (1 + gain / loss.replace(0, 1e-9))).iloc[-1])
+        # Consensus: angalia EMA cross + MACD direction + RSI zone
+        buy_votes = sell_votes = 0
+        if ema9 > ema21:   buy_votes  += 1
+        else:              sell_votes += 1
+        if macd_hist > 0:  buy_votes  += 1
+        else:              sell_votes += 1
+        if rsi_1h > 55:    buy_votes  += 1
+        elif rsi_1h < 45:  sell_votes += 1
+        if buy_votes >= 2:
+            return "BUY"
+        elif sell_votes >= 2:
+            return "SELL"
+        return None  # Mixed — hakuna mwelekeo wazi
+    except Exception as e:
+        logging.warning("_fetch_1h_trend failed for {}: {}".format(pair, e))
+        return None
+
+# Multi-timeframe intervals for Yahoo Finance
+MTF_INTERVALS = [
+    ("1m",  "1d"),   # 1 minute
+    ("5m",  "2d"),   # 5 minutes
+    ("15m", "5d"),   # 15 minutes
+    ("30m", "5d"),   # 30 minutes
+    ("1h",  "5d"),   # 1 hour
+]
+
+def _fetch_mtf_score(pair):
+    """
+    Fetch indicators across 5 timeframes (1m, 5m, 15m, 30m, 1h).
+    Returns: (buy_tfs, sell_tfs, total_tfs, tf_details)
+    For OTC pairs, uses mapped real pair.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return None
+    buy_tfs = sell_tfs = 0
+    tf_details = {}
+    for interval, period in MTF_INTERVALS:
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            ind = _calc_indicators_from_df(df)
+            if ind is None:
+                continue
+            # Count buy/sell votes per timeframe
+            b = s = 0
+            if ind["rsi"] < 45:    b += 1
+            elif ind["rsi"] > 55:  s += 1
+            if ind["ma_diff"] > 0: b += 1
+            elif ind["ma_diff"] < 0: s += 1
+            if ind["macd"] > 0:    b += 1
+            elif ind["macd"] < 0:  s += 1
+            if ind["bb_pos"] < 0.5: b += 1
+            else:                   s += 1
+            if ind["mom"] > 0:     b += 1
+            elif ind["mom"] < 0:   s += 1
+            tf_dir = "BUY" if b > s else "SELL"
+            tf_details[interval] = tf_dir
+            if tf_dir == "BUY":   buy_tfs  += 1
+            else:                  sell_tfs += 1
+        except Exception as e:
+            logging.warning("MTF {} failed for {}: {}".format(interval, pair, e))
+            continue
+    total = buy_tfs + sell_tfs
+    return {"buy_tfs": buy_tfs, "sell_tfs": sell_tfs, "total": total, "details": tf_details}
+
 def _fetch_real_indicators(pair):
-    """Fetch real OHLCV from Yahoo Finance and calculate indicators."""
+    """Fetch real OHLCV from Yahoo Finance and calculate indicators (5m timeframe)."""
     symbol = YAHOO_SYMBOLS.get(pair)
     if not symbol:
         return None
     try:
         df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
-        if df is None or len(df) < 30:
-            return None
-        close  = df["Close"].squeeze()
-        high   = df["High"].squeeze()
-        low    = df["Low"].squeeze()
-        volume = df["Volume"].squeeze()
-        # RSI
-        delta = close.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rs    = gain / loss.replace(0, 1e-9)
-        rsi   = float((100 - 100 / (1 + rs)).iloc[-1])
-        # MACD
-        ema12 = close.ewm(span=12).mean()
-        ema26 = close.ewm(span=26).mean()
-        macd_hist = float(((ema12 - ema26) - (ema12 - ema26).ewm(span=9).mean()).iloc[-1])
-        macd_norm = max(-1.0, min(1.0, macd_hist / (close.iloc[-1] * 0.001 + 1e-9)))
-        # Bollinger Bands
-        sma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        u = float((sma20 + 2*std20).iloc[-1]); l = float((sma20 - 2*std20).iloc[-1])
-        bb_pos = max(0.0, min(1.0, (float(close.iloc[-1]) - l) / (u - l + 1e-9)))
-        # MA crossover
-        ma9  = float(close.rolling(9).mean().iloc[-1])
-        ma21 = float(close.rolling(21).mean().iloc[-1])
-        ma_diff = max(-1.0, min(1.0, (ma9 - ma21) / (ma21 + 1e-9) * 100))
-        # Momentum
-        mom = max(-1.0, min(1.0, float(close.iloc[-1] - close.iloc[-11]) / (close.iloc[-11] + 1e-9) * 100))
-        # Stochastic
-        low14  = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        sto = max(0.0, min(100.0, float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])))
-        # Volume
-        vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
-        # Current price
-        current_price = float(close.iloc[-1])
-        return {"rsi": rsi, "macd": macd_norm, "bb_pos": bb_pos,
-                "ma_diff": ma_diff, "mom": mom, "sto": sto, "vol": vol,
-                "real": True, "current_price": current_price,
-                # Market quality score — higher = clearer trend
-                "quality": abs(ma_diff) + abs(mom) + abs(macd_norm)}
+        result = _calc_indicators_from_df(df)
+        return result
     except Exception as e:
         logging.warning("Yahoo Finance fetch failed for {}: {}".format(pair, e))
         return None
@@ -964,7 +1146,7 @@ def check_signal_request(user_id, pair):
         return {"action": "block"}
 
 # ============================================================
-# SIGNAL ALGORITHM — Enhanced
+# SIGNAL ALGORITHM — Multi-Timeframe + 1H Trend Filter
 # ============================================================
 def generate_signal(pair):
     is_otc = "OTC" in pair
@@ -972,8 +1154,16 @@ def generate_signal(pair):
     if not is_otc:
         real = _fetch_real_indicators(pair)
 
+    # ── 1H TREND FILTER ──────────────────────────────────────
+    # Pata mwelekeo mkuu wa saa 1 (OTC inatumia real pair yake)
+    trend_1h = _fetch_1h_trend(pair)
+
+    # ── MULTI-TIMEFRAME SCORE ─────────────────────────────────
+    # Kwa non-OTC NA OTC (OTC inatumia mapped real pair)
+    mtf = _fetch_mtf_score(pair)
+
     if real:
-        # Real data from Yahoo Finance
+        # ── NON-OTC: Real indicators kutoka Yahoo Finance (5m) ──
         rsi     = real["rsi"]
         sto     = real["sto"]
         ma_diff = real["ma_diff"]
@@ -982,15 +1172,8 @@ def generate_signal(pair):
         mom     = real["mom"]
         vol     = real["vol"]
         candle  = random.choices([-1, -0.5, 0, 0.5, 1], weights=[10, 15, 50, 15, 10])[0]
-        # Non-OTC: block signal if market quality is too low (ranging/choppy)
-        # quality = abs(ma_diff) + abs(mom) + abs(macd) — higher = clearer trend
-        market_quality = real.get("quality", 1.0)
-        if market_quality < 0.25:
-            # Market is ranging — return flat signal immediately
-            return {"direction": "BUY", "pair": pair, "timeframe": 0, "strength": 300,
-                    "indicators_agree": 0, "flat": True, "reason": "ranging_nonOTC"}
     else:
-        # Smart OTC indicators — session-aware
+        # ── OTC: Smart synthetic indicators (session-aware) ────
         sess  = _get_session()
         ptype = _pair_type(pair)
         if sess["name"] in ("London Open", "NY/London"):
@@ -999,6 +1182,13 @@ def generate_signal(pair):
             rsi_w = [10, 20, 40, 20, 10]
         else:
             rsi_w = [15, 20, 30, 20, 15]
+
+        # Kama 1H trend inaonekana wazi, biased synthetic data iendane nayo
+        if trend_1h == "BUY":
+            rsi_w = [25, 20, 25, 18, 12]  # Zaidi oversold/neutral_low (BUY setup)
+        elif trend_1h == "SELL":
+            rsi_w = [12, 18, 25, 20, 25]  # Zaidi overbought (SELL setup)
+
         rsi_zone = random.choices(
             ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
         rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
@@ -1011,13 +1201,16 @@ def generate_signal(pair):
             ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
         else:
             ma_diff = random.uniform(-0.4, 0.4)
+        # Kama 1H trend ipo, push ma_diff upande wake
+        if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
+        if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
         macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
         bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
         mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
         vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
         candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
 
-    # --- Scoring ---
+    # ── BASE SCORING ─────────────────────────────────────────
     b = s = 0
     if rsi < 25:    b += 25
     elif rsi < 35:  b += 15
@@ -1050,6 +1243,40 @@ def generate_signal(pair):
     if vol > 0.75:
         if b > s: b += 8
         else:     s += 8
+
+    # ── RSI DIVERGENCE BONUS ─────────────────────────────────
+    # Real pair inajua divergence — ipa nguvu zaidi
+    if real and real.get("divergence"):
+        div = real["divergence"]
+        if div == "BUY":  b += 20
+        elif div == "SELL": s += 20
+
+    # ── WILLIAMS FRACTAL BONUS ───────────────────────────────
+    # Real pair: fractal kutoka Yahoo Finance data
+    # OTC pair: fractal ya synthetic (approximate, kulingana na bb_pos + mom)
+    fractal_sig = None
+    fractal_str = 0
+    if real and real.get("fractal_signal"):
+        fractal_sig = real["fractal_signal"]
+        fractal_str = real.get("fractal_strength", 1)
+    else:
+        # OTC: approximate fractal kulingana na Bollinger Band position
+        # bb_pos chini sana = karibu na lower band = bullish fractal zone
+        # bb_pos juu sana  = karibu na upper band = bearish fractal zone
+        if bb_pos < 0.15:
+            fractal_sig = "BUY";  fractal_str = 1
+        elif bb_pos < 0.08:
+            fractal_sig = "BUY";  fractal_str = 2
+        elif bb_pos > 0.85:
+            fractal_sig = "SELL"; fractal_str = 1
+        elif bb_pos > 0.92:
+            fractal_sig = "SELL"; fractal_str = 2
+    if fractal_sig == "BUY":
+        b += 15 * fractal_str   # fractal_str=1 → +15, fractal_str=2 → +30
+    elif fractal_sig == "SELL":
+        s += 15 * fractal_str
+
+    # ── SESSION BIAS ─────────────────────────────────────────
     sb, ss = _session_bias()
     b += sb; s += ss
     ptype = _pair_type(pair)
@@ -1064,7 +1291,20 @@ def generate_signal(pair):
         if ma_diff > 0.2: b += 5
         elif ma_diff < -0.2: s += 5
 
-    # Confluence — ALL indicators must agree for signal to be strong
+    # ── 1H TREND FILTER BONUS ────────────────────────────────
+    # Signal inayoendana na 1H trend inapata bonus kubwa
+    if trend_1h == "BUY":   b += 25
+    elif trend_1h == "SELL": s += 25
+
+    # ── MULTI-TIMEFRAME BONUS ────────────────────────────────
+    # Kila timeframe inayokubaliana inaongeza uzito
+    if mtf and mtf["total"] >= 3:
+        if mtf["buy_tfs"] > mtf["sell_tfs"]:
+            b += mtf["buy_tfs"] * 8   # e.g. 4/5 TFs = +32
+        elif mtf["sell_tfs"] > mtf["buy_tfs"]:
+            s += mtf["sell_tfs"] * 8
+
+    # ── DIRECTION & CONFLUENCE ───────────────────────────────
     direction = "BUY" if b >= s else "SELL"
     indicators_agree = 0
     checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
@@ -1073,10 +1313,25 @@ def generate_signal(pair):
         if direction == "BUY" and buy_c:   indicators_agree += 1
         if direction == "SELL" and sell_c: indicators_agree += 1
 
-    # Minimum confluence threshold — signal lazima iwe na nguvu
-    # Kama indicators chini ya 4 hazikubaliani, flip direction na retry mara moja
+    # ── MTF CONFLUENCE COUNT ─────────────────────────────────
+    # Ongeza MTF agreement kwenye indicators_agree
+    if mtf and mtf["total"] >= 3:
+        if direction == "BUY"  and mtf["buy_tfs"]  > mtf["sell_tfs"]: indicators_agree += mtf["buy_tfs"]
+        if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
+    # 1H trend inaongeza pia
+    if trend_1h == direction:
+        indicators_agree += 2
+
+    # ── CONFLICT CHECK: MTF vs 1H ────────────────────────────
+    # Kama 1H trend inapingana na MTF majority — piga kura tena
+    if mtf and trend_1h and mtf["total"] >= 3:
+        mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
+        if mtf_dir != trend_1h:
+            # Conflict — toa signal direction yenye nguvu zaidi (b vs s)
+            direction = "BUY" if b > s else "SELL"
+
+    # ── MINIMUM CONFLUENCE ───────────────────────────────────
     if indicators_agree < 4:
-        # Try opposite direction
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
         for buy_c, sell_c in checks:
@@ -1085,75 +1340,65 @@ def generate_signal(pair):
         if alt_agree > indicators_agree:
             direction = alt_dir
             indicators_agree = alt_agree
-        # If still weak, force recalculate with stronger bias
         if indicators_agree < 4:
-            # Boost score of leading side significantly
-            if b > s:
-                direction = "BUY"
-            else:
-                direction = "SELL"
-            # Recount
+            direction = "BUY" if b > s else "SELL"
             indicators_agree = 0
             for buy_c, sell_c in checks:
                 if direction == "BUY" and buy_c:   indicators_agree += 1
                 if direction == "SELL" and sell_c: indicators_agree += 1
 
+    # ── STRENGTH CALCULATION ─────────────────────────────────
     dom = max(b, s); tot = max(b+s, 1)
-    strength  = min(500, max(300, 250 + indicators_agree*30 + int((dom/tot)*120) + int(random.uniform(-10,10))))
+    # MTF bonus kwenye strength
+    mtf_bonus = 0
+    if mtf and mtf["total"] >= 3:
+        agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
+        mtf_bonus = int((agreeing / mtf["total"]) * 40)
+    # 1H bonus kwenye strength
+    trend_bonus = 15 if trend_1h == direction else 0
+    strength = min(500, max(300, 250 + indicators_agree*25 + int((dom/tot)*100) + mtf_bonus + trend_bonus + int(random.uniform(-5,5))))
 
-    # --- Volatility / ranging check ---
-    # bb_pos near 0.5 + small ma_diff + small mom = flat/ranging market
-    # For OTC pairs, use stricter check since we don't have real quality score
-    if real:
-        is_flat = real.get("quality", 1.0) < 0.30
-    else:
-        is_flat = (
-            0.35 <= bb_pos <= 0.65 and
-            abs(ma_diff) < 0.15 and
-            abs(mom) < 0.2
-        )
-
-    # Timeframe: nguvu zaidi (indicators nyingi zinakubaliana) = TF fupi (1 min) — bora zaidi
-    if is_flat:
-        # Market flat — force long timeframe or block weak signals
-        if indicators_agree < 5:
-            # Too weak + flat = no signal
-            record_signal(pair, direction)
-            return {"direction": direction, "pair": pair, "timeframe": 0, "strength": strength, "indicators_agree": indicators_agree, "flat": True}
-        else:
-            # Has some confluence but flat — give longer timeframe
-            timeframe = random.choice([3, 4, 5])
-    elif indicators_agree >= 6:
+    # ── TIMEFRAME: nguvu zaidi = timeframe fupi ──────────────
+    if indicators_agree >= 11:    # 7 base + 5 MTF / 1H
         timeframe = 1
-    elif indicators_agree >= 5:
+    elif indicators_agree >= 9:
         timeframe = random.choice([1, 1, 2])
-    elif indicators_agree >= 4:
+    elif indicators_agree >= 7:
         timeframe = random.choice([1, 2])
+    elif indicators_agree >= 5:
+        timeframe = random.choice([1, 2, 3])
     else:
         timeframe = random.choice([2, 3])
 
-    # Session-aware fractal/contrarian override
-    session   = _get_session()
-    bias      = get_signal_bias(pair, window=10, threshold=session["threshold"])
+    # ── SESSION-AWARE CONTRARIAN OVERRIDE ────────────────────
+    session = _get_session()
+    bias    = get_signal_bias(pair, window=10, threshold=session["threshold"])
     if bias is not None:
         if is_otc:
             direction = ("SELL" if bias=="BUY" else "BUY") if session["otc"]=="contrarian" else bias
         else:
             direction = bias
 
-    # AUTO-REVERSE: kama pair iko kwenye reverse list, geuza direction
+    # ── AUTO-REVERSE ─────────────────────────────────────────
     if is_reverse_pair(pair):
         direction = "SELL" if direction == "BUY" else "BUY"
 
-    # AUTO-MANAGE: baada ya kutoa signal, angalia reverse pairs zote
-    # Inafanya kazi background — ikifail haisimamishi signal
+    # ── AUTO-MANAGE REVERSE PAIRS ────────────────────────────
     try:
         auto_manage_reverse_pairs()
     except Exception:
         pass
 
     record_signal(pair, direction)
-    return {"direction": direction, "pair": pair, "timeframe": timeframe, "strength": strength, "indicators_agree": indicators_agree}
+    return {
+        "direction": direction,
+        "pair": pair,
+        "timeframe": timeframe,
+        "strength": strength,
+        "indicators_agree": indicators_agree,
+        "trend_1h": trend_1h,
+        "mtf": mtf,
+    }
 
 # ============================================================
 # PAIR INDEX
@@ -1176,9 +1421,13 @@ def is_weekend():
 def pairs_keyboard():
     rows=[]; row=[]
     weekend = is_weekend()
+    otc_on  = is_otc_enabled()
     for i, pair in enumerate(ALL_PAIRS):
         # Weekend: ficha non-OTC pairs kabisa
         if weekend and "OTC" not in pair:
+            continue
+        # Admin amezima OTC: onyesha non-OTC tu
+        if not otc_on and "OTC" in pair:
             continue
         row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
         if len(row)==3: rows.append(row); row=[]
@@ -1385,14 +1634,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/addlifetime` — Generate 1 lifetime code\n"
             "`/addlifetime 5` — Generate 5 lifetime codes\n"
             "`/listlicences` — View all codes (used/unused)\n"
+            "`/revoke 123456` — Remove user licence\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "👥 *USER MANAGEMENT*\n"
             "`/listusers` — View all users & stats\n"
             "`/totalusers` — Quick user count\n"
             "`/stats` — Detailed statistics\n"
             "`/userinfo 123456` — Full details of a user\n"
-            "`/addtrial 123456 5` — Give user extra signals\n"
-            "`/revoke 123456` — Remove user licence\n"
+            "`/addtrial 123456 5` — Give user extra free signals\n"
             "`/deleteuser 123456` — Delete user permanently\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🚫 *BLACKLIST*\n"
@@ -1401,7 +1650,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/listblacklist` — View all banned users\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📢 *BROADCAST*\n"
-            "`/broadcast Your message` — Send to all users\n"
+            "`/broadcast message` — Send to all users\n"
             "_Markdown inafanya kazi: *bold*, _italic_, `code`_\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🖼 *IMAGES*\n"
@@ -1411,10 +1660,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/dbcheck` — Check database status\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 *PAIR STATS & REVERSE*\n"
-            "`/pairstats` — Win/loss stats ya pairs\n"
-            "`/addreverse PAIR` — Weka pair reverse (bot inatoa kinyume)\n"
-            "`/removereverse PAIR` — Ondoa reverse\n"
-            "`/listreverse` — Orodha ya reverse pairs\n"
+            "`/pairstats` — Win/loss stats ya pairs zote\n"
+            "`/addreverse PAIR` — Pair itoe direction kinyume\n"
+            "`/removereverse PAIR` — Ondoa reverse ya pair\n"
+            "`/listreverse` — Orodha ya reverse pairs zote\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔀 *OTC CONTROL*\n"
+            "`/toggleotc` — Zima au washa OTC pairs\n"
+            "• OTC OFF → watumie non-OTC pairs tu\n"
+            "• OTC ON  → pairs zote zinaonekana (default)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "`/help` — This menu",
             parse_mode="Markdown",
@@ -1584,20 +1838,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data=="bot_pick_pair":
         # Bot inachagua pair yenye history nzuri ya win na soko si flat
         weekend = is_weekend()
-        best = get_best_pair(otc_only=weekend)
-        if not best:
-            # Hakuna history ya kutosha — chagua random kutoka OTC pairs kwa kuchunguza signal
-            # Jaribu pairs kadhaa na uangalie ni ipi ina mwelekeo wazi
-            otc_pairs = [p for p in ALL_PAIRS if "OTC" in p]
-            random.shuffle(otc_pairs)
+        otc_on  = is_otc_enabled()
+        # Kama OTC zimezimwa AU weekend: otc_only=False, tafuta non-OTC bora
+        force_non_otc = not otc_on
+        best = get_best_pair(otc_only=(weekend and not force_non_otc))
+        # Kama OTC zimezimwa, hakikisha pair iliyochaguliwa si OTC
+        if best and force_non_otc and "OTC" in best:
             best = None
-            for candidate in otc_pairs[:10]:  # Jaribu top 10 random
+        if not best:
+            if force_non_otc:
+                candidate_pool = [p for p in ALL_PAIRS if "OTC" not in p]
+            elif weekend:
+                candidate_pool = [p for p in ALL_PAIRS if "OTC" in p]
+            else:
+                candidate_pool = list(ALL_PAIRS)
+            random.shuffle(candidate_pool)
+            best = None
+            for candidate in candidate_pool[:10]:  # Jaribu top 10 random
                 sig_test = generate_signal(candidate)
-                if not sig_test.get("flat") and sig_test.get("indicators_agree", 0) >= 4:
+                if sig_test.get("indicators_agree", 0) >= 5:
                     best = candidate
                     break
             if not best:
-                best = otc_pairs[0] if otc_pairs else ALL_PAIRS[0]
+                best = candidate_pool[0] if candidate_pool else ALL_PAIRS[0]
         # Get stats for display
         try:
             with get_conn() as conn:
@@ -2110,247 +2373,4 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🆓 Free trial: *{}*".format(s["total"], licensed, s["free"]),
                 parse_mode="Markdown"
             )
-            return
-        if text=="/setimage":
-            await update.message.reply_text(
-                "🖼 *Set Signal Images*\n\nChoose which image to update:",
-                parse_mode="Markdown",
-                reply_markup=admin_image_keyboard()
-            )
-            return
-        if text=="/stats":
-            s=get_stats()
-            m_unused=len(s["m_codes"]); l_unused=len(s["l_codes"])
-            await update.message.reply_text(
-                "📊 *EVALON MASTER PRO — STATS*\n\n"
-                "👤 Total Users: {}\n"
-                "📅 Monthly Licensed: {}\n"
-                "♾️ Lifetime Licensed: {}\n"
-                "🆓 Free (trial): {}\n\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "🔑 *LICENCES UNUSED*\n"
-                "📅 Monthly: {}\n"
-                "♾️ Lifetime: {}".format(
-                    s["total"], s["monthly"], s["lifetime"], s["free"],
-                    m_unused, l_unused
-                ),
-                parse_mode="Markdown"
-            )
-            return
-        if text.startswith("/revoke "):
-            try:
-                target_id = int(text.split()[1])
-                u = get_user(target_id)
-                if not u:
-                    await update.message.reply_text("❌ User {} not found.".format(target_id))
-                    return
-                revoke_licence(target_id)
-                await update.message.reply_text(
-                    "✅ *Licence revoked!*\n\nUser ID: `{}`\nUser is back on free trial.".format(target_id),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/revoke 123456789`", parse_mode="Markdown")
-            return
-        if text.startswith("/deleteuser "):
-            try:
-                target_id = int(text.split()[1])
-                delete_user(target_id)
-                await update.message.reply_text(
-                    "🗑 *User deleted!*\n\nUser ID: `{}` has been permanently removed.".format(target_id),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/deleteuser 123456789`", parse_mode="Markdown")
-            return
-        if text.startswith("/broadcast "):
-            msg = text[len("/broadcast "):].strip()
-            if not msg:
-                await update.message.reply_text(
-                    "❌ Please type a message after /broadcast\n\nExample:\n`/broadcast Hello everyone! 🎉`",
-                    parse_mode="Markdown"
-                )
-                return
-            user_ids = get_all_user_ids()
-            sent = 0; failed = 0
-            broadcast_text = "📢 *EVALON MASTER PRO*\n\n" + msg
-            for uid in user_ids:
-                try:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=broadcast_text,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                    sent += 1
-                    await asyncio.sleep(0.05)  # Avoid Telegram flood limits
-                except Exception:
-                    failed += 1
-            await update.message.reply_text(
-                "📢 *Broadcast Complete!*\n\n"
-                "✅ Sent: *{}*\n"
-                "❌ Failed: *{}*\n"
-                "👥 Total: *{}*".format(sent, failed, sent + failed),
-                parse_mode="Markdown"
-            )
-            return
-        if text.startswith("/blacklist "):
-            try:
-                target_id = int(text.split()[1])
-                reason = " ".join(text.split()[2:]) if len(text.split()) > 2 else "No reason given"
-                blacklist_user(target_id, reason)
-                await update.message.reply_text(
-                    "🚫 *User banned!*\n\nID: `{}`\nReason: {}".format(target_id, reason),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/blacklist 123456789 reason`", parse_mode="Markdown")
-            return
-        if text.startswith("/unblacklist "):
-            try:
-                target_id = int(text.split()[1])
-                unblacklist_user(target_id)
-                await update.message.reply_text(
-                    "✅ *User unbanned!*\n\nID: `{}`".format(target_id),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/unblacklist 123456789`", parse_mode="Markdown")
-            return
-        if text == "/listblacklist":
-            bl = get_blacklist()
-            if not bl:
-                await update.message.reply_text("✅ No banned users.")
-                return
-            msg = "🚫 *BLACKLIST*\n\n"
-            for b in bl:
-                msg += "• `{}` — {}\n".format(b["user_id"], b.get("reason",""))
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-        if text.startswith("/userinfo "):
-            try:
-                target_id = int(text.split()[1])
-                u = get_user(target_id)
-                if not u:
-                    await update.message.reply_text("❌ User not found.")
-                    return
-                refs = count_referrals(target_id)
-                bonus = get_bonus_signals(target_id)
-                bl = is_blacklisted(target_id)
-                lic = "✅ {}".format(u.get("licence_type","").capitalize()) if u.get("licensed") else "❌ None"
-                exp = get_expiry_text(target_id) if u.get("licensed") else "—"
-                await update.message.reply_text(
-                    "👤 *USER INFO*\n\n"
-                    "🆔 ID: `{}`\n"
-                    "🔑 Licence: {}\n"
-                    "⏳ Expiry: {}\n"
-                    "🆓 Free used: {}/{}\n"
-                    "👥 Referrals: {}\n"
-                    "🎁 Bonus signals: {}\n"
-                    "🚫 Blacklisted: {}".format(
-                        target_id, lic, exp,
-                        u.get("free_used",0), total_free_allowed(target_id),
-                        refs, bonus, "Yes" if bl else "No"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/userinfo 123456789`", parse_mode="Markdown")
-            return
-        if text.startswith("/addtrial "):
-            parts = text.split()
-            try:
-                target_id = int(parts[1])
-                extra = int(parts[2])
-                u = get_user(target_id)
-                if not u:
-                    await update.message.reply_text("❌ User not found.")
-                    return
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE users SET bonus_signals = bonus_signals + %s WHERE user_id = %s",
-                            (extra, target_id)
-                        )
-                    conn.commit()
-                await update.message.reply_text(
-                    "✅ *Trial updated!*\n\nUser `{}` received {} extra signals.".format(target_id, extra),
-                    parse_mode="Markdown"
-                )
-            except (IndexError, ValueError):
-                await update.message.reply_text("❌ Usage: `/addtrial 123456789 5`", parse_mode="Markdown")
-            return
-
-        if text == "/pairstats":
-            stats = get_pair_stats_all()
-            if not stats:
-                await update.message.reply_text("📊 *PAIR STATS*\n\nHakuna data bado.", parse_mode="Markdown")
-                return
-            msg = "📊 *PAIR WIN/LOSS STATS*\n\n"
-            for r in stats[:30]:  # Onyesha top 30
-                total = r["wins"] + r["losses"]
-                rate  = int(r["wins"] / max(total, 1) * 100)
-                bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
-                msg  += "{} *{}*\n  ✅ {} wins | ❌ {} losses | {}%\n\n".format(
-                    bar, r["pair"], r["wins"], r["losses"], rate)
-            await update.message.reply_text(msg[:4000], parse_mode="Markdown")
-            return
-        if text.startswith("/addreverse "):
-            pair_name = text[len("/addreverse "):].strip().upper()
-            add_reverse_pair(pair_name)
-            await update.message.reply_text(
-                "🔄 *Reverse pair added:*\n`{}`\n\nBot itatoa direction kinyume cha signal.".format(pair_name),
-                parse_mode="Markdown"
-            )
-            return
-        if text.startswith("/removereverse "):
-            pair_name = text[len("/removereverse "):].strip().upper()
-            remove_reverse_pair(pair_name)
-            await update.message.reply_text(
-                "✅ *Reverse pair removed:*\n`{}`".format(pair_name),
-                parse_mode="Markdown"
-            )
-            return
-        if text == "/listreverse":
-            pairs_list = get_all_reverse_pairs()
-            if not pairs_list:
-                await update.message.reply_text("🔄 *REVERSE PAIRS*\n\nHakuna pairs za reverse.", parse_mode="Markdown")
-            else:
-                msg = "🔄 *REVERSE PAIRS* (bot inatoa kinyume):\n\n"
-                for p in pairs_list:
-                    msg += "• `{}`\n".format(p)
-                await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-
-    # /refer command — user yeyote
-    if update.message.text and update.message.text.strip() == "/refer":
-        user_id2 = update.effective_user.id
-        refs = count_referrals(user_id2)
-        bonus = get_bonus_signals(user_id2)
-        bot_username = (await context.bot.get_me()).username
-        ref_link = "https://t.me/{}?start=REF_{}".format(bot_username, user_id2)
-        if refs >= 5:
-            status = "🎁 You have 3 bonus signals (5+ referrals)"
-        elif refs >= 3:
-            status = "🎁 You have 2 bonus signals (3-4 referrals)"
-        else:
-            needed = 3 - refs
-            status = "⏳ Invite {} more people to get bonus!".format(needed)
-        await update.message.reply_text(
-            "👥 *YOUR REFERRAL*\n\n"
-            "🔗 Your link:\n`{}`\n\n"
-            "👤 People you invited: *{}*\n"
-            "{}\n\n"
-            "_Share your link — invite 3+ people and get free bonus signals!_".format(ref_link, refs, status),
-            parse_mode="Markdown"
-        )
-        return
-
-    if context.user_data.get("awaiting_code"):
-        context.user_data["awaiting_code"]=False
-        code=text.upper().strip()
-        if activate_licence(code,user_id):
-            u=get_user(user_id); exp=get_expiry_text(user_id)
-            tl="📅 Monthly" if u.get("licence_type")=="monthly" else "♾️ Lifetime"
-            await update.message.reply_text(
-                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON MASTER PRO!\n🏆 Win Rate: 9
+   
