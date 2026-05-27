@@ -139,7 +139,9 @@ def get_pair_stats_all():
         return []
 
 def get_best_pair(otc_only=False):
-    """Return the pair with highest win rate (minimum 3 total signals)."""
+    """Return the pair with highest win rate (minimum 3 total signals).
+    Also filters out flat/ranging pairs by checking market quality for non-OTC pairs.
+    """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -153,10 +155,44 @@ def get_best_pair(otc_only=False):
             return None
         # Sort by win rate descending
         rows.sort(key=lambda r: r["wins"] / max(r["wins"] + r["losses"], 1), reverse=True)
-        return rows[0]["pair"]
+        # For non-OTC pairs, skip flat/ranging markets
+        for row in rows:
+            pair = row["pair"]
+            if "OTC" not in pair and pair in YAHOO_SYMBOLS:
+                real = _fetch_real_indicators(pair)
+                if real and real.get("quality", 1.0) < 0.25:
+                    continue  # Skip flat market pairs
+            return pair
+        return rows[0]["pair"]  # Fallback
     except Exception as e:
         logging.warning("get_best_pair failed: {}".format(e))
         return None
+
+def auto_manage_reverse_pairs():
+    """
+    Bot ijiangalie yenyewe:
+    - Pair yenye win rate chini ya 40% (minimum 5 signals) → iongeze kwenye reverse_pairs
+    - Pair yenye win rate juu ya 60% (minimum 5 signals) → iondoe kutoka reverse_pairs (hata kama ilikuwepo)
+    Called automatically ndani ya generate_signal flow.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pair, wins, losses FROM pair_stats WHERE (wins + losses) >= 5")
+                rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            pair = row["pair"]
+            total = row["wins"] + row["losses"]
+            win_rate = row["wins"] / max(total, 1)
+            if win_rate < 0.40:
+                # Pair inafail sana — weka reverse
+                add_reverse_pair(pair)
+                logging.info("AUTO-REVERSE: Added {} (win rate {:.0%})".format(pair, win_rate))
+            elif win_rate > 0.60:
+                # Pair inafanya vizuri — ondoa reverse kama ipo
+                remove_reverse_pair(pair)
+    except Exception as e:
+        logging.warning("auto_manage_reverse_pairs failed: {}".format(e))
 
 # ============================================================
 # REVERSE PAIRS — bot anatoa kinyume cha direction
@@ -1067,11 +1103,15 @@ def generate_signal(pair):
 
     # --- Volatility / ranging check ---
     # bb_pos near 0.5 + small ma_diff + small mom = flat/ranging market
-    is_flat = (
-        0.35 <= bb_pos <= 0.65 and
-        abs(ma_diff) < 0.15 and
-        abs(mom) < 0.2
-    )
+    # For OTC pairs, use stricter check since we don't have real quality score
+    if real:
+        is_flat = real.get("quality", 1.0) < 0.30
+    else:
+        is_flat = (
+            0.35 <= bb_pos <= 0.65 and
+            abs(ma_diff) < 0.15 and
+            abs(mom) < 0.2
+        )
 
     # Timeframe: nguvu zaidi (indicators nyingi zinakubaliana) = TF fupi (1 min) — bora zaidi
     if is_flat:
@@ -1100,6 +1140,17 @@ def generate_signal(pair):
             direction = ("SELL" if bias=="BUY" else "BUY") if session["otc"]=="contrarian" else bias
         else:
             direction = bias
+
+    # AUTO-REVERSE: kama pair iko kwenye reverse list, geuza direction
+    if is_reverse_pair(pair):
+        direction = "SELL" if direction == "BUY" else "BUY"
+
+    # AUTO-MANAGE: baada ya kutoa signal, angalia reverse pairs zote
+    # Inafanya kazi background — ikifail haisimamishi signal
+    try:
+        auto_manage_reverse_pairs()
+    except Exception:
+        pass
 
     record_signal(pair, direction)
     return {"direction": direction, "pair": pair, "timeframe": timeframe, "strength": strength, "indicators_agree": indicators_agree}
@@ -1356,16 +1407,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🖼 *IMAGES*\n"
             "`/setimage` — Change BUY/SELL signal images\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "📊 *PAIR TRACKING*\n"
-            "`/pairstats` — Win/loss stats za kila pair\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "🔄 *REVERSE PAIRS* _(toa kinyume)_\n"
-            "`/reversepair EUR/USD OTC` — Weka pair kama reverse\n"
-            "`/unreversepair EUR/USD OTC` — Futa reverse\n"
-            "`/listreverse` — Orodha ya reverse pairs\n"
-            "━━━━━━━━━━━━━━━━━━\n"
             "🗄 *DATABASE*\n"
             "`/dbcheck` — Check database status\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📊 *PAIR STATS & REVERSE*\n"
+            "`/pairstats` — Win/loss stats ya pairs\n"
+            "`/addreverse PAIR` — Weka pair reverse (bot inatoa kinyume)\n"
+            "`/removereverse PAIR` — Ondoa reverse\n"
+            "`/listreverse` — Orodha ya reverse pairs\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "`/help` — This menu",
             parse_mode="Markdown",
@@ -1533,13 +1582,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data=="bot_pick_pair":
-        # Bot inachagua pair yenye history nzuri ya win
+        # Bot inachagua pair yenye history nzuri ya win na soko si flat
         weekend = is_weekend()
         best = get_best_pair(otc_only=weekend)
         if not best:
-            # Hakuna history ya kutosha — chagua random kutoka OTC pairs
+            # Hakuna history ya kutosha — chagua random kutoka OTC pairs kwa kuchunguza signal
+            # Jaribu pairs kadhaa na uangalie ni ipi ina mwelekeo wazi
             otc_pairs = [p for p in ALL_PAIRS if "OTC" in p]
-            best = random.choice(otc_pairs) if otc_pairs else ALL_PAIRS[0]
+            random.shuffle(otc_pairs)
+            best = None
+            for candidate in otc_pairs[:10]:  # Jaribu top 10 random
+                sig_test = generate_signal(candidate)
+                if not sig_test.get("flat") and sig_test.get("indicators_agree", 0) >= 4:
+                    best = candidate
+                    break
+            if not best:
+                best = otc_pairs[0] if otc_pairs else ALL_PAIRS[0]
         # Get stats for display
         try:
             with get_conn() as conn:
@@ -1626,6 +1684,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # Futa signal photo ya zamani (ile iliyotumwa na "Get More" au "sel_")
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+
         # Check if current signal expiry is still active
         state = get_user_signal_state(user_id, pair)
         expiry_finished = True
@@ -1639,14 +1703,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 expiry_finished = False
 
         if not expiry_finished:
-            # Signal bado hai — block kimya, usifanye chochote
+            # Signal bado hai — mpe pairs zote achague upya
+            await context.bot.send_message(
+                chat_id=chat,
+                text="⚡ *EVALON MASTER PRO*\n\n📊 Select a trading pair:",
+                parse_mode="Markdown",
+                reply_markup=pairs_keyboard()
+            )
             return
         else:
             # Expiry imeisha — toa signal ya pair ile ile moja kwa moja (kama "sel_" flow)
             # Free trial check
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
-                try: await q.message.delete()
-                except: pass
                 bonus = get_bonus_signals(user_id)
                 refs  = count_referrals(user_id)
                 extra = "\n\n🎁 *You have {} referrals* — invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
@@ -1732,9 +1800,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 gm_entry_price = _fetch_current_price(pair)
                 save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=gm_entry_price)
 
-            # Reverse pair: badilisha direction inayoonyeshwa kwa mtumiaji
-            gm_display_dir = ("SELL" if direction == "BUY" else "BUY") if is_reverse_pair(pair) else direction
-            ib    = gm_display_dir == "BUY"
+            ib    = direction == "BUY"
             img   = get_buy_image() if ib else get_sell_image()
             arrow = "Up 🟢" if ib else "Down 🔴"
             if not is_licensed(user_id): use_free_signal(user_id)
@@ -1934,9 +2000,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if check["action"] != "fresh":
             record_signal(pair, direction)
 
-        # Reverse pair: badilisha direction inayoonyeshwa kwa mtumiaji (si ya result tracking)
-        display_direction = ("SELL" if direction == "BUY" else "BUY") if is_reverse_pair(pair) else direction
-        ib    = display_direction == "BUY"
+        ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
         arrow = "Up 🟢" if ib else "Down 🔴"
         if not is_licensed(user_id): use_free_signal(user_id)
@@ -2130,52 +2194,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        if text == "/pairstats":
-            stats = get_pair_stats_all()
-            if not stats:
-                await update.message.reply_text("📊 No pair stats yet.", parse_mode="Markdown")
-                return
-            msg = "📊 *PAIR WIN/LOSS STATS*\n\n"
-            for r in stats[:30]:  # max 30 ili ujumbe usizidi
-                total = r["wins"] + r["losses"]
-                rate  = int(r["wins"] / max(total, 1) * 100)
-                bar   = "🟢" * min(5, r["wins"] // max(total // 5, 1)) if total > 0 else ""
-                msg  += "• *{}*\n  ✅{} ❌{} | {}% {}\n".format(r["pair"], r["wins"], r["losses"], rate, bar)
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-        if text.startswith("/reversepair "):
-            pair_name = text[len("/reversepair "):].strip()
-            if not pair_name:
-                await update.message.reply_text("❌ Usage: `/reversepair EUR/USD OTC`", parse_mode="Markdown")
-                return
-            add_reverse_pair(pair_name)
-            await update.message.reply_text(
-                "🔄 *Reverse pair added!*\n\n`{}` — bot itatoa kinyume cha direction.\n\nMfano: kama signal ni BUY, mtumiaji ataona SELL.".format(pair_name),
-                parse_mode="Markdown"
-            )
-            return
-        if text.startswith("/unreversepair "):
-            pair_name = text[len("/unreversepair "):].strip()
-            if not pair_name:
-                await update.message.reply_text("❌ Usage: `/unreversepair EUR/USD OTC`", parse_mode="Markdown")
-                return
-            remove_reverse_pair(pair_name)
-            await update.message.reply_text(
-                "✅ *Reverse pair removed!*\n\n`{}` — bot itatoa direction ya kawaida sasa.".format(pair_name),
-                parse_mode="Markdown"
-            )
-            return
-        if text == "/listreverse":
-            pairs_rev = get_all_reverse_pairs()
-            if not pairs_rev:
-                await update.message.reply_text("✅ Hakuna reverse pairs zilizowekwa.", parse_mode="Markdown")
-                return
-            msg = "🔄 *REVERSE PAIRS*\n\n_Bot inatoa kinyume cha direction kwa pairs hizi:_\n\n"
-            for p in pairs_rev:
-                msg += "• `{}`\n".format(p)
-            msg += "\n_Futa kwa `/unreversepair PAIR_NAME`_"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
         if text.startswith("/blacklist "):
             try:
                 target_id = int(text.split()[1])
@@ -2263,6 +2281,47 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Usage: `/addtrial 123456789 5`", parse_mode="Markdown")
             return
 
+        if text == "/pairstats":
+            stats = get_pair_stats_all()
+            if not stats:
+                await update.message.reply_text("📊 *PAIR STATS*\n\nHakuna data bado.", parse_mode="Markdown")
+                return
+            msg = "📊 *PAIR WIN/LOSS STATS*\n\n"
+            for r in stats[:30]:  # Onyesha top 30
+                total = r["wins"] + r["losses"]
+                rate  = int(r["wins"] / max(total, 1) * 100)
+                bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
+                msg  += "{} *{}*\n  ✅ {} wins | ❌ {} losses | {}%\n\n".format(
+                    bar, r["pair"], r["wins"], r["losses"], rate)
+            await update.message.reply_text(msg[:4000], parse_mode="Markdown")
+            return
+        if text.startswith("/addreverse "):
+            pair_name = text[len("/addreverse "):].strip().upper()
+            add_reverse_pair(pair_name)
+            await update.message.reply_text(
+                "🔄 *Reverse pair added:*\n`{}`\n\nBot itatoa direction kinyume cha signal.".format(pair_name),
+                parse_mode="Markdown"
+            )
+            return
+        if text.startswith("/removereverse "):
+            pair_name = text[len("/removereverse "):].strip().upper()
+            remove_reverse_pair(pair_name)
+            await update.message.reply_text(
+                "✅ *Reverse pair removed:*\n`{}`".format(pair_name),
+                parse_mode="Markdown"
+            )
+            return
+        if text == "/listreverse":
+            pairs_list = get_all_reverse_pairs()
+            if not pairs_list:
+                await update.message.reply_text("🔄 *REVERSE PAIRS*\n\nHakuna pairs za reverse.", parse_mode="Markdown")
+            else:
+                msg = "🔄 *REVERSE PAIRS* (bot inatoa kinyume):\n\n"
+                for p in pairs_list:
+                    msg += "• `{}`\n".format(p)
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
     # /refer command — user yeyote
     if update.message.text and update.message.text.strip() == "/refer":
         user_id2 = update.effective_user.id
@@ -2294,48 +2353,4 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u=get_user(user_id); exp=get_expiry_text(user_id)
             tl="📅 Monthly" if u.get("licence_type")=="monthly" else "♾️ Lifetime"
             await update.message.reply_text(
-                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON MASTER PRO!\n🏆 Win Rate: 90% — 98%\n🔑 Type: *{}*\n⏳ {}\n\nYou can now use unlimited signals!".format(tl,exp),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Start Trading Now", callback_data="choose_pair")]])
-            )
-        else:
-            await update.message.reply_text(
-                "❌ *Invalid or already used code.*\n\nCheck your code or contact admin.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 Contact Admin", url="https://t.me/evalonwinnersbot")],
-                    [InlineKeyboardButton("🔑 Try Again", callback_data="enter_code")]
-                ])
-            )
-
-# ============================================================
-# MAIN
-# ============================================================
-# ============================================================
-# MAIN
-# ============================================================
-async def run_bot():
-    from aiohttp import web
-
-    PORT = int(os.environ.get("PORT", 8080))
-    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("help", help_command))
-    ptb_app.add_handler(CommandHandler("setimage", setimage_command))
-    ptb_app.add_handler(CommandHandler("dbcheck", dbcheck_command))
-    ptb_app.add_handler(CommandHandler("totalusers", message_handler))
-    ptb_app.add_handler(ChatJoinRequestHandler(join_request_handler))
-    ptb_app.add_handler(CallbackQueryHandler(button_handler))
-    ptb_app.add_handler(MessageHandler(filters.PHOTO, message_handler))
-    ptb_app.add_handler(MessageHandler(filters.TEXT, message_handler))
-
-    if RENDER_URL:
-        print("Render webhook mode on port {}".format(PORT))
-        WEBHOOK_PATH = "/{}".format(BOT_TOKEN)
-        WEBHOOK_URL  = "{}{}".format(RENDER_URL, WEBHOOK_PATH)
-
-        await ptb_app.initialize()
-        await ptb_app.start()
-     
+                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON MASTER PRO!\n🏆 Win Rate: 9
