@@ -1444,11 +1444,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             ib    = direction == "BUY"
             img   = get_buy_image() if ib else get_sell_image()
-            trend = "Up 🟢" if ib else "Down 🔴"
+            arrow = "Up 🟢" if ib else "Down 🔴"
             if not is_licensed(user_id): use_free_signal(user_id)
             try: await cm.delete()
             except: pass
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, trend, timeframe, strength)
+            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
             sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
             inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
@@ -1620,11 +1620,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
-        trend = "Up 🟢" if ib else "Down 🔴"
+        arrow = "Up 🟢" if ib else "Down 🔴"
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
-        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, trend, timeframe, strength)
+        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
         # --- Inactivity tracker: rekodi msg_id na washa timer upya ---
