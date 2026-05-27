@@ -603,11 +603,11 @@ def get_signal_bias(pair, window=10, threshold=0.70):
 def is_candle_safe_zone():
     """
     Check if current UTC second is in the safe zone for signal generation.
-    Safe zone: seconds 10-49 (middle of 1-minute candle).
-    Block zone: seconds 0-9 (new candle chaos) and 50-59 (candle closing).
+    Safe zone: seconds 5-54 (middle of 1-minute candle).
+    Block zone: seconds 0-4 (new candle chaos) and 55-59 (candle closing).
     """
     second = datetime.utcnow().second
-    return 10 <= second <= 49
+    return 5 <= second <= 54
 
 def get_trend_direction(pair, window=20, min_signals=8, threshold=0.65):
     """
@@ -637,6 +637,8 @@ def get_trend_direction(pair, window=20, min_signals=8, threshold=0.65):
     except Exception as e:
         logging.warning("get_trend_direction failed: {}".format(e))
         return None
+
+def get_user_signal_state(user_id, pair):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
