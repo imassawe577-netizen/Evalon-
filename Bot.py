@@ -600,7 +600,43 @@ def get_signal_bias(pair, window=10, threshold=0.70):
         logging.warning("get_signal_bias failed: {}".format(e))
         return None
 
-def get_user_signal_state(user_id, pair):
+def is_candle_safe_zone():
+    """
+    Check if current UTC second is in the safe zone for signal generation.
+    Safe zone: seconds 10-49 (middle of 1-minute candle).
+    Block zone: seconds 0-9 (new candle chaos) and 50-59 (candle closing).
+    """
+    second = datetime.utcnow().second
+    return 10 <= second <= 49
+
+def get_trend_direction(pair, window=20, min_signals=8, threshold=0.65):
+    """
+    Analyze signal history to find dominant trend.
+    Returns 'BUY', 'SELL', or None (flat/no clear trend).
+    Requires at least min_signals history entries and threshold dominance.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction FROM signal_history WHERE pair=%s ORDER BY created_at DESC LIMIT %s",
+                    (pair, window)
+                )
+                rows = cur.fetchall()
+        if len(rows) < min_signals:
+            return None  # Not enough history — no trend decision
+        directions = [r["direction"] for r in rows]
+        total = len(directions)
+        buy_ratio  = directions.count("BUY")  / total
+        sell_ratio = directions.count("SELL") / total
+        if buy_ratio >= threshold:
+            return "BUY"
+        if sell_ratio >= threshold:
+            return "SELL"
+        return None  # Flat market — mixed signals
+    except Exception as e:
+        logging.warning("get_trend_direction failed: {}".format(e))
+        return None
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -860,7 +896,7 @@ def generate_signal(pair):
             direction = bias
 
     record_signal(pair, direction)
-    return {"direction": direction, "pair": pair, "timeframe": timeframe, "strength": strength}
+    return {"direction": direction, "pair": pair, "timeframe": timeframe, "strength": strength, "indicators_agree": indicators_agree}
 
 # ============================================================
 # PAIR INDEX
@@ -1365,6 +1401,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Generate fresh signal for same pair (expiry imeisha)
             clear_user_signal_state(user_id, pair)
+
+            # Candle safe zone check
+            if not is_candle_safe_zone():
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                    ])
+                )
+                return
+
             cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
             await asyncio.sleep(2)
 
@@ -1372,6 +1421,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction = sig["direction"]
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
+
+            # Trend validation
+            trend_dir = get_trend_direction(pair)
+            if trend_dir is not None:
+                direction = trend_dir
+            elif sig.get("indicators_agree", 7) < 4:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="❌ *No good signal available.*\n\nMarket is flat — indicators are not aligned. Try another pair.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
+
             save_user_signal_state(user_id, pair, direction, timeframe, 0)
 
             ib    = direction == "BUY"
@@ -1486,8 +1554,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if elapsed < threshold:
                     return  # Block kimya — hakuna ujumbe
 
+        # --- Candle safe zone check ---
+        # Block if we are in the first 10 seconds (new candle) or last 10 seconds (candle closing)
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                ])
+            )
+            return
+
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
+
+        # --- Trend validation ---
+        trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
             sig        = generate_signal(pair)
@@ -1495,6 +1579,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
             flip_count = 0
+            # Override with dominant trend if available
+            if trend is not None:
+                direction = trend
+            # If no trend (flat market) and indicators weak — no signal
+            elif sig.get("indicators_agree", 7) < 4:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="❌ *No good signal available.*\n\nMarket is flat — indicators are not aligned. Try another pair.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
 
         elif check["action"] == "flip":
             # First quick return — flip direction, reset flip_count to 1
