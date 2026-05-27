@@ -89,8 +89,12 @@ def init_db():
                     signal_time TIMESTAMP NOT NULL,
                     flip_count INTEGER DEFAULT 0,
                     cooldown_until TIMESTAMP,
+                    entry_price DOUBLE PRECISION DEFAULT NULL,
+                    result_sent BOOLEAN DEFAULT FALSE,
                     PRIMARY KEY (user_id, pair)
                 );
+                ALTER TABLE user_signal_state ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION DEFAULT NULL;
+                ALTER TABLE user_signal_state ADD COLUMN IF NOT EXISTS result_sent BOOLEAN DEFAULT FALSE;
             """)
         conn.commit()
 
@@ -509,10 +513,29 @@ def _fetch_real_indicators(pair):
         sto = max(0.0, min(100.0, float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])))
         # Volume
         vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
+        # Current price
+        current_price = float(close.iloc[-1])
         return {"rsi": rsi, "macd": macd_norm, "bb_pos": bb_pos,
-                "ma_diff": ma_diff, "mom": mom, "sto": sto, "vol": vol, "real": True}
+                "ma_diff": ma_diff, "mom": mom, "sto": sto, "vol": vol,
+                "real": True, "current_price": current_price,
+                # Market quality score — higher = clearer trend
+                "quality": abs(ma_diff) + abs(mom) + abs(macd_norm)}
     except Exception as e:
         logging.warning("Yahoo Finance fetch failed for {}: {}".format(pair, e))
+        return None
+
+def _fetch_current_price(pair):
+    """Fetch only current price for result checking."""
+    symbol = YAHOO_SYMBOLS.get(pair)
+    if not symbol:
+        return None
+    try:
+        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
+        if df is None or len(df) < 1:
+            return None
+        return float(df["Close"].squeeze().iloc[-1])
+    except Exception as e:
+        logging.warning("_fetch_current_price failed for {}: {}".format(pair, e))
         return None
 
 def _get_session():
@@ -649,20 +672,22 @@ def get_user_signal_state(user_id, pair):
         logging.warning("get_user_signal_state failed: {}".format(e))
         return None
 
-def save_user_signal_state(user_id, pair, direction, timeframe, flip_count):
+def save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO user_signal_state
-                        (user_id, pair, last_direction, last_timeframe, signal_time, flip_count)
-                    VALUES (%s, %s, %s, %s, NOW(), %s)
+                        (user_id, pair, last_direction, last_timeframe, signal_time, flip_count, entry_price, result_sent)
+                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, FALSE)
                     ON CONFLICT (user_id, pair) DO UPDATE SET
                         last_direction = EXCLUDED.last_direction,
                         last_timeframe = EXCLUDED.last_timeframe,
                         signal_time    = EXCLUDED.signal_time,
-                        flip_count     = EXCLUDED.flip_count
-                """, (user_id, pair, direction, timeframe, flip_count))
+                        flip_count     = EXCLUDED.flip_count,
+                        entry_price    = EXCLUDED.entry_price,
+                        result_sent    = FALSE
+                """, (user_id, pair, direction, timeframe, flip_count, entry_price))
             conn.commit()
     except Exception as e:
         logging.warning("save_user_signal_state failed: {}".format(e))
@@ -700,6 +725,68 @@ def get_cooldown_remaining(user_id, pair):
     if isinstance(cooldown_until, str):
         cooldown_until = datetime.fromisoformat(cooldown_until)
     return max(0, int((cooldown_until - datetime.utcnow()).total_seconds()))
+
+async def schedule_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price):
+    """
+    Background task: waits for signal timeframe to expire, then checks result.
+    Only for non-OTC pairs with real Yahoo Finance price data.
+    """
+    # Wait for timeframe + 10 seconds buffer
+    await asyncio.sleep(timeframe_mins * 60 + 10)
+
+    # Don't send result if user cleared state already (e.g. new signal on same pair)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT result_sent, entry_price FROM user_signal_state WHERE user_id=%s AND pair=%s",
+                    (user_id, pair)
+                )
+                row = cur.fetchone()
+        if not row or row["result_sent"]:
+            return  # Already sent or state cleared
+    except Exception as e:
+        logging.warning("schedule_result_check state check failed: {}".format(e))
+        return
+
+    # Fetch current price
+    exit_price = _fetch_current_price(pair)
+    if exit_price is None or entry_price is None:
+        return  # Can't determine result without prices
+
+    # Determine win or loss
+    price_diff = exit_price - entry_price
+    if direction == "BUY":
+        won = price_diff > 0
+    else:
+        won = price_diff < 0
+
+    result_emoji = "🏆 *WON!*" if won else "📉 *LOSS*"
+    result_text = (
+        "📊 *SIGNAL RESULT — {}*\n\n"
+        "Pair: *{}*\n"
+        "Direction: *{}*\n"
+        "Timeframe: *{} min*\n\n"
+        "{}\n\n"
+        "_Entry: {:.5f}  →  Exit: {:.5f}_"
+    ).format(
+        pair, pair, direction, timeframe_mins,
+        result_emoji,
+        entry_price, exit_price
+    )
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
+        # Mark result as sent
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE user_signal_state SET result_sent=TRUE WHERE user_id=%s AND pair=%s",
+                    (user_id, pair)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("schedule_result_check send failed: {}".format(e))
 
 def check_signal_request(user_id, pair):
     """
@@ -766,6 +853,13 @@ def generate_signal(pair):
         mom     = real["mom"]
         vol     = real["vol"]
         candle  = random.choices([-1, -0.5, 0, 0.5, 1], weights=[10, 15, 50, 15, 10])[0]
+        # Non-OTC: block signal if market quality is too low (ranging/choppy)
+        # quality = abs(ma_diff) + abs(mom) + abs(macd) — higher = clearer trend
+        market_quality = real.get("quality", 1.0)
+        if market_quality < 0.25:
+            # Market is ranging — return flat signal immediately
+            return {"direction": "BUY", "pair": pair, "timeframe": 0, "strength": 300,
+                    "indicators_agree": 0, "flat": True, "reason": "ranging_nonOTC"}
     else:
         # Smart OTC indicators — session-aware
         sess  = _get_session()
@@ -1475,6 +1569,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             save_user_signal_state(user_id, pair, direction, timeframe, 0)
 
+            # For non-OTC: fetch entry price for result tracking
+            gm_entry_price = None
+            gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+            if gm_is_non_otc:
+                gm_entry_price = _fetch_current_price(pair)
+                save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=gm_entry_price)
+
             ib    = direction == "BUY"
             img   = get_buy_image() if ib else get_sell_image()
             arrow = "Up 🟢" if ib else "Down 🔴"
@@ -1483,6 +1584,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
             sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+
+            # Result tracker for non-OTC
+            if gm_is_non_otc and gm_entry_price is not None:
+                asyncio.create_task(
+                    schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
+                )
 
             inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
 
@@ -1659,7 +1766,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             strength   = random.randint(200, 500)
 
         # Save state with updated flip_count
-        save_user_signal_state(user_id, pair, direction, timeframe, flip_count)
+        # For non-OTC: fetch current price as entry price for result tracking
+        entry_price = None
+        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        if is_non_otc:
+            entry_price = _fetch_current_price(pair)
+        save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
         # Record to signal history (fresh signals already recorded inside generate_signal)
         if check["action"] != "fresh":
             record_signal(pair, direction)
@@ -1672,6 +1784,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+
+        # --- Result tracker: kwa non-OTC tu (zina real price data) ---
+        if is_non_otc and entry_price is not None:
+            asyncio.create_task(
+                schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, entry_price)
+            )
 
         # --- Inactivity tracker: rekodi msg_id na washa timer upya ---
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
