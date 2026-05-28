@@ -49,7 +49,7 @@ CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
 SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (haibadiliki)
-REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # ← Referral bot — referral links zinaenda hapa
+REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
 
 def support_url():
     """Returns support link — fungua support bot na neno 'admin' tayari kwenye text box."""
@@ -69,6 +69,9 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
+                    first_name TEXT DEFAULT NULL,
+                    last_name  TEXT DEFAULT NULL,
+                    username   TEXT DEFAULT NULL,
                     free_used INTEGER DEFAULT 0,
                     licensed BOOLEAN DEFAULT FALSE,
                     licence_type TEXT,
@@ -77,13 +80,23 @@ def init_db():
                     referred_by BIGINT DEFAULT NULL,
                     bonus_signals INTEGER DEFAULT 0
                 );
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT NULL;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  TEXT DEFAULT NULL;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS username   TEXT DEFAULT NULL;
                 CREATE TABLE IF NOT EXISTS licences (
                     code TEXT PRIMARY KEY,
                     type TEXT,
                     used BOOLEAN DEFAULT FALSE,
                     revoked BOOLEAN DEFAULT FALSE,
+                    revoked_at TIMESTAMP DEFAULT NULL,
                     used_by BIGINT,
                     used_at TIMESTAMP
+                );
+                ALTER TABLE licences ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP DEFAULT NULL;
+                CREATE TABLE IF NOT EXISTS vte_last_direction (
+                    pair TEXT PRIMARY KEY,
+                    direction TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -338,6 +351,23 @@ def get_user(user_id):
             row = cur.fetchone()
             return dict(row) if row else {}
 
+def upsert_user_profile(user_id, first_name=None, last_name=None, username=None):
+    """Save or update user display name and username for admin lookup."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users
+                    SET first_name = COALESCE(%s, first_name),
+                        last_name  = COALESCE(%s, last_name),
+                        username   = COALESCE(%s, username)
+                    WHERE user_id = %s
+                """, (first_name or None, last_name or None, username or None, user_id))
+            conn.commit()
+    except Exception as e:
+        import logging
+        logging.warning("upsert_user_profile failed {}: {}".format(user_id, e))
+
 def is_licensed(user_id):
     u = get_user(user_id)
     if not u.get("licensed"):
@@ -381,8 +411,8 @@ def activate_licence(code, user_id):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM licences WHERE code = %s", (code,))
             lic = cur.fetchone()
-            # Block if not found, already used, or revoked
-            if not lic or lic["used"] or lic.get("revoked"):
+            # Block if not found, already used, or revoked — revoked codes NEVER reactivate
+            if not lic or lic.get("revoked") or lic["used"]:
                 return False
             ltype  = lic["type"]
             expiry = None
@@ -436,14 +466,19 @@ def delete_user(user_id):
         conn.commit()
 
 def revoke_licence(user_id):
+    """
+    Permanently revoke a user licence.
+    - Strips licence from user immediately.
+    - Marks their code as revoked with timestamp.
+    - Code can never be reactivated even if re-generated with same value.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT licence_code FROM users WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
             if row and row["licence_code"]:
-                # Mark code as revoked — cannot be reused ever
                 cur.execute(
-                    "UPDATE licences SET used=TRUE, revoked=TRUE WHERE code=%s",
+                    "UPDATE licences SET used=TRUE, revoked=TRUE, revoked_at=NOW() WHERE code=%s",
                     (row["licence_code"],)
                 )
             cur.execute(
@@ -487,9 +522,10 @@ def inactivity_get_msgs(user_id):
 # ANTI-SPAM
 # ============================================================
 LAST_SIGNAL_TIME = {}
-SPAM_SECONDS = 5
+SPAM_SECONDS = 3  # Minimal anti-flood only — no cooldown between signals
 
 def is_spam(user_id):
+    """Minimal flood guard — 3 seconds only. No signal cooldown."""
     now = time.time()
     last = LAST_SIGNAL_TIME.get(user_id, 0)
     if now - last < SPAM_SECONDS:
@@ -1456,8 +1492,7 @@ def check_signal_request(user_id, pair):
       {"action": "cooldown"}                -- still in cooldown
     """
     # Cooldown check first
-    if get_cooldown_remaining(user_id, pair) > 0:
-        return {"action": "cooldown"}
+    # No cooldown — signals available at any time
 
     state = get_user_signal_state(user_id, pair)
     if state is None:
@@ -1486,7 +1521,7 @@ def check_signal_request(user_id, pair):
     if flip_count == 0:
         return {"action": "flip", "direction": flipped}
     else:
-        # Daima "same" — hakuna block. Warning inatoka kwenye getmore_ handler
+        # Always "same" — no block here. Warning shown in getmore_ handler
         return {"action": "same", "direction": flipped}
 
 # ============================================================
@@ -1552,9 +1587,9 @@ def _detect_candlestick_patterns(df):
     if c1 < o1 and c2 < o2 and c3 < o3 and c1 < c2 < c3:
         patterns["three_black_crows"] = ("SELL", 40)
 
-    # ── INSIDE BAR: candle 1 ndani ya range ya candle 2 (consolidation → breakout) ──
+    # ── INSIDE BAR: candle 1 within range of candle 2 (consolidation → breakout) ──
     if h1 < h2 and l1 > l2:
-        # Inside bar — neutral/continuation; direction ya candle 2 inaendelea
+        # Inside bar — neutral/continuation; follow candle 2 direction
         if c2 > o2:
             patterns["inside_bar_continuation"] = ("BUY", 15)
         else:
@@ -1683,20 +1718,39 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 # ============================================================
 # SIGNAL ALGORITHM — Multi-Timeframe + 1H Trend Filter + Patterns
 # ============================================================
+# Per-pair OTC flip decision cache (in-memory, reset on restart — fine for OTC)
+_otc_flip_cache: dict = {}
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
     if not is_otc:
-        real = _fetch_real_indicators_mtf(pair)
+        try:
+            real = _fetch_real_indicators_mtf(pair)
+        except Exception as e:
+            logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
+            real = None
 
     # ── 1H TREND FILTER (with reversal detection) ────────────
-    trend_1h = _fetch_1h_trend(pair)
+    trend_1h = None
+    try:
+        trend_1h = _fetch_1h_trend(pair)
+    except Exception as e:
+        logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
 
     # ── VWAP TREND ───────────────────────────────────────────
-    vwap_data = _fetch_vwap_trend(pair)
+    vwap_data = None
+    try:
+        vwap_data = _fetch_vwap_trend(pair)
+    except Exception as e:
+        logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
 
     # ── MULTI-TIMEFRAME SCORE ─────────────────────────────────
-    mtf = _fetch_mtf_score(pair)
+    mtf = None
+    try:
+        mtf = _fetch_mtf_score(pair)
+    except Exception as e:
+        logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
 
     # ── CANDLESTICK PATTERN DETECTION ────────────────────────
     pattern_buy_bonus = 0
@@ -1916,10 +1970,10 @@ def generate_signal(pair):
         if direction == "BUY"  and mtf["buy_tfs"]  > mtf["sell_tfs"]: indicators_agree += mtf["buy_tfs"]
         if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
     if trend_1h == direction:
-        indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection ni nguvu zaidi
+        indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection is stronger
 
     # ── PATTERN CONFLUENCE ───────────────────────────────────
-    # Kama patterns zinakubaliana na direction — ongeza indicators_agree
+    # If patterns agree with direction — boost indicators_agree
     pattern_agrees = (pattern_buy_bonus > 0 and direction == "BUY") or \
                      (pattern_sell_bonus > 0 and direction == "SELL")
     if pattern_agrees:
@@ -1950,18 +2004,18 @@ def generate_signal(pair):
                 if direction == "SELL" and sell_c: indicators_agree += 1
 
     # ── SIGNAL HISTORY BIAS CHECK ────────────────────────────
-    # Kama signals nyingi za nyuma ni same direction → imarisha decision
+    # If most recent signals share same direction — reinforce decision
     hist_same, hist_total, hist_pct = _check_signal_history_bias(pair, direction, window=15)
     if hist_total >= 5:
         if hist_pct >= 0.70:
-            # Historia inakubaliana sana — ziada ya +20 na indicators_agree +2
+            # History strongly agrees — add +20 and boost indicators_agree
             if direction == "BUY":
                 b += 20
             else:
                 s += 20
             indicators_agree += 2
         elif hist_pct <= 0.30:
-            # Historia inapingana sana — punguza confidence
+            # History strongly disagrees — reduce confidence
             if direction == "BUY":
                 b -= 15
             else:
@@ -1982,67 +2036,53 @@ def generate_signal(pair):
                             + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
                             + int(random.uniform(-5,5))))
 
-    # ── TIMEFRAME: Data-driven, no random fallback for non-OTC ──
+    # ── TIMEFRAME SELECTION ──────────────────────────────────
     vte_tf = get_optimal_tf(pair)
-    if vte_tf is not None:
+    if is_otc:
+        # OTC: always pick a random timeframe (1m-5m).
+        # Each call picks independently — no fixed pattern.
+        # This mimics human decision-making and keeps broker off-guard.
+        timeframe = random.choice([1, 1, 2, 2, 3, 3, 4, 5])
+    elif vte_tf is not None:
         timeframe = vte_tf
-    elif not is_otc:
-        # Non-OTC: use real data confluence to pick TF (1m / 2m / 3m / 5m)
-        # High confluence = shorter TF safe; low confluence = longer TF for confirmation
-        if movement_cat == "HIGH":
-            if indicators_agree >= 10:
-                timeframe = 1
-            elif indicators_agree >= 7:
-                timeframe = 2
-            elif indicators_agree >= 5:
-                timeframe = 3
-            else:
-                timeframe = 5
-        elif movement_cat == "MEDIUM":
-            if indicators_agree >= 12:
-                timeframe = 1
-            elif indicators_agree >= 9:
-                timeframe = 2
-            elif indicators_agree >= 6:
-                timeframe = 3
-            else:
-                timeframe = 5
-        else:   # LOW movement
-            if indicators_agree >= 11:
-                timeframe = 3
-            else:
-                timeframe = 5
     else:
-        # OTC: keep existing 1m / 2m / 3m logic
+        # Non-OTC: data-driven TF based on real confluence
         if movement_cat == "HIGH":
-            if indicators_agree >= 9:
-                timeframe = 1
-            elif indicators_agree >= 6:
-                timeframe = random.choice([1, 1, 2])
-            else:
-                timeframe = random.choice([1, 2])
+            if indicators_agree >= 10:   timeframe = 1
+            elif indicators_agree >= 7:  timeframe = 2
+            elif indicators_agree >= 5:  timeframe = 3
+            else:                        timeframe = 5
         elif movement_cat == "MEDIUM":
-            if indicators_agree >= 11:
-                timeframe = 1
-            elif indicators_agree >= 8:
-                timeframe = random.choice([1, 2])
-            elif indicators_agree >= 5:
-                timeframe = random.choice([1, 2, 3])
-            else:
-                timeframe = 2
+            if indicators_agree >= 12:   timeframe = 1
+            elif indicators_agree >= 9:  timeframe = 2
+            elif indicators_agree >= 6:  timeframe = 3
+            else:                        timeframe = 5
         else:   # LOW movement
-            if indicators_agree >= 10:
-                timeframe = random.choice([2, 2, 3])
-            else:
-                timeframe = 3
+            if indicators_agree >= 11:   timeframe = 3
+            else:                        timeframe = 5
 
     # ── NON-OTC: No signal if confluence too weak ─────────────
-    # Do not guess a timeframe — if indicators are weak, wait.
     if not is_otc and indicators_agree < 6 and vte_tf is None:
         timeframe = 0   # Triggers no-signal in handler
 
-    # ── SMART 1H CANDLE CONFIRMATION FOR SHORT TFs ───────────
-    if timeframe <= 2 and (trend_1h is not None or True):
+    # ── OTC: Random flip/follow logic ────────────────────────
+    # Each signal independently decides: follow the market or go against it.
+    # Random intervals mean the broker cannot predict the pattern.
+    # Works alongside contrarian pair logic (applied in handler).
+    if is_otc:
+        # Weighted random: 45% follow, 55% oppose — slightly contrarian overall
+        otc_flip = random.choices(
+            ["follow", "oppose"],
+            weights=[45, 55]
+        )[0]
+        if otc_flip == "oppose":
+            direction = "SELL" if direction == "BUY" else "BUY"
+        # Store flip decision so handler knows (for contrarian pair override)
+        _otc_flip_cache[pair] = otc_flip
+
+    # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
+    # OTC always forces a signal — no blocking on 1H confirmation.
+    if not is_otc and timeframe <= 2:
         h1_confirmed = _confirm_1h_direction(pair, direction)
         if not h1_confirmed:
             if timeframe == 1:
@@ -2104,9 +2144,9 @@ def generate_signal(pair):
                     "no_signal_reason": "1H vs short-TF conflict",
                 }
 
-    # ── SIGNAL STABILITY FILTER ───────────────────────────────
-    # Block sudden direction flips within 5-minute window
-    if not _check_signal_stability(pair, direction, window_minutes=5):
+    # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
+    # OTC always produces a signal — stability filter does not apply.
+    if not is_otc and not _check_signal_stability(pair, direction, window_minutes=5):
         timeframe = 0
         record_signal(pair, direction)
         return {
@@ -2163,19 +2203,61 @@ def is_weekend():
     return datetime.utcnow().weekday() >= 5
 
 def pairs_keyboard():
-    rows=[]; row=[]
+    """
+    Build the pair selection keyboard.
+    Weekday (non-OTC available):
+      - Shows forex pairs only, ranked by VTE win rate (worst first).
+      - First 3 = contrarian pairs (marked with 🔄), rest = normal.
+      - Falls back to default ALL_PAIRS forex order if VTE has no data yet.
+    Weekend: shows OTC pairs only (unchanged).
+    """
+    rows = []
+    row  = []
     weekend = is_weekend()
     otc_on  = is_otc_enabled()
-    for i, pair in enumerate(ALL_PAIRS):
-        # Weekend: ficha non-OTC pairs kabisa
-        if weekend and "OTC" not in pair:
-            continue
-        # Admin amezima OTC: onyesha non-OTC tu
-        if not otc_on and "OTC" in pair:
-            continue
-        row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-        if len(row)==3: rows.append(row); row=[]
-    if row: rows.append(row)
+
+    if weekend:
+        # Weekend — show OTC pairs only
+        for i, pair in enumerate(ALL_PAIRS):
+            if "OTC" not in pair:
+                continue
+            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+    else:
+        # Weekday — forex only, ranked by VTE (worst → best)
+        if not otc_on:
+            ranked = get_ranked_forex_pairs()
+            display_pairs = ranked["all"]
+            contrarian_set = set(ranked["contrarian"])
+        else:
+            # OTC enabled — show all pairs
+            display_pairs = [p for p in ALL_PAIRS if "OTC" not in p]
+            contrarian_set = set()
+
+        for pair in display_pairs:
+            i = pair_to_idx(pair)
+            if i is None:
+                continue
+            label = pair
+            row.append(InlineKeyboardButton(label, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+
+        # Also show OTC pairs if enabled
+        if otc_on:
+            for i, pair in enumerate(ALL_PAIRS):
+                if "OTC" not in pair:
+                    continue
+                row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+
+    if row:
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 def signal_keyboard(pair):
@@ -2589,9 +2671,18 @@ async def dbcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     data=q.data; chat=q.message.chat_id; user_id=q.from_user.id
+    # Save user profile for admin lookup
+    try:
+        u = q.from_user
+        upsert_user_profile(user_id,
+            first_name=u.first_name,
+            last_name=u.last_name,
+            username=u.username)
+    except Exception:
+        pass
 
     if data == "restart_fresh":
-        # Clear signal state na inactivity tracking yote
+        # Clear signal state and inactivity tracking
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -2764,7 +2855,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         free_allowed = total_free_allowed(user_id)
         refs = count_referrals(user_id)
         bonus = get_bonus_signals(user_id)
-        # Referral link → REFERRAL_BOT (tofauti na admin bot)
+        # Referral link → REFERRAL_BOT (separate from admin bot)
         ref_link = "https://t.me/{}?start=REF_{}".format(REFERRAL_BOT, user_id)
         share_url = "https://t.me/share/url?url={}".format(ref_link)
         if refs >= 5:
@@ -2774,7 +2865,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             needed = 3 - refs
             ref_status = "⏳ Invite {} more to get bonus signals!".format(needed)
-        status = "✅ Licensed ({})".format(lic_type) if licensed else "🆓 Free Trial ({}/{} used)".format(free_used, free_allowed)
         await q.edit_message_text(
             "📊 *YOUR STATS*\n\n"
             "🔑 Status: {}\n"
@@ -2825,7 +2915,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── OTC: "Back" button — rudi kwa mode selection ─────────────
+    # ── OTC: "Back" button — return to mode selection ───────────
     if data.startswith("otcback_"):
         idx_str = data[8:]
         pair = PAIR_INDEX.get(idx_str)
@@ -2847,7 +2937,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── OTC: "Normal (minutes)" chosen — endelea na mtiririko wa kawaida ───
+    # ── OTC: "Normal (minutes)" chosen — continue with normal signal flow ─
     if data.startswith("otc_normal_"):
         idx_str = data[11:]
         pair = PAIR_INDEX.get(idx_str)
@@ -2863,7 +2953,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # --- Check user signal state (mtiririko wa kawaida wa OTC) ---
+        # --- Check user signal state (normal OTC flow) ---
         check = check_signal_request(user_id, pair)
         if check["action"] == "cooldown":
             return
@@ -2960,7 +3050,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_INACTIVITY[user_id]["task"] = task
         return
 
-    # ── OTC: "Sekunde" chosen — onyesha keyboard ya sekunde ──────────────
+    # ── OTC: "Sekunde" chosen — show seconds keyboard ───────────────────
     if data.startswith("otc_secs_"):
         idx_str = data[9:]
         pair = PAIR_INDEX.get(idx_str)
@@ -2970,7 +3060,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # Non-subscribers: ona keyboard ya sekunde LAKINI waambie ni subscribers tu
+        # Non-subscribers: show seconds keyboard but notify it is subscribers only
         if not is_licensed(user_id):
             await context.bot.send_message(
                 chat_id=chat,
@@ -2990,7 +3080,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Subscribers: onyesha keyboard ya sekunde
+        # Subscribers: show seconds keyboard
         await context.bot.send_message(
             chat_id=chat,
             text="⏱ *{}*\n\nChoose signal duration:".format(pair),
@@ -2999,7 +3089,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── OTC: Sekunde imechaguliwa — toa signal ya sekunde ────────────────
+    # ── OTC: Seconds timeframe selected — generate seconds signal ────────
     if data.startswith("otctf_"):
         # Format: otctf_{idx}_{seconds}
         rest = data[6:]
@@ -3124,7 +3214,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_spam(user_id):
             return
 
-        # Futa result message (📊 SIGNAL RESULT) kama ipo
+        # Delete result message if present
         try:
             state_for_del = get_user_signal_state(user_id, pair)
             if state_for_del and state_for_del.get("result_msg_id"):
@@ -3132,7 +3222,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Futa signal photo ya zamani (ile iliyotumwa na "Get More" au "sel_")
+        # Delete previous signal photo
         try:
             await q.message.delete()
         except Exception:
@@ -3312,10 +3402,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         new_flip_count = (press_count + 1) if not expiry_finished else 0
+
+        # Contrarian flip: worst-3 VTE pairs get signal flipped
+        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        if gm_is_non_otc and expiry_finished and is_contrarian_pair(pair):
+            direction = "SELL" if direction == "BUY" else "BUY"
+            logging.info("CONTRARIAN FLIP getmore: {} → {}".format(pair, direction))
+
         save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
 
         # For non-OTC: capture entry price at signal time
-        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
         gm_entry_price = None
         if gm_is_non_otc:
             gm_entry_price = _fetch_current_price(pair)
@@ -3380,7 +3476,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Anti-spam check
         if is_spam(user_id):
             return
-        # User is active — reset inactivity timer (bila msg_id bado, inaongezwa baadaye)
+        # User is active — reset inactivity timer (msg_id added later)
         inactivity_reset(user_id, chat)
         # Free trial check
         if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
@@ -3406,7 +3502,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # ── OTC: Onyesha chaguo la mode (sekunde AU normal) ──────
+        # ── OTC: Show mode selection (seconds OR normal minutes) ───
         if "OTC" in pair:
             await context.bot.send_message(
                 chat_id=chat,
@@ -3428,9 +3524,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Silent — do nothing
             return
 
-        # (block action imeondolewa — user anapata signal daima bila kuzuiwa)
+        # (block removed — user always gets a signal without restriction)
 
-        # Kama signal bado hai (expiry haijaisha) — redirect to getmore_ ili aweze kupata signal mpya
+        # Signal still active — redirect to getmore_ for a new signal
         if check["action"] not in ("fresh", "flip", "same"):
             state = get_user_signal_state(user_id, pair)
             if state:
@@ -3440,7 +3536,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elapsed   = (datetime.utcnow() - signal_time).total_seconds()
                 threshold = state["last_timeframe"] * 60
                 if elapsed < threshold:
-                    # Signal bado hai — toa signal mpya mara moja kwa pair hii hii
+                    # Signal still active — issue new signal immediately for same pair
                     idx_str = pair_to_idx(pair)
                     await context.bot.send_message(
                         chat_id=chat,
@@ -3465,20 +3561,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
 
         # --- Capture entry price IMMEDIATELY (before any processing delay) ---
-        # This ensures price is from the exact moment user requests signal
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
         entry_price = None
         if is_non_otc:
             entry_price = _fetch_current_price(pair)
         signal_capture_time = datetime.utcnow()
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         # --- Trend validation ---
         trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
-            sig        = generate_signal(pair)
+            try:
+                loop = asyncio.get_event_loop()
+                sig = await asyncio.wait_for(
+                    loop.run_in_executor(None, generate_signal, pair),
+                    timeout=18.0
+                )
+            except asyncio.TimeoutError:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="Signal took too long. Please try again or choose another pair.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Retry", callback_data="sel_{}".format(data[4:]))],
+                        [InlineKeyboardButton("Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
+            except Exception as e:
+                logging.warning("generate_signal error {}: {}".format(pair, e))
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="Could not generate signal. Please try again.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Retry", callback_data="sel_{}".format(data[4:]))],
+                        [InlineKeyboardButton("Choose Another Pair", callback_data="choose_pair")]
+                    ])
+                )
+                return
+            if False:  # placeholder to keep elif chain intact
+                sig = generate_signal(pair)
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
@@ -3557,6 +3686,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Save state with updated flip_count
         # entry_price was already captured at signal request time (above)
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+
+        # Contrarian flip: worst-3 VTE pairs get signal flipped (they fail consistently)
+        if is_non_otc and check["action"] == "fresh" and is_contrarian_pair(pair):
+            direction = "SELL" if direction == "BUY" else "BUY"
+            logging.info("CONTRARIAN FLIP applied: {} → {}".format(pair, direction))
+
         save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
         # Record to signal history (fresh signals already recorded inside generate_signal)
         if check["action"] != "fresh":
@@ -3571,27 +3706,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
-        # --- Result tracker: kwa non-OTC tu (zina real price data) ---
+        # --- Result tracker: non-OTC only (have real price data) ---
         if is_non_otc and entry_price is not None:
             asyncio.create_task(
                 schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, entry_price)
             )
 
-        # --- Inactivity tracker: rekodi msg_id na washa timer upya ---
+        # --- Inactivity tracker: record msg_id and reset timer ---
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
 
         async def inactivity_expire(uid, cid):
             """Clears ALL signals and sends VIP message immediately."""
             await asyncio.sleep(INACTIVITY_MINUTES * 60)
             msg_ids = inactivity_get_msgs(uid)
-            # Futa messages zote
+            # Delete all messages
             for mid in msg_ids:
                 try:
                     await context.bot.delete_message(chat_id=cid, message_id=mid)
                 except Exception:
                     pass
             inactivity_clear(uid)
-            # Tuma ujumbe wa VIP mara moja tu
+            # Send VIP message once only
             try:
                 await context.bot.send_message(
                     chat_id=cid,
@@ -3721,7 +3856,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         free_allowed = total_free_allowed(user_id)
         refs = count_referrals(user_id)
         bonus = get_bonus_signals(user_id)
-        # Referral link → REFERRAL_BOT (tofauti na admin bot)
+        # Referral link → REFERRAL_BOT (separate from admin bot)
         ref_link = "https://t.me/{}?start=REF_{}".format(REFERRAL_BOT, user_id)
         share_url = "https://t.me/share/url?url={}".format(ref_link)
         if refs >= 5:
@@ -3731,7 +3866,6 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         else:
             needed = 3 - refs
             ref_status = "⏳ Invite {} more to get bonus signals!".format(needed)
-        status = "✅ Licensed ({})".format(lic_type) if licensed else "🆓 Free Trial ({}/{} used)".format(free_used, free_allowed)
         await update.message.reply_text(
             "📊 *YOUR STATS*\n\n"
             "🔑 Status: {}\n"
@@ -3762,7 +3896,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id=update.effective_user.id
 
-    # Admin: kupokea picha ya BUY au SELL
+    # Admin: receive BUY or SELL signal image
     if user_id == ADMIN_ID and context.user_data.get("awaiting_image"):
         img_type = context.user_data.pop("awaiting_image")
         if update.message.photo:
@@ -3815,7 +3949,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "👥 *TOTAL USERS*\n\n"
                 "📊 All users: *{}*\n"
-                "✅ Licensed: *{}*\n"
                 "🆓 Free trial: *{}*".format(s["total"], licensed, s["free"]),
                 parse_mode="Markdown"
             )
@@ -4105,7 +4238,88 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
-    if context.user_data.get("awaiting_code"):
+    # Admin: search user by name or username
+    if text.startswith("finduser ") and user_id == ADMIN_ID:
+        query = text[9:].strip().lower()
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, first_name, last_name, username,
+                               licensed, licence_type, expiry, free_used
+                        FROM users
+                        WHERE LOWER(COALESCE(first_name,'')) LIKE %s
+                           OR LOWER(COALESCE(last_name,''))  LIKE %s
+                           OR LOWER(COALESCE(username,''))   LIKE %s
+                        LIMIT 10
+                    """, ('%'+query+'%', '%'+query+'%', '%'+query+'%'))
+                    rows = cur.fetchall()
+            if not rows:
+                await update.message.reply_text(
+                    "No users found for: *{}*".format(query),
+                    parse_mode="Markdown"
+                )
+                return
+            msg = "*Search: {}*\n\n".format(query)
+            for r in rows:
+                first = r["first_name"] or ""
+                last  = r["last_name"]  or ""
+                name  = "{} {}".format(first, last).strip() or "No name"
+                uname = "@{}".format(r["username"]) if r["username"] else "No username"
+                uid   = r["user_id"]
+                if r["licensed"]:
+                    status = "Licensed ({})".format(r["licence_type"] or "?")
+                else:
+                    status = "Free trial"
+                msg += (
+                    "Name: *{}*\n"
+                    "Username: {}\n"
+                    "ID: `{}`\n"
+                    "Status: {}\n"
+                    "Revoke: `/revoke {}`\n"
+                    "\n"
+                ).format(name, uname, uid, status, uid)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text("Error: {}".format(e))
+        return
+
+    # Admin: show VTE win rate stats for all forex pairs
+    if text == "vtestats" and user_id == ADMIN_ID:
+        try:
+            forex_pairs = [p for p in YAHOO_SYMBOLS
+                           if "/" in p and "BTC" not in p
+                           and "^" not in YAHOO_SYMBOLS.get(p, "")]
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair, wins, losses,
+                               ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
+                               optimal_tf, avg_movement
+                        FROM pair_stats
+                        WHERE pair = ANY(%s) AND (wins + losses) >= 5
+                        ORDER BY win_rate ASC
+                    """, (forex_pairs,))
+                    rows = cur.fetchall()
+            if not rows:
+                await update.message.reply_text("📊 No VTE data yet. Bot is still learning.")
+                return
+            ranked = get_ranked_forex_pairs()
+            contrarian_set = set(ranked["contrarian"])
+            lines = ["📊 *VTE Win Rate Stats — Forex Pairs*\n"]
+            for r in rows:
+                tag = " 🔄 CONTRARIAN" if r["pair"] in contrarian_set else ""
+                lines.append("• *{}*{}\n  W:{} L:{} | Rate: {}% | TF: {}m".format(
+                    r["pair"], tag,
+                    r["wins"], r["losses"], r["win_rate"],
+                    r["optimal_tf"] or "?"
+                ))
+            await update.message.reply_text(
+                "\n".join(lines), parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text("❌ Error: {}".format(e))
+        return
         context.user_data["awaiting_code"]=False
         code=text.upper().strip()
         if activate_licence(code,user_id):
@@ -4127,131 +4341,193 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 # ============================================================
-# MAIN
-# ============================================================
-# ============================================================
-# VIRTUAL TRADING ENGINE
-# Runs every 5 seconds — places virtual trades on all pairs
-# across 1m, 2m, 3m timeframes and records results automatically
+# VIRTUAL TRADING ENGINE v2
+# Scans every 5 seconds. Places ONE virtual trade per NEW signal
+# per pair (direction change only). Checks results after the
+# correct timeframe expires. ATR is used to detect flat markets
+# and skip recording those results (does not affect user signals).
 # ============================================================
 
 # In-memory store for pending virtual trades
-# { "pair:tf": [(entry_price, direction, expiry_timestamp), ...] }
+# { pair: [(entry_price, direction, expiry_timestamp, tf_secs), ...] }
 _virtual_trades: dict = {}
-_vt_lock = asyncio.Lock() if False else None  # created lazily
 
-VIRTUAL_TF_SECONDS = [60, 120, 180, 300]  # 1m, 2m, 3m, 5m in seconds
+def _vt_get_last_direction(pair):
+    """Get last recorded VTE direction for a pair from DB (survives restarts)."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT direction FROM vte_last_direction WHERE pair=%s", (pair,))
+                row = cur.fetchone()
+        return row["direction"] if row else None
+    except Exception:
+        return None
+
+def _vt_set_last_direction(pair, direction):
+    """Save VTE last direction for a pair to DB."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO vte_last_direction (pair, direction, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (pair) DO UPDATE
+                    SET direction=EXCLUDED.direction, updated_at=NOW()
+                """, (pair, direction))
+            conn.commit()
+    except Exception as e:
+        import logging
+        logging.warning("_vt_set_last_direction failed {}: {}".format(pair, e))
+
+VIRTUAL_TF_SECONDS = [60, 120, 180, 300, 600]  # 1m,2m,3m,5m,10m
+
+def _vt_calc_atr(pair, period=14):
+    """
+    Calculate ATR for a pair using Yahoo Finance 5m data.
+    Returns ATR as a % of current price, or None on failure.
+    Used to detect flat markets — does NOT block user signals.
+    """
+    symbol = YAHOO_SYMBOLS.get(pair)
+    if not symbol:
+        return None
+    try:
+        df = yf.download(symbol, period="2d", interval="5m",
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < period + 1:
+            return None
+        high  = df["High"].squeeze()
+        low   = df["Low"].squeeze()
+        close = df["Close"].squeeze()
+        tr = pd.Series([
+            max(float(high.iloc[i]) - float(low.iloc[i]),
+                abs(float(high.iloc[i]) - float(close.iloc[i-1])),
+                abs(float(low.iloc[i])  - float(close.iloc[i-1])))
+            for i in range(1, len(close))
+        ], index=close.index[1:])
+        atr = float(tr.rolling(period).mean().iloc[-1])
+        price = float(close.iloc[-1])
+        return atr / (price + 1e-9) * 100   # ATR as % of price
+    except Exception as e:
+        logging.warning("VTE ATR calc failed {}: {}".format(pair, e))
+        return None
+
 
 async def _vt_place_trades():
     """
-    Fetch full signal for every trackable pair using generate_signal()
-    (all indicators, MTF, fractal, 1H trend — same as real user signal).
-    Direction used is PRE-REVERSE — we want to know what the market
-    actually does, not what the bot told the user.
-    Virtual trades never trigger auto-reverse.
+    For each forex pair in YAHOO_SYMBOLS:
+    - Generate signal
+    - If direction changed since last check → place ONE new virtual trade
+      for each timeframe (1m/2m/3m/5m/10m)
+    - If direction is same → skip (no duplicate trades)
     """
-    now = time.time()
+    now  = time.time()
     loop = asyncio.get_event_loop()
-    for pair in list(YAHOO_SYMBOLS.keys()):
+
+    # Only track forex pairs (no BTC, indices, commodities)
+    forex_pairs = [p for p in YAHOO_SYMBOLS if "/" in p and "BTC" not in p
+                   and "^" not in YAHOO_SYMBOLS.get(p, "")]
+
+    for pair in forex_pairs:
         try:
-            # Run generate_signal in thread pool (it does blocking HTTP calls)
             sig = await loop.run_in_executor(None, generate_signal, pair)
-            # Use the raw direction BEFORE any reverse flip
-            # We re-derive it: if pair is reversed, flip back to original
             direction = sig["direction"]
+            # Use pre-reverse direction for VTE accuracy
             if is_reverse_pair(pair):
                 direction = "SELL" if direction == "BUY" else "BUY"
+
+            last_dir = _vt_get_last_direction(pair)
+
+            # Only place a new trade when direction changes
+            if direction == last_dir:
+                continue
+
+            _vt_set_last_direction(pair, direction)
 
             price = _fetch_current_price(pair)
             if price is None:
                 continue
 
+            if pair not in _virtual_trades:
+                _virtual_trades[pair] = []
+
+            # Place one trade per timeframe
             for tf_secs in VIRTUAL_TF_SECONDS:
-                key = "{}:{}".format(pair, tf_secs)
                 expiry = now + tf_secs
-                if key not in _virtual_trades:
-                    _virtual_trades[key] = []
-                _virtual_trades[key].append((price, direction, expiry))
+                _virtual_trades[pair].append((price, direction, expiry, tf_secs))
+
+            logging.info("VTE NEW TRADE: {} → {} @ {:.5f}".format(
+                pair, direction, price))
+
         except Exception as e:
             logging.warning("VTE place trade failed {}: {}".format(pair, e))
             continue
 
+
 async def _vt_check_results():
     """
     Check expired virtual trades.
-    For each trade: measure entry→exit movement (in pips/percent),
-    determine win/loss, and update optimal_tf per pair.
-
-    Optimal TF logic:
-    - Track win rate per timeframe per pair
-    - The TF with highest win rate becomes optimal_tf
-    - Also track avg_movement so we know how much the pair typically moves
+    - Measure price movement vs ATR
+    - If movement < 30% of ATR → market was flat → skip (don't record)
+    - Otherwise record win/loss per timeframe
+    - Update pair_stats and optimal_tf
     """
     now = time.time()
-    # Accumulate TF-level stats in memory before saving
-    # { pair: { tf_secs: {"wins":0,"losses":0,"total_movement":0.0,"count":0} } }
-    tf_results: dict = {}
+    tf_results: dict = {}   # { pair: { tf_secs: {wins,losses,total_movement,count} } }
 
-    for key in list(_virtual_trades.keys()):
-        pair, tf_str = key.rsplit(":", 1)
-        tf_secs = int(tf_str)
+    for pair in list(_virtual_trades.keys()):
         remaining = []
-
-        for (entry_price, direction, expiry) in _virtual_trades[key]:
+        for (entry_price, direction, expiry, tf_secs) in _virtual_trades[pair]:
             if now < expiry:
-                remaining.append((entry_price, direction, expiry))
+                remaining.append((entry_price, direction, expiry, tf_secs))
                 continue
 
             exit_price = _fetch_current_price(pair)
             if exit_price is None or entry_price is None:
                 continue
 
-            # Movement as percentage of entry price
-            raw_diff  = exit_price - entry_price
-            movement  = abs(raw_diff) / (entry_price + 1e-9) * 100  # % movement
+            raw_diff = exit_price - entry_price
+            movement_pct = abs(raw_diff) / (entry_price + 1e-9) * 100
 
-            if movement < 0.00001:
-                continue  # Essentially zero movement — skip
+            # ATR flat-market filter — skip recording, but signal still reached user
+            atr_pct = _vt_calc_atr(pair)
+            if atr_pct is not None and movement_pct < (atr_pct * 0.30):
+                logging.info("VTE FLAT SKIP: {} move={:.5f}% < 30% of ATR {:.5f}%".format(
+                    pair, movement_pct, atr_pct))
+                continue   # Skip — flat market, don't corrupt stats
 
             won = (raw_diff > 0) if direction == "BUY" else (raw_diff < 0)
 
-            # Accumulate per-TF stats
             if pair not in tf_results:
                 tf_results[pair] = {}
             if tf_secs not in tf_results[pair]:
-                tf_results[pair][tf_secs] = {"wins": 0, "losses": 0, "total_movement": 0.0, "count": 0}
+                tf_results[pair][tf_secs] = {
+                    "wins": 0, "losses": 0,
+                    "total_movement": 0.0, "count": 0
+                }
 
             tf_results[pair][tf_secs]["count"]          += 1
-            tf_results[pair][tf_secs]["total_movement"] += movement
+            tf_results[pair][tf_secs]["total_movement"] += movement_pct
             if won:
                 tf_results[pair][tf_secs]["wins"]   += 1
             else:
                 tf_results[pair][tf_secs]["losses"] += 1
 
-        _virtual_trades[key] = remaining
+        _virtual_trades[pair] = remaining
 
     if not tf_results:
         return
 
-    # Now save to DB and compute optimal TF per pair
     for pair, tf_data in tf_results.items():
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # Update overall wins/losses
-                    total_wins   = sum(d["wins"]   for d in tf_data.values())
-                    total_losses = sum(d["losses"] for d in tf_data.values())
+                    total_wins     = sum(d["wins"]   for d in tf_data.values())
+                    total_losses   = sum(d["losses"] for d in tf_data.values())
                     total_movement = sum(d["total_movement"] for d in tf_data.values())
-                    total_count    = sum(d["count"] for d in tf_data.values())
+                    total_count    = sum(d["count"]  for d in tf_data.values())
                     avg_mov = total_movement / max(total_count, 1)
 
-                    # Fetch existing TF win rates from DB to compute best TF
-                    cur.execute("""
-                        SELECT optimal_tf, avg_movement FROM pair_stats WHERE pair=%s
-                    """, (pair,))
-                    row = cur.fetchone()
-
-                    # Find best TF from this batch (highest win rate, min 3 trades)
+                    # Best TF = highest win rate with at least 3 trades
                     best_tf   = None
                     best_rate = 0.0
                     for tf_secs, d in tf_data.items():
@@ -4261,13 +4537,16 @@ async def _vt_check_results():
                         rate = d["wins"] / total
                         if rate > best_rate:
                             best_rate = rate
-                            best_tf   = tf_secs // 60  # Convert to minutes
+                            best_tf   = tf_secs // 60
 
-                    # Keep existing optimal_tf if new batch doesn't have enough data
+                    # Smooth avg_movement with existing DB value
+                    cur.execute(
+                        "SELECT optimal_tf, avg_movement FROM pair_stats WHERE pair=%s",
+                        (pair,)
+                    )
+                    row = cur.fetchone()
                     if best_tf is None and row and row["optimal_tf"]:
                         best_tf = row["optimal_tf"]
-
-                    # Smooth avg_movement with existing value
                     if row and row["avg_movement"]:
                         avg_mov = (avg_mov + row["avg_movement"]) / 2
 
@@ -4276,33 +4555,35 @@ async def _vt_check_results():
                             (pair, wins, losses, consecutive_losses, optimal_tf, avg_movement)
                         VALUES (%s, %s, %s, 0, %s, %s)
                         ON CONFLICT (pair) DO UPDATE SET
-                            wins       = pair_stats.wins + EXCLUDED.wins,
-                            losses     = pair_stats.losses + EXCLUDED.losses,
-                            optimal_tf = COALESCE(EXCLUDED.optimal_tf, pair_stats.optimal_tf),
+                            wins         = pair_stats.wins + EXCLUDED.wins,
+                            losses       = pair_stats.losses + EXCLUDED.losses,
+                            optimal_tf   = COALESCE(EXCLUDED.optimal_tf, pair_stats.optimal_tf),
                             avg_movement = EXCLUDED.avg_movement
                     """, (pair, total_wins, total_losses, best_tf, avg_mov))
 
                 conn.commit()
-                logging.info("VTE: {} — W:{} L:{} | optimal_tf={}m | avg_move={:.4f}%".format(
+                logging.info("VTE RESULT: {} W:{} L:{} | best_tf={}m | avg_move={:.4f}%".format(
                     pair, total_wins, total_losses, best_tf, avg_mov))
         except Exception as e:
             logging.warning("VTE result save failed {}: {}".format(pair, e))
 
+
 async def virtual_trading_engine():
     """
-    Main loop: every 5 seconds place new virtual trades,
-    then check expired ones. Runs forever in background.
+    Main VTE loop: every 5 seconds scan all forex pairs,
+    place trades on direction changes, check expired results.
+    Runs forever in background.
     """
-    logging.info("Virtual Trading Engine starting...")
+    logging.info("Virtual Trading Engine v2 starting...")
     cycle = 0
     while True:
         try:
             await _vt_place_trades()
             await _vt_check_results()
             cycle += 1
-            if cycle % 60 == 0:  # Log every 5 minutes
-                logging.info("VTE: cycle {} complete — {} active trade slots".format(
-                    cycle, sum(len(v) for v in _virtual_trades.values())))
+            if cycle % 60 == 0:
+                active = sum(len(v) for v in _virtual_trades.values())
+                logging.info("VTE: cycle {} — {} active trades".format(cycle, active))
         except Exception as e:
             logging.warning("VTE cycle error: {}".format(e))
         await asyncio.sleep(5)
@@ -4326,6 +4607,48 @@ def get_optimal_tf(pair, fallback=None):
     except Exception as e:
         logging.warning("get_optimal_tf failed {}: {}".format(pair, e))
     return fallback
+
+
+def get_ranked_forex_pairs():
+    """
+    Return all forex pairs ranked by VTE win rate (ascending — worst first).
+    Only pairs in YAHOO_SYMBOLS with "/" in name (forex only, no BTC/indices).
+    Splits into two groups:
+      - Group A (contrarian): lowest win rate pairs (worst performers)
+      - Group B (normal):     higher win rate pairs
+    Returns: {
+        "contrarian": [pair, ...],   # worst 3 — bot will flip signal
+        "normal":     [pair, ...],   # rest — normal signal
+        "all":        [pair, ...]    # full list worst→best
+    }
+    """
+    forex_pairs = [p for p in YAHOO_SYMBOLS
+                   if "/" in p and "BTC" not in p
+                   and "^" not in YAHOO_SYMBOLS.get(p, "")]
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pair, wins, losses,
+                           ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate
+                    FROM pair_stats
+                    WHERE pair = ANY(%s) AND (wins + losses) >= 5
+                    ORDER BY win_rate ASC, losses DESC
+                """, (forex_pairs,))
+                ranked = [r["pair"] for r in cur.fetchall()]
+    except Exception as e:
+        logging.warning("get_ranked_forex_pairs failed: {}".format(e))
+        ranked = []
+
+    # Pairs not yet in DB go to the end (unknown — treat as normal)
+    ranked_set = set(ranked)
+    unranked = [p for p in forex_pairs if p not in ranked_set]
+    all_pairs = ranked + unranked
+
+    contrarian = all_pairs[:3]    # worst 3 → contrarian (flip signal)
+    normal     = all_pairs[3:]    # rest → normal signal
+
+    return {"contrarian": contrarian, "normal": normal, "all": all_pairs}
 
 
 def get_top5_pairs(otc_only=False, non_otc_only=False):
@@ -4353,6 +4676,21 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
     except Exception as e:
         logging.warning("get_top5_pairs failed: {}".format(e))
         return []
+
+
+def is_contrarian_pair(pair):
+    """
+    Check if a pair is in the worst-3 by VTE win rate.
+    Applies to ALL pairs — OTC and forex.
+    If yes, the signal direction is flipped before showing to user.
+    """
+    try:
+        # Get OTC real equivalent if OTC pair
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        ranked = get_ranked_forex_pairs()
+        return pair in ranked["contrarian"] or real_pair in ranked["contrarian"]
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -4399,8 +4737,8 @@ def main():
     import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    # ── Fungua port KWANZA kabla ya kitu chochote ──────────────
-    # Render inahitaji port ifunguliwe ndani ya sekunde chache
+    # ── Open port FIRST before anything else ───────────────────
+    # Render requires port to open within a few seconds of startup
     PORT = int(os.environ.get("PORT", 8080))
 
     class HealthHandler(BaseHTTPRequestHandler):
@@ -4419,7 +4757,7 @@ def main():
     t.start()
     print("Port {} open. Starting bot...".format(PORT))
 
-    # ── Sasa endelea na init na bot ────────────────────────────
+    # ── Now proceed with init and bot startup ──────────────────
     print("EVALON MASTER PRO starting...")
     init_db()
     print("Database ready.")
