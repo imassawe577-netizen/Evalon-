@@ -46,6 +46,13 @@ ADMIN_ID       = 8054370971
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
+BOT_USERNAME   = ""  # Set at startup in run_bot()
+
+def support_url():
+    """Returns support link — opens this bot with ?start=support."""
+    if BOT_USERNAME:
+        return "https://t.me/{}?start=support".format(BOT_USERNAME)
+    return "https://t.me/evalonwinnersbot"
 
 # Health check handled by webhook server at /health path
 
@@ -1695,7 +1702,7 @@ def signal_keyboard(pair):
 
 def expired_signal_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👑 Contact Admin", url="https://t.me/evalonwinnersbot")],
+        [InlineKeyboardButton("💬 Support", url=support_url())],
         [InlineKeyboardButton("▶️ Start", callback_data="restart_fresh")],
     ])
 
@@ -1707,7 +1714,7 @@ def unlock_keyboard():
 
 def payment_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Contact Admin", url="https://t.me/evalonwinnersbot")],
+        [InlineKeyboardButton("💬 Support", url=support_url())],
         [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_unlock")],
     ])
@@ -1865,10 +1872,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Referral check
     if context.args:
         try:
-            referrer_id = int(context.args[0].replace("REF_", ""))
-            if referrer_id != user_id:
-                register_referral(user_id, referrer_id)
-        except:
+            arg = context.args[0]
+            if arg == "support":
+                # User tapped Support button — notify admin
+                user = update.effective_user
+                name = user.full_name or "Unknown"
+                username = "@" + user.username if user.username else "no username"
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text="💬 *Support Request*\n\n"
+                             "👤 Name: {}\n"
+                             "🔗 Username: {}\n"
+                             "🆔 ID: `{}`\n\n"
+                             "User tapped the Support button.".format(name, username, user_id),
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+            else:
+                referrer_id = int(arg.replace("REF_", ""))
+                if referrer_id != user_id:
+                    register_referral(user_id, referrer_id)
+        except Exception:
             pass
     # Channel membership check
     if not await check_channel_and_proceed(update, context):
@@ -1964,13 +1990,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_image_keyboard()
         )
     else:
+        # Get bot username for support link
+        try:
+            bot_info = await context.bot.get_me()
+            support_url = "https://t.me/{}?start=support".format(bot_info.username)
+        except Exception:
+            support_url = "https://t.me/evalonwinnersbot"
         await update.message.reply_text(
-            "⚡ *EVALON MASTER PRO*\n\n📌 *How to use:*\n1️⃣ Select your trading pair\n2️⃣ Get your BUY or SELL signal\n3️⃣ Follow the signal on your platform\n\n🔑 Have a licence code? Tap *Enter Licence Code*\n💬 Need access? Contact @evalonwinnersbot",
+            "⚡ *EVALON MASTER PRO*\n\n"
+            "📌 *How to use:*\n"
+            "1️⃣ Select your trading pair\n"
+            "2️⃣ Get your BUY or SELL signal\n"
+            "3️⃣ Follow the signal on your platform\n\n"
+            "🔑 Have a licence code? Tap *Enter Licence Code*\n"
+            "💬 Need help? Tap *Support* below",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 Start Trading", callback_data="choose_pair")],
                 [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
-                [InlineKeyboardButton("💬 Contact Admin", url="https://t.me/evalonwinnersbot")],
+                [InlineKeyboardButton("💬 Support", url=support_url)],
             ])
         )
 
@@ -2152,6 +2190,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data=="bot_pick_pair":
+        # Free trial users cannot use Bot Pick Pair — subscribers only
+        if not is_licensed(user_id):
+            await q.edit_message_text(
+                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
+                "This feature is available for licensed subscribers only.\n\n"
+                "Upgrade to get:\n"
+                "✅ Bot-picked best pairs\n"
+                "✅ Unlimited signals\n"
+                "✅ Win rate 90% — 98%",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
+                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+                ])
+            )
+            return
+
         weekend      = is_weekend()
         otc_on       = is_otc_enabled()
         force_non_otc = not otc_on
@@ -2200,12 +2255,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("📋 Choose Myself", callback_data="choose_pair")])
         kb = InlineKeyboardMarkup(buttons)
 
-        await query.edit_message_text(
+        await q.edit_message_text(
             "🤖 *Bot Top 5 Picks*\n\n"
             "Pairs ranked by virtual trading win rate.\n"
             "Select one to get a signal:",
             parse_mode="Markdown",
             reply_markup=kb
+        )
+        return
+
+    if data=="my_stats":
+        u = get_user(user_id)
+        licensed = is_licensed(user_id)
+        lic_type = u.get("licence_type", "").capitalize() if licensed else "Free Trial"
+        expiry_txt = get_expiry_text(user_id) if licensed else "—"
+        free_used = free_signals_used(user_id)
+        free_allowed = total_free_allowed(user_id)
+        refs = count_referrals(user_id)
+        bonus = get_bonus_signals(user_id)
+        status = "✅ Licensed ({})".format(lic_type) if licensed else "🆓 Free Trial ({}/{} used)".format(free_used, free_allowed)
+        await q.edit_message_text(
+            "📊 *YOUR STATS*\n\n"
+            "🔑 Status: {}\n"
+            "⏳ Expiry: {}\n"
+            "🆓 Free signals: {}/{}\n"
+            "👥 Referrals: {}\n"
+            "🎁 Bonus signals: {}\n\n"
+            "{}".format(
+                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Upgrade", callback_data="pay_info")],
+                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+            ]) if not licensed else InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+            ])
         )
         return
 
@@ -2997,7 +3083,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ *Invalid or already used code.*\n\nCheck your code or contact admin.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 Contact Admin", url="https://t.me/evalonwinnersbot")],
+                    [InlineKeyboardButton("💬 Support", url=support_url())],
                     [InlineKeyboardButton("🔑 Try Again", callback_data="enter_code")]
                 ])
             )
@@ -3234,6 +3320,14 @@ async def run_bot():
     RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
     ptb_app = Application.builder().token(BOT_TOKEN).build()
+    await ptb_app.initialize()
+
+    # Set global bot username for support links
+    global BOT_USERNAME
+    me = await ptb_app.bot.get_me()
+    BOT_USERNAME = me.username or ""
+    logging.info("Bot username: @{}".format(BOT_USERNAME))
+
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("help", help_command))
     ptb_app.add_handler(CommandHandler("setimage", setimage_command))
@@ -3243,12 +3337,10 @@ async def run_bot():
     ptb_app.add_handler(ChatJoinRequestHandler(join_request_handler))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_handler(MessageHandler(filters.PHOTO, message_handler))
-    # FIXED: Exclude commands from TEXT filter — CommandHandlers above handle /commands properly
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     # ── Use async polling (works inside asyncio.run) ──
     print("Starting bot polling...")
-    await ptb_app.initialize()
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     print("Bot polling active.")
