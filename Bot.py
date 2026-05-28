@@ -833,6 +833,41 @@ def _fetch_1h_trend(pair):
         logging.warning("_fetch_1h_trend failed for {}: {}".format(pair, e))
         return None
 
+
+def _confirm_1h_direction(pair, direction):
+    """
+    Smart check: kama signal ya chini (1m/2m) ni SELL,
+    angalia 1H candles za sekunde chache zilizopita je zinaenda chini?
+    Returns True kama 1H inathibitisha direction, False kama inapingana.
+    Hii ni accuracy layer ya ziada — kama 1H haina data, rudi True (proceed).
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return True  # No real data — proceed with signal
+    try:
+        df = yf.download(symbol, period="3d", interval="1h", progress=False, auto_adjust=True)
+        if df is None or len(df) < 5:
+            return True
+        close = df["Close"].squeeze()
+        # Look at last 3 candles to determine if price is moving in our direction
+        c_last   = float(close.iloc[-1])
+        c_prev1  = float(close.iloc[-2])
+        c_prev2  = float(close.iloc[-3])
+        # Count how many recent candles agree with our direction
+        agree = 0
+        if direction == "SELL":
+            if c_last  < c_prev1: agree += 1
+            if c_prev1 < c_prev2: agree += 1
+        else:  # BUY
+            if c_last  > c_prev1: agree += 1
+            if c_prev1 > c_prev2: agree += 1
+        # At least 1 of the 2 recent 1H candles must confirm
+        return agree >= 1
+    except Exception as e:
+        logging.warning("_confirm_1h_direction failed for {}: {}".format(pair, e))
+        return True  # Proceed on error
+
 # Multi-timeframe intervals for Yahoo Finance
 MTF_INTERVALS = [
     ("1m",  "1d"),   # 1 minute
@@ -1230,15 +1265,11 @@ def get_cooldown_remaining(user_id, pair):
 
 async def schedule_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price):
     """
-    Background task: waits for signal timeframe to expire, then checks result.
-    Only for non-OTC pairs with real Yahoo Finance price data.
-    direction: the direction shown to user (already reversed if pair was reversed)
-
-    TIMING FIX: entry_price captured immediately at signal send time.
-    We sleep EXACTLY timeframe_mins * 60 seconds — no extra delay.
+    Wait for candle to expire, add 5s buffer for candle to fully close,
+    then check price once and send result.
     """
-    # Sleep exactly the timeframe — result checked right when candle closes
-    await asyncio.sleep(timeframe_mins * 60)
+    # Wait for candle expiry + 5 second buffer
+    await asyncio.sleep(timeframe_mins * 60 + 5)
 
     try:
         with get_conn() as conn:
@@ -1250,7 +1281,6 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                 row = cur.fetchone()
         if not row or row["result_sent"]:
             return
-        # Use DB entry_price as authoritative (captured at signal send time)
         db_entry = row.get("entry_price")
         if db_entry is not None:
             entry_price = float(db_entry)
@@ -1261,44 +1291,35 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
     if entry_price is None:
         return
 
-    # Fetch exit price — retry up to 3 times with 5s gap
+    # Fetch exit price — retry up to 3 times with 3s gap if API fails
     exit_price = None
-    for attempt in range(3):
+    for _ in range(3):
         exit_price = _fetch_current_price(pair)
         if exit_price is not None:
             break
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
     if exit_price is None:
         return
 
-    # Compare direction shown to user vs actual price movement
-    # BUY shown → win if price went UP
-    # SELL shown → win if price went DOWN
     price_diff = exit_price - entry_price
     if abs(price_diff) < 0.000001:
-        return  # Price unchanged — too close to call, skip
+        return  # No movement — skip
 
     if direction == "BUY":
         won = price_diff > 0
     else:
         won = price_diff < 0
 
-    # Check if pair was reversed when signal was given
-    # (direction passed in is already the reversed direction shown to user)
     was_reversed = is_reverse_pair(pair)
 
-    result_emoji = "🏆" if won else "💔"
-    result_word  = "WON" if won else "LOSS"
-    pair_clean   = pair.replace("/", "").replace(" ", "").upper()
-    result_text  = (
-        "╔═══════════════════════╗\n"
-        "{} EVALON {} TF {}M {} {}\n"
-        "╚═══════════════════════╝"
-    ).format(result_emoji, pair_clean, timeframe_mins, result_word, result_emoji)
+    if won:
+        result_text = "🏆 *EVALON {}* TF {}M — *WON* ✅".format(pair, timeframe_mins)
+    else:
+        result_text = "💔 *EVALON {}* TF {}M — *LOSS* ❌".format(pair, timeframe_mins)
 
     try:
-        sent = await bot.send_message(chat_id=chat_id, text=result_text)
+        sent = await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1306,7 +1327,6 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                     (sent.message_id, user_id, pair)
                 )
             conn.commit()
-        # Update stats with correct won value + was_reversed flag
         update_pair_stats(pair, won, was_reversed=was_reversed)
     except Exception as e:
         logging.warning("schedule_result_check send failed: {}".format(e))
@@ -1603,6 +1623,26 @@ def generate_signal(pair):
     else:
         timeframe = random.choice([2, 3])
 
+    # ── SMART 1H CANDLE CONFIRMATION FOR SHORT TFs ───────────
+    # Kama timeframe ni 1m au 2m, kagua kwamba 1H candles za hivi karibuni
+    # zinaenda direction ile ile. Kama 1H inapingana:
+    #   - Jaribu 2m na 3m confirmation
+    #   - Kama zote zinapingana → timeframe = 0 (no signal)
+    if timeframe <= 2 and (trend_1h is not None or True):
+        h1_confirmed = _confirm_1h_direction(pair, direction)
+        if not h1_confirmed:
+            # 1H ya hivi karibuni inapingana na signal yetu
+            # Jaribu timeframe ndefu zaidi (2m, 3m) — inaweza market inarejea
+            if timeframe == 1:
+                timeframe = 2  # Escalate to 2m
+                h1_confirmed = _confirm_1h_direction(pair, direction)
+            if not h1_confirmed:
+                timeframe = 3  # Try 3m
+                h1_confirmed = _confirm_1h_direction(pair, direction)
+            if not h1_confirmed:
+                # All short TFs rejected — no good signal
+                timeframe = 0
+
     # ── SESSION-AWARE CONTRARIAN OVERRIDE ────────────────────
     # FIXED: Session bias override haitumiki kama 1H trend iko wazi.
     # 1H trend ni nguvu zaidi — haipigwi kura na bias ya historia ya signals.
@@ -1658,6 +1698,7 @@ def generate_signal(pair):
         "vwap_data": vwap_data,
         "confluence": confluence,
         "mtf": mtf,
+        "flat": (timeframe == 0),
     }
 
 # ============================================================
@@ -2350,27 +2391,74 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if current signal expiry is still active
         state = get_user_signal_state(user_id, pair)
         expiry_finished = True
+        press_count = 0
         if state:
             signal_time = state["signal_time"]
             if isinstance(signal_time, str):
                 signal_time = datetime.fromisoformat(signal_time)
             elapsed   = (datetime.utcnow() - signal_time).total_seconds()
             threshold = state["last_timeframe"] * 60
+            press_count = state.get("flip_count", 0)
             if elapsed < threshold:
                 expiry_finished = False
 
         if not expiry_finished:
-            # Signal bado hai — mpe pairs zote achague upya
-            await context.bot.send_message(
-                chat_id=chat,
-                text="⚡ *EVALON MASTER PRO*\n\n📊 Select a trading pair:",
-                parse_mode="Markdown",
-                reply_markup=pairs_keyboard()
-            )
-            return
-        else:
-            # Expiry imeisha — toa signal ya pair ile ile moja kwa moja (kama "sel_" flow)
-            # Free trial check
+            # Signal still active — do NOT block. Pick a different TF and give new signal.
+            # After 4+ taps within same signal window, warn user then still give signal.
+            if press_count >= 4:
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text=(
+                        "⚠️ *Heads up!*\n\n"
+                        "Tapping *Get More* too many times while a signal is active "
+                        "can cause the bot to lose direction accuracy and may lead to a loss.\n\n"
+                        "For best results, wait for the signal to expire before requesting a new one."
+                    ),
+                    parse_mode="Markdown"
+                )
+            # Always continue to give a new signal regardless — just with a different TF
+            # Pick a TF different from the current one, favoring longer TFs for stability
+            current_tf = state["last_timeframe"] if state else 1
+            # Choose TF with best pip movement potential (longer = more movement room)
+            best_tf = get_optimal_tf(pair)
+            if best_tf and best_tf != current_tf:
+                new_tf = best_tf
+            else:
+                # Escalate to next TF: 1→2, 2→3, 3→1
+                tf_cycle = {1: 2, 2: 3, 3: 1}
+                new_tf = tf_cycle.get(current_tf, 2)
+
+            # Generate signal with the new timeframe
+            clear_user_signal_state(user_id, pair)
+
+        # --- Pip-based expiry selection helper (used below) ---
+        # Bot checks avg_movement from VTE stats to pick optimal TF:
+        # High avg_movement (>0.1%) → shorter TF (1m) sufficient
+        # Low avg_movement (<0.05%) → longer TF (3m) needed for clear candle close
+        def _pick_tf_by_pips(pair, fallback_tf):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT avg_movement, optimal_tf FROM pair_stats WHERE pair=%s", (pair,)
+                        )
+                        row = cur.fetchone()
+                if row and row["avg_movement"]:
+                    avg_mov = float(row["avg_movement"])
+                    if avg_mov >= 0.10:
+                        return 1   # Moves fast — 1m is enough
+                    elif avg_mov >= 0.06:
+                        return 2   # Medium movement — 2m
+                    else:
+                        return 3   # Slow pair — needs 3m for clear close
+                if row and row["optimal_tf"]:
+                    return int(row["optimal_tf"])
+            except Exception:
+                pass
+            return fallback_tf
+
+        if expiry_finished:
+            # Fresh signal flow
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
                 bonus = get_bonus_signals(user_id)
                 refs  = count_referrals(user_id)
@@ -2384,116 +2472,115 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=unlock_keyboard()
                 )
                 return
-            # Weekend check
             if is_weekend() and "OTC" not in pair:
                 await context.bot.send_message(chat_id=chat, text="⚠️ *Market Closed (Weekend)*\n\nThis pair is not available on weekends.\nPlease select an *OTC* pair instead.", parse_mode="Markdown", reply_markup=pairs_keyboard())
                 return
 
             inactivity_reset(user_id, chat)
-            try: await q.message.delete()
-            except: pass
-
-            # Generate fresh signal for same pair (expiry imeisha)
             clear_user_signal_state(user_id, pair)
 
-            # Candle safe zone check
-            if not is_candle_safe_zone():
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                    ])
-                )
-                return
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                ])
+            )
+            return
 
-            cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
-            await asyncio.sleep(2)
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
+        await asyncio.sleep(2)
 
-            sig       = generate_signal(pair)
-            direction = sig["direction"]
-            timeframe = sig["timeframe"]
-            strength  = sig["strength"]
+        sig       = generate_signal(pair)
+        direction = sig["direction"]
+        strength  = sig["strength"]
 
-            # Flat market block
-            if sig.get("flat") and timeframe == 0:
-                try: await cm.delete()
-                except: pass
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="🟡 *No good signal available.*",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
-                )
-                return
+        # Use pip-based TF if expiry finished (fresh), or the new_tf we picked above
+        if expiry_finished:
+            timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
+        else:
+            timeframe = new_tf  # Already determined above for mid-signal tap
 
-            # Trend validation
-            trend_dir = get_trend_direction(pair)
-            if trend_dir is not None:
-                direction = trend_dir
-            elif sig.get("indicators_agree", 7) < 4:
-                try: await cm.delete()
-                except: pass
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="🟡 *No good signal available.*",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
-                )
-                return
-
-            save_user_signal_state(user_id, pair, direction, timeframe, 0)
-
-            # For non-OTC: capture entry price BEFORE any delay (at signal time)
-            gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-            gm_entry_price = None
-            if gm_is_non_otc:
-                gm_entry_price = _fetch_current_price(pair)
-                save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=gm_entry_price)
-
-            ib    = direction == "BUY"
-            img   = get_buy_image() if ib else get_sell_image()
-            arrow = "Up 🟢" if ib else "Down 🔴"
-            if not is_licensed(user_id): use_free_signal(user_id)
+        # Flat market block
+        if sig.get("flat") and sig["timeframe"] == 0:
             try: await cm.delete()
             except: pass
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
-            sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
-
-            # Result tracker for non-OTC
-            if gm_is_non_otc and gm_entry_price is not None:
-                asyncio.create_task(
-                    schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
-                )
-
-            inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
-
-            async def inactivity_expire_gm(uid, cid):
-                await asyncio.sleep(INACTIVITY_MINUTES * 60)
-                msg_ids = inactivity_get_msgs(uid)
-                for mid in msg_ids:
-                    try: await context.bot.delete_message(chat_id=cid, message_id=mid)
-                    except: pass
-                inactivity_clear(uid)
-                try:
-                    await context.bot.send_message(
-                        chat_id=cid,
-                        text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% — 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
-                        parse_mode="Markdown",
-                        reply_markup=expired_signal_keyboard()
-                    )
-                except Exception as e:
-                    logging.warning("inactivity_expire send failed: {}".format(e))
-
-            task = asyncio.create_task(inactivity_expire_gm(user_id, chat))
-            USER_INACTIVITY[user_id]["task"] = task
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No good signal available.*\n\nMarket conditions are unclear right now.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
+            )
             return
+
+        # Trend validation
+        trend_dir = get_trend_direction(pair)
+        if trend_dir is not None:
+            direction = trend_dir
+        elif sig.get("indicators_agree", 7) < 4:
+            try: await cm.delete()
+            except: pass
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No good signal available.*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
+            )
+            return
+
+        new_flip_count = (press_count + 1) if not expiry_finished else 0
+        save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
+
+        # For non-OTC: capture entry price at signal time
+        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        gm_entry_price = None
+        if gm_is_non_otc:
+            gm_entry_price = _fetch_current_price(pair)
+            save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count, entry_price=gm_entry_price)
+
+        ib    = direction == "BUY"
+        img   = get_buy_image() if ib else get_sell_image()
+        arrow = "Up 🟢" if ib else "Down 🔴"
+        if not is_licensed(user_id): use_free_signal(user_id)
+        try: await cm.delete()
+        except: pass
+        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+
+        if gm_is_non_otc and gm_entry_price is not None:
+            asyncio.create_task(
+                schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
+            )
+
+        inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
+
+        async def inactivity_expire_gm(uid, cid):
+            await asyncio.sleep(INACTIVITY_MINUTES * 60)
+            msg_ids = inactivity_get_msgs(uid)
+            for mid in msg_ids:
+                try: await context.bot.delete_message(chat_id=cid, message_id=mid)
+                except: pass
+            inactivity_clear(uid)
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% — 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
+                    parse_mode="Markdown",
+                    reply_markup=expired_signal_keyboard()
+                )
+            except Exception as e:
+                logging.warning("inactivity_expire send failed: {}".format(e))
+
+        task = asyncio.create_task(inactivity_expire_gm(user_id, chat))
+        USER_INACTIVITY[user_id]["task"] = task
+        return
 
     if data.startswith("sel_"):
         idx=data[4:]
@@ -2714,17 +2801,135 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_INACTIVITY[user_id]["task"] = task
 
 async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Simulate inline button press from a reply keyboard button."""
-    # Send a temporary inline menu that triggers the right flow
-    cb_map = {
-        "choose_pair":   ("📊 *Choose a pair:*",          InlineKeyboardMarkup([[InlineKeyboardButton("📊 Open Pairs", callback_data="choose_pair")]])),
-        "bot_pick_pair": ("🤖 *Loading Bot Picks...*",    InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Bot Pick Pair", callback_data="bot_pick_pair")]])),
-        "pay_info":      ("💎 *Upgrade options:*",         InlineKeyboardMarkup([[InlineKeyboardButton("💎 View Plans", callback_data="pay_info")]])),
-        "my_stats":      ("📊 *Your stats:*",              InlineKeyboardMarkup([[InlineKeyboardButton("📊 My Stats", callback_data="my_stats")]])),
-    }
-    text_msg, kb = cb_map.get(data, ("", None))
-    if kb:
-        await update.message.reply_text(text_msg, parse_mode="Markdown", reply_markup=kb)
+    """Directly handle reply keyboard button presses — no middleman button needed."""
+    user_id = update.effective_user.id
+
+    if data == "choose_pair":
+        weekend = is_weekend()
+        taglines = [
+            "🌙 *After-Hours Trading*\nWeekend-only pairs available 24/7." if weekend else
+            "🌍 *Real Market Pairs*\nTrade on live market data.",
+        ]
+        tagline = random.choice(taglines)
+        header = "⚡ *EVALON MASTER PRO*\n\n{}\n\n📊 Select your trading pair:".format(tagline)
+        await update.message.reply_text(
+            header,
+            parse_mode="Markdown",
+            reply_markup=pairs_keyboard()
+        )
+        return
+
+    if data == "bot_pick_pair":
+        # Free trial users cannot use Bot Pick Pair — subscribers only
+        if not is_licensed(user_id):
+            await update.message.reply_text(
+                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
+                "This feature is available for licensed subscribers only.\n\n"
+                "Upgrade to get:\n"
+                "✅ Bot-picked best pairs\n"
+                "✅ Unlimited signals\n"
+                "✅ Win rate 90% — 98%",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
+                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+                ])
+            )
+            return
+
+        weekend      = is_weekend()
+        otc_on       = is_otc_enabled()
+        force_non_otc = not otc_on
+
+        # Get top 5 from virtual trading engine stats
+        if force_non_otc:
+            top5 = get_top5_pairs(non_otc_only=True)
+        elif weekend:
+            top5 = get_top5_pairs(otc_only=True)
+        else:
+            top5 = get_top5_pairs()
+
+        # Fallback: if not enough virtual data yet, pick random
+        if len(top5) < 3:
+            if force_non_otc:
+                pool = [p for p in ALL_PAIRS if "OTC" not in p]
+            elif weekend:
+                pool = [p for p in ALL_PAIRS if "OTC" in p]
+            else:
+                pool = list(ALL_PAIRS)
+            random.shuffle(pool)
+            existing = {r["pair"] for r in top5}
+            for p in pool:
+                if p not in existing and len(top5) < 5:
+                    top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
+                    existing.add(p)
+
+        is_admin_user = (user_id == ADMIN_ID)
+        buttons = []
+        for row in top5:
+            pair  = row["pair"]
+            wr    = row.get("win_rate") or 0
+            total = row.get("wins", 0) + row.get("losses", 0)
+            if is_admin_user and total > 0:
+                label = "📊 {} — {:.0f}% ({} trades)".format(pair, wr, total)
+            else:
+                label = "📊 {}".format(pair)
+            try:
+                idx = ALL_PAIRS.index(pair)
+            except ValueError:
+                continue
+            buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
+
+        buttons.append([InlineKeyboardButton("📋 Choose Myself", callback_data="choose_pair")])
+        kb = InlineKeyboardMarkup(buttons)
+
+        await update.message.reply_text(
+            "🤖 *Bot Top 5 Picks*\n\n"
+            "Pairs ranked by virtual trading win rate.\n"
+            "Select one to get a signal:",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    if data == "pay_info":
+        await update.message.reply_text(
+            PAYMENT_TEXT,
+            parse_mode="Markdown",
+            reply_markup=payment_keyboard()
+        )
+        return
+
+    if data == "my_stats":
+        u = get_user(user_id)
+        licensed = is_licensed(user_id)
+        lic_type = u.get("licence_type", "").capitalize() if licensed else "Free Trial"
+        expiry_txt = get_expiry_text(user_id) if licensed else "—"
+        free_used = free_signals_used(user_id)
+        free_allowed = total_free_allowed(user_id)
+        refs = count_referrals(user_id)
+        bonus = get_bonus_signals(user_id)
+        status = "✅ Licensed ({})".format(lic_type) if licensed else "🆓 Free Trial ({}/{} used)".format(free_used, free_allowed)
+        await update.message.reply_text(
+            "📊 *YOUR STATS*\n\n"
+            "🔑 Status: {}\n"
+            "⏳ Expiry: {}\n"
+            "🆓 Free signals: {}/{}\n"
+            "👥 Referrals: {}\n"
+            "🎁 Bonus signals: {}\n\n"
+            "{}".format(
+                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Upgrade", callback_data="pay_info")],
+                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+            ]) if not licensed else InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+            ])
+        )
+        return
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3045,6 +3250,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Reply Keyboard Button Handlers ────────────────────────
+    # Delete the user's keyboard message immediately to keep chat clean
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     if text in ("/start", "🔄 Restart"):
         await start(update, context)
         return
@@ -3288,6 +3499,9 @@ def get_optimal_tf(pair, fallback=None):
     except Exception as e:
         logging.warning("get_optimal_tf failed {}: {}".format(pair, e))
     return fallback
+
+
+def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
     Return top 5 pairs by win rate with minimum 5 virtual trades.
     Used by bot_pick_pair to show user 5 choices.
