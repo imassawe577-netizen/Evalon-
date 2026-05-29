@@ -48,8 +48,9 @@ CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
-SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
+SUPPORT_BOT = "Evalonwinnersbot"   # Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
+FINNHUB_API_KEY = "d8cl2q1r01qidic8fee0d8cl2q1r01qidic8feeg"  # Finnhub API key for trend data
 
 def support_url():
     """Returns support link — opens support bot with 'admin' pre-filled."""
@@ -827,56 +828,84 @@ OTC_TO_REAL = {
 
 def _fetch_1h_trend(pair):
     """
-    Fetch 1H candle data and determine trend direction using layered confirmation.
-
-    Rules (in order of priority):
-    1. EMA cross (9 vs 21) is REQUIRED — if absent/flat, return None immediately.
-    2. Price position vs EMA21 must agree with EMA cross.
-    3. MACD histogram direction must confirm.
-    4. RSI 1H provides momentum confirmation.
-    5. Last 3 candles direction provides momentum check.
-    6. Reversal detection: if recent candles strongly oppose EMA cross + MACD flips, override.
-
-    Returns: 'BUY', 'SELL', or None (unclear — no signal should be issued).
+    Fetch 1H candle data from Finnhub (primary) or Yahoo Finance (fallback).
+    Determines trend direction using EMA cross + MACD + RSI + candle momentum.
+    Returns: 'BUY', 'SELL', or None
     """
+    import urllib.request
+    import json as _json
+
     real_pair = OTC_TO_REAL.get(pair, pair)
-    symbol = YAHOO_SYMBOLS.get(real_pair)
-    if not symbol:
-        return None
-    try:
-        df = yf.download(symbol, period="7d", interval="1h", progress=False, auto_adjust=True)
-        if df is None or len(df) < 30:
+
+    FINNHUB_SYMBOLS = {
+        "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
+        "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
+        "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
+        "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
+        "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
+        "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
+        "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
+        "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
+        "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
+        "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
+        "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
+        "GBP/CHF": "OANDA:GBP_CHF", "USD/MXN": "OANDA:USD_MXN",
+        "Bitcoin": "BINANCE:BTCUSDT", "Gold": "OANDA:XAU_USD",
+    }
+
+    close_prices = None
+    finnhub_symbol = FINNHUB_SYMBOLS.get(real_pair)
+
+    # --- Try Finnhub first ---
+    if finnhub_symbol:
+        try:
+            now_ts = int(time.time())
+            from_ts = now_ts - (7 * 24 * 3600)
+            candle_url = (
+                "https://finnhub.io/api/v1/forex/candle"
+                "?symbol={}&resolution=60&from={}&to={}&token={}"
+            ).format(finnhub_symbol, from_ts, now_ts, FINNHUB_API_KEY)
+            with urllib.request.urlopen(candle_url, timeout=8) as resp:
+                data = _json.loads(resp.read().decode())
+            if data.get("s") == "ok" and len(data.get("c", [])) >= 30:
+                import pandas as _pd
+                close_prices = _pd.Series(data["c"])
+                logging.info("Finnhub 1H OK: {}".format(pair))
+        except Exception as e:
+            logging.warning("Finnhub failed for {}, using Yahoo: {}".format(pair, e))
+
+    # --- Fallback to Yahoo Finance ---
+    if close_prices is None:
+        yahoo_symbol = YAHOO_SYMBOLS.get(real_pair)
+        if not yahoo_symbol:
+            return None
+        try:
+            df = yf.download(yahoo_symbol, period="7d", interval="1h", progress=False, auto_adjust=True)
+            if df is None or len(df) < 30:
+                return None
+            close_prices = df["Close"].squeeze()
+        except Exception as e:
+            logging.warning("Yahoo fallback failed for {}: {}".format(pair, e))
             return None
 
-        close = df["Close"].squeeze()
-        high  = df["High"].squeeze()
-        low   = df["Low"].squeeze()
-
+    try:
+        close = close_prices
         current_price = float(close.iloc[-1])
 
-        # --- LAYER 1: EMA cross (REQUIRED) ---
         ema9  = float(close.ewm(span=9,  adjust=False).mean().iloc[-1])
         ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
-        ema9_prev  = float(close.ewm(span=9,  adjust=False).mean().iloc[-2])
-        ema21_prev = float(close.ewm(span=21, adjust=False).mean().iloc[-2])
 
         ema_gap_pct = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
-        # EMA gap must be meaningful (> 0.005%) — flat EMAs = no trend
         if ema_gap_pct < 0.005:
             return None
 
-        ema_bull = ema9 > ema21   # True = bullish EMA structure
-
-        # --- LAYER 2: Price vs EMA21 must agree with EMA cross ---
+        ema_bull = ema9 > ema21
         price_above_ema21 = current_price > ema21
         if ema_bull and not price_above_ema21:
-            # EMA says BUY but price is below EMA21 — conflict
             return None
         if not ema_bull and price_above_ema21:
-            # EMA says SELL but price is above EMA21 — conflict
             return None
 
-        # --- LAYER 3: MACD on 1H ---
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         macd_line   = ema12 - ema26
@@ -887,14 +916,12 @@ def _fetch_1h_trend(pair):
         macd_turning_bear = (macd_hist_now < 0 and macd_hist_prev >= 0)
         macd_bull = macd_hist_now > 0
 
-        # --- LAYER 4: RSI on 1H ---
         delta  = close.diff()
         gain   = delta.clip(lower=0).rolling(14).mean()
         loss   = (-delta.clip(upper=0)).rolling(14).mean()
         rsi_1h = float((100 - 100 / (1 + gain / loss.replace(0, 1e-9))).iloc[-1])
         rsi_bull = rsi_1h > 50
 
-        # --- LAYER 5: Recent candle momentum (last 3 candles) ---
         c0 = float(close.iloc[-1])
         c1 = float(close.iloc[-2])
         c2 = float(close.iloc[-3])
@@ -902,38 +929,20 @@ def _fetch_1h_trend(pair):
         candle_bull_count = sum([1 for a, b in [(c0,c1),(c1,c2),(c2,c3)] if a > b])
         candle_bear_count = 3 - candle_bull_count
 
-        # --- REVERSAL DETECTION ---
-        # If EMA says BUY but ALL 3 recent candles are falling + MACD turned bear = reversal
         if ema_bull and candle_bear_count >= 3 and (macd_turning_bear or not macd_bull):
-            return None   # Trend is reversing — no signal, wait for clarity
+            return None
         if not ema_bull and candle_bull_count >= 3 and (macd_turning_bull or macd_bull):
-            return None   # Trend is reversing — no signal, wait for clarity
+            return None
 
-        # --- FINAL LAYERED DECISION ---
-        # EMA cross already confirmed above (Layer 1+2).
-        # Now count how many supporting layers agree.
         if ema_bull:
-            supporting = sum([
-                macd_bull,           # MACD agrees
-                rsi_bull,            # RSI agrees
-                candle_bull_count >= 2,  # At least 2 of 3 candles agree
-            ])
-            # Need at least 2 of 3 supporting layers for a valid BUY signal
-            if supporting >= 2:
-                return "BUY"
-            return None
+            supporting = sum([macd_bull, rsi_bull, candle_bull_count >= 2])
+            return "BUY" if supporting >= 2 else None
         else:
-            supporting = sum([
-                not macd_bull,              # MACD agrees (bearish)
-                not rsi_bull,               # RSI agrees (bearish)
-                candle_bear_count >= 2,     # At least 2 of 3 candles agree
-            ])
-            if supporting >= 2:
-                return "SELL"
-            return None
+            supporting = sum([not macd_bull, not rsi_bull, candle_bear_count >= 2])
+            return "SELL" if supporting >= 2 else None
 
     except Exception as e:
-        logging.warning("_fetch_1h_trend failed for {}: {}".format(pair, e))
+        logging.warning("_fetch_1h_trend analysis failed for {}: {}".format(pair, e))
         return None
 
 
@@ -1721,6 +1730,112 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 # Per-pair OTC flip decision cache (in-memory, reset on restart — fine for OTC)
 _otc_flip_cache: dict = {}
 
+
+def _check_short_history(pair, seconds_back):
+    """
+    Check signal history for the last N seconds.
+    Returns: ('BUY', score) or ('SELL', score) or (None, 0)
+    score = how dominant the direction is (0.0 to 1.0)
+    Used to confirm short-term momentum before issuing a signal.
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=seconds_back)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT direction FROM signal_history
+                       WHERE pair=%s AND created_at >= %s
+                       ORDER BY created_at DESC LIMIT 20""",
+                    (pair, cutoff)
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return None, 0.0
+        directions = [r["direction"] for r in rows]
+        total = len(directions)
+        buy_count  = directions.count("BUY")
+        sell_count = directions.count("SELL")
+        if buy_count > sell_count:
+            return "BUY", buy_count / total
+        elif sell_count > buy_count:
+            return "SELL", sell_count / total
+        return None, 0.5
+    except Exception as e:
+        logging.warning("_check_short_history failed {}: {}".format(pair, e))
+        return None, 0.0
+
+
+def _get_tf_strength(pair, tf_minutes, trend_1h):
+    """
+    Calculate signal strength for a specific timeframe.
+    Checks short history window matching the TF:
+      1m → 5s history
+      2m → 10s history
+      3m → 15s history
+
+    Returns: (direction, strength_score)
+      direction: 'BUY' or 'SELL'
+      strength_score: 0-100 (higher = more candles agree with trend)
+    """
+    seconds_map = {1: 5, 2: 10, 3: 15}
+    seconds_back = seconds_map.get(tf_minutes, 10)
+
+    hist_dir, hist_score = _check_short_history(pair, seconds_back)
+
+    # If history agrees with 1H trend → strong signal
+    if trend_1h is not None and hist_dir == trend_1h:
+        strength = int(hist_score * 100)
+        return trend_1h, strength
+
+    # If history has clear direction but no 1H trend → use history
+    if hist_dir is not None and hist_score >= 0.65:
+        return hist_dir, int(hist_score * 100)
+
+    # If 1H trend exists but history is unclear → trust 1H trend with lower strength
+    if trend_1h is not None:
+        return trend_1h, 40
+
+    return None, 0
+
+
+def _pick_best_tf(pair, trend_1h):
+    """
+    Compare 1m, 2m, 3m signal strengths using short history windows.
+    Returns (best_timeframe, best_direction) — whichever TF has most
+    candles agreeing (green/red) with the trend.
+
+    1m uses 5s history, 2m uses 10s, 3m uses 15s.
+    """
+    results = {}
+    for tf in [1, 2, 3]:
+        direction, score = _get_tf_strength(pair, tf, trend_1h)
+        results[tf] = (direction, score)
+        logging.info("TF {}m: dir={} score={}".format(tf, direction, score))
+
+    # Pick TF with highest score where direction matches trend
+    best_tf   = None
+    best_score = -1
+    best_dir  = None
+
+    for tf, (direction, score) in results.items():
+        if direction is not None and score > best_score:
+            # Prefer TF that agrees with 1H trend
+            if trend_1h is None or direction == trend_1h:
+                best_score = score
+                best_tf    = tf
+                best_dir   = direction
+
+    # Fallback: if no TF agrees with trend, pick highest score overall
+    if best_tf is None:
+        for tf, (direction, score) in results.items():
+            if direction is not None and score > best_score:
+                best_score = score
+                best_tf    = tf
+                best_dir   = direction
+
+    return best_tf or 1, best_dir
+
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
@@ -2035,10 +2150,14 @@ def generate_signal(pair):
     # ── TIMEFRAME SELECTION ──────────────────────────────────
     vte_tf = get_optimal_tf(pair)
     if is_otc:
-        # OTC: always pick a random timeframe (1m-5m).
-        # Each call picks independently — no fixed pattern.
-        # This mimics human decision-making and keeps broker off-guard.
-        timeframe = random.choice([1, 1, 2, 2, 3, 3, 4, 5])
+        # Pick best TF by checking short history windows:
+        # 1m → check 5s history, 2m → 10s, 3m → 15s
+        # The TF with most candles agreeing with 1H trend wins
+        best_tf, best_dir = _pick_best_tf(pair, trend_1h)
+        timeframe = best_tf
+        # Override direction if best_dir is clear
+        if best_dir is not None:
+            direction = best_dir
     elif vte_tf is not None:
         timeframe = vte_tf
     else:
@@ -2061,20 +2180,11 @@ def generate_signal(pair):
     if not is_otc and indicators_agree < 6 and vte_tf is None:
         timeframe = 0   # Triggers no-signal in handler
 
-    # ── OTC: Random flip/follow logic ────────────────────────
-    # Each signal independently decides: follow the market or go against it.
-    # Random intervals mean the broker cannot predict the pattern.
-    # Works alongside contrarian pair logic (applied in handler).
+    # ── OTC: Direction is now set by trend + short history (no random flip) ──
+    # Direction was already determined by _pick_best_tf above.
+    # Store in cache for handler reference.
     if is_otc:
-        # Weighted random: 45% follow, 55% oppose — slightly contrarian overall
-        otc_flip = random.choices(
-            ["follow", "oppose"],
-            weights=[45, 55]
-        )[0]
-        if otc_flip == "oppose":
-            direction = "SELL" if direction == "BUY" else "BUY"
-        # Store flip decision so handler knows (for contrarian pair override)
-        _otc_flip_cache[pair] = otc_flip
+        _otc_flip_cache[pair] = "follow"
 
     # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
     # OTC always forces a signal — no blocking on 1H confirmation.
@@ -3240,22 +3350,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT avg_movement, optimal_tf FROM pair_stats WHERE pair=%s", (pair,)
+                            "SELECT avg_movement, optimal_tf, wins, losses FROM pair_stats WHERE pair=%s", (pair,)
                         )
                         row = cur.fetchone()
-                if row and row["avg_movement"]:
-                    avg_mov = float(row["avg_movement"])
-                    if avg_mov >= 0.10:
-                        return 1   # Moves fast — 1m is enough
-                    elif avg_mov >= 0.06:
-                        return 2   # Medium movement — 2m
-                    else:
-                        return 3   # Slow pair — needs 3m for clear close
-                if row and row["optimal_tf"]:
-                    return int(row["optimal_tf"])
+                # Only trust VTE data if pair has at least 10 trades recorded
+                if row and (row.get("wins", 0) or 0) + (row.get("losses", 0) or 0) >= 10:
+                    if row["optimal_tf"]:
+                        return int(row["optimal_tf"])
+                    if row["avg_movement"]:
+                        avg_mov = float(row["avg_movement"])
+                        if avg_mov >= 0.10:
+                            return 1
+                        elif avg_mov >= 0.06:
+                            return 2
+                        else:
+                            return 3
             except Exception:
                 pass
-            return fallback_tf
+            return fallback_tf  # Use signal's own TF — no VTE data yet
 
         if True:  # Always fresh — regenerate on every tap
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
