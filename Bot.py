@@ -1733,10 +1733,9 @@ _otc_flip_cache: dict = {}
 
 def _check_short_history(pair, seconds_back):
     """
-    Check signal history for the last N seconds.
-    Returns: ('BUY', score) or ('SELL', score) or (None, 0)
-    score = how dominant the direction is (0.0 to 1.0)
-    Used to confirm short-term momentum before issuing a signal.
+    Count BUY vs SELL signals recorded in the last N seconds for this pair.
+    Returns: (dominant_direction, score) or (None, 0.0)
+    score = fraction of signals in dominant direction (0.0 to 1.0)
     """
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=seconds_back)
@@ -1745,14 +1744,14 @@ def _check_short_history(pair, seconds_back):
                 cur.execute(
                     """SELECT direction FROM signal_history
                        WHERE pair=%s AND created_at >= %s
-                       ORDER BY created_at DESC LIMIT 20""",
+                       ORDER BY created_at DESC LIMIT 30""",
                     (pair, cutoff)
                 )
                 rows = cur.fetchall()
         if not rows:
             return None, 0.0
         directions = [r["direction"] for r in rows]
-        total = len(directions)
+        total      = len(directions)
         buy_count  = directions.count("BUY")
         sell_count = directions.count("SELL")
         if buy_count > sell_count:
@@ -1765,75 +1764,66 @@ def _check_short_history(pair, seconds_back):
         return None, 0.0
 
 
-def _get_tf_strength(pair, tf_minutes, trend_1h):
-    """
-    Calculate signal strength for a specific timeframe.
-    Checks short history window matching the TF:
-      1m → 5s history
-      2m → 10s history
-      3m → 15s history
-
-    Returns: (direction, strength_score)
-      direction: 'BUY' or 'SELL'
-      strength_score: 0-100 (higher = more candles agree with trend)
-    """
-    seconds_map = {1: 5, 2: 10, 3: 15}
-    seconds_back = seconds_map.get(tf_minutes, 10)
-
-    hist_dir, hist_score = _check_short_history(pair, seconds_back)
-
-    # If history agrees with 1H trend → strong signal
-    if trend_1h is not None and hist_dir == trend_1h:
-        strength = int(hist_score * 100)
-        return trend_1h, strength
-
-    # If history has clear direction but no 1H trend → use history
-    if hist_dir is not None and hist_score >= 0.65:
-        return hist_dir, int(hist_score * 100)
-
-    # If 1H trend exists but history is unclear → trust 1H trend with lower strength
-    if trend_1h is not None:
-        return trend_1h, 40
-
-    return None, 0
-
-
 def _pick_best_tf(pair, trend_1h):
     """
-    Compare 1m, 2m, 3m signal strengths using short history windows.
-    Returns (best_timeframe, best_direction) — whichever TF has most
-    candles agreeing (green/red) with the trend.
+    Pick best timeframe by checking short-term candle history:
+      1m → look back 5s
+      2m → look back 10s
+      3m → look back 15s
 
-    1m uses 5s history, 2m uses 10s, 3m uses 15s.
+    Each TF gets a real score from actual history data.
+    The TF whose history most strongly agrees with the 1H trend wins.
+
+    If history is empty for all TFs (new pair / first signal):
+      - Use current UTC second to pick TF (5s→1m, 10s→2m, 15s→3m)
+      - Direction comes from trend_1h or defaults to indicator score
+
+    Returns: (best_tf, best_direction)
     """
-    results = {}
+    seconds_map = {1: 5, 2: 10, 3: 15}
+    results = {}  # tf -> (hist_dir, hist_score)
+
     for tf in [1, 2, 3]:
-        direction, score = _get_tf_strength(pair, tf, trend_1h)
-        results[tf] = (direction, score)
-        logging.info("TF {}m: dir={} score={}".format(tf, direction, score))
+        secs = seconds_map[tf]
+        hist_dir, hist_score = _check_short_history(pair, secs)
+        results[tf] = (hist_dir, hist_score)
+        logging.info("TF {}m ({} s back): dir={} score={:.2f}".format(
+            tf, secs, hist_dir, hist_score))
 
-    # Pick TF with highest score where direction matches trend
-    best_tf   = None
-    best_score = -1
-    best_dir  = None
+    # Find TF with real history data (score > 0) that agrees with trend
+    best_tf    = None
+    best_score = 0.0
+    best_dir   = None
 
-    for tf, (direction, score) in results.items():
-        if direction is not None and score > best_score:
-            # Prefer TF that agrees with 1H trend
-            if trend_1h is None or direction == trend_1h:
-                best_score = score
+    for tf in [1, 2, 3]:
+        hist_dir, hist_score = results[tf]
+        if hist_dir is None or hist_score == 0.0:
+            continue  # No real data for this window
+        # Prefer direction that matches 1H trend
+        if trend_1h is not None:
+            if hist_dir == trend_1h and hist_score > best_score:
+                best_score = hist_score
                 best_tf    = tf
-                best_dir   = direction
+                best_dir   = hist_dir
+        else:
+            if hist_score > best_score:
+                best_score = hist_score
+                best_tf    = tf
+                best_dir   = hist_dir
 
-    # Fallback: if no TF agrees with trend, pick highest score overall
+    # If no TF had real history data → use time-based selection
     if best_tf is None:
-        for tf, (direction, score) in results.items():
-            if direction is not None and score > best_score:
-                best_score = score
-                best_tf    = tf
-                best_dir   = direction
+        sec = datetime.utcnow().second % 15  # cycle 0-14
+        if sec <= 4:
+            best_tf = 1
+        elif sec <= 9:
+            best_tf = 2
+        else:
+            best_tf = 3
+        best_dir = trend_1h  # direction from 1H trend
+        logging.info("TF fallback (no history): {}m dir={}".format(best_tf, best_dir))
 
-    return best_tf or 1, best_dir
+    return best_tf, best_dir
 
 
 def generate_signal(pair):
