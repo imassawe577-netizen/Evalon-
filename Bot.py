@@ -3228,43 +3228,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Check if current signal expiry is still active
+        # Always generate a fresh signal regardless of expiry.
+        # User can regenerate as many times as needed to get desired timeframe.
         state = get_user_signal_state(user_id, pair)
-        expiry_finished = True
-        press_count = 0
-        if state:
-            signal_time = state["signal_time"]
-            if isinstance(signal_time, str):
-                signal_time = datetime.fromisoformat(signal_time)
-            elapsed   = (datetime.utcnow() - signal_time).total_seconds()
-            threshold = state["last_timeframe"] * 60
-            press_count = state.get("flip_count", 0)
-            if elapsed < threshold:
-                expiry_finished = False
-
-        if not expiry_finished:
-            # Signal still active — ALWAYS give new signal on same pair.
-            # Show warning only if pressed many times, but NEVER redirect to pair selection.
-            if press_count >= 3:
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text=(
-                        "⚠️ *Heads up!*\n\n"
-                        "You are requesting signals very frequently on the same pair. "
-                        "For best results, wait for the current signal to expire before the next one. "
-                        "Continuing with a new signal anyway..."
-                    ),
-                    parse_mode="Markdown"
-                )
-            # Always continue to give a new signal regardless
-            current_tf = state["last_timeframe"] if state else 1
-            best_tf = get_optimal_tf(pair)
-            if best_tf and best_tf != current_tf:
-                new_tf = best_tf
-            else:
-                tf_cycle = {1: 2, 2: 3, 3: 1}
-                new_tf = tf_cycle.get(current_tf, 2)
-            clear_user_signal_state(user_id, pair)
+        press_count = state.get("flip_count", 0) if state else 0
+        expiry_finished = True   # Always treat as fresh — no blocking
+        clear_user_signal_state(user_id, pair)
 
         # --- Pip-based expiry selection helper (used below) ---
         # Bot checks avg_movement from VTE stats to pick optimal TF:
@@ -3292,8 +3261,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return fallback_tf
 
-        if expiry_finished:
-            # Fresh signal flow
+        if True:  # Always fresh — regenerate on every tap
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
                 bonus = get_bonus_signals(user_id)
                 refs  = count_referrals(user_id)
@@ -3332,11 +3300,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = sig["direction"]
         strength  = sig["strength"]
 
-        # Use pip-based TF if expiry finished (fresh), or the new_tf we picked above
-        if expiry_finished:
-            timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
-        else:
-            timeframe = new_tf  # Already determined above for mid-signal tap
+        # Use pip-based TF from VTE stats, fallback to signal's own TF
+        timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
 
         # Flat market block
         if sig.get("flat") and sig["timeframe"] == 0:
@@ -3401,11 +3366,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        new_flip_count = (press_count + 1) if not expiry_finished else 0
+        new_flip_count = 0  # Always fresh signal — reset flip count
 
         # Contrarian flip: worst-3 VTE pairs get signal flipped
         gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-        if gm_is_non_otc and expiry_finished and is_contrarian_pair(pair):
+        if gm_is_non_otc and is_contrarian_pair(pair):
             direction = "SELL" if direction == "BUY" else "BUY"
             logging.info("CONTRARIAN FLIP getmore: {} → {}".format(pair, direction))
 
@@ -3575,39 +3540,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if check["action"] == "fresh":
             try:
                 loop = asyncio.get_event_loop()
-                sig = await asyncio.wait_for(
-                    loop.run_in_executor(None, generate_signal, pair),
-                    timeout=18.0
-                )
-            except asyncio.TimeoutError:
-                try: await cm.delete()
-                except: pass
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="Signal took too long. Please try again or choose another pair.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Retry", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("Choose Another Pair", callback_data="choose_pair")]
-                    ])
-                )
-                return
+                sig = await loop.run_in_executor(None, generate_signal, pair)
             except Exception as e:
                 logging.warning("generate_signal error {}: {}".format(pair, e))
                 try: await cm.delete()
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="Could not generate signal. Please try again.",
+                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.".format(pair),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Retry", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("Choose Another Pair", callback_data="choose_pair")]
+                        [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
                     ])
                 )
                 return
-            if False:  # placeholder to keep elif chain intact
-                sig = generate_signal(pair)
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
