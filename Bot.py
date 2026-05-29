@@ -48,12 +48,11 @@ CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
-SUPPORT_BOT = "Evalonwinnersbot"   # Admin/support bot (do not change)
+SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (haibadiliki)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
-FINNHUB_API_KEY = "d8cl2q1r01qidic8fee0d8cl2q1r01qidic8feeg"  # Finnhub API key for trend data
 
 def support_url():
-    """Returns support link — opens support bot with 'admin' pre-filled."""
+    """Returns support link — fungua support bot na neno 'admin' tayari kwenye text box."""
     return "https://t.me/{}?text=admin".format(SUPPORT_BOT)
 
 # Health check handled by webhook server at /health path
@@ -99,6 +98,18 @@ def init_db():
                     direction TEXT NOT NULL,
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS blocked_users (
+                    user_id BIGINT PRIMARY KEY,
+                    blocked_at TIMESTAMP DEFAULT NOW(),
+                    reason TEXT DEFAULT NULL
+                );
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO bot_settings (key, value)
+                    VALUES ('auto_reverse', 'on')
+                    ON CONFLICT (key) DO NOTHING;
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
@@ -190,7 +201,7 @@ def update_pair_stats(pair, won, was_reversed=False):
                     # Check if consecutive losses hit 3 — auto-reverse
                     cur.execute("SELECT consecutive_losses FROM pair_stats WHERE pair=%s", (pair,))
                     row = cur.fetchone()
-                    if row and row["consecutive_losses"] >= 3:
+                    if False:  # Auto-reverse removed
                         # Auto-reverse: flip pair and reset streak
                         if is_reverse_pair(pair):
                             remove_reverse_pair(pair)
@@ -238,10 +249,10 @@ def get_best_pair(otc_only=False):
 
 def auto_manage_reverse_pairs():
     """
-    Bot self-manages:
-    - Pairs with win rate below 40% (minimum 5 signals) → add to reverse_pairs
-    - Pairs with win rate above 60% (minimum 5 signals) → remove from reverse_pairs (even if previously set)
-    Called automatically within generate_signal flow.
+    Bot ijiangalie yenyewe:
+    - Pair yenye win rate chini ya 40% (minimum 5 signals) → iongeze kwenye reverse_pairs
+    - Pair yenye win rate juu ya 60% (minimum 5 signals) → iondoe kutoka reverse_pairs (hata kama ilikuwepo)
+    Called automatically ndani ya generate_signal flow.
     """
     try:
         with get_conn() as conn:
@@ -352,6 +363,63 @@ def get_user(user_id):
             row = cur.fetchone()
             return dict(row) if row else {}
 
+def is_blocked(user_id):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM blocked_users WHERE user_id=%s", (user_id,))
+                return cur.fetchone() is not None
+    except Exception:
+        return False
+
+def block_user(user_id, reason=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO blocked_users (user_id, reason, blocked_at) VALUES (%s,%s,NOW()) ON CONFLICT DO NOTHING",
+                (user_id, reason))
+        conn.commit()
+
+def unblock_user(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM blocked_users WHERE user_id=%s", (user_id,))
+        conn.commit()
+
+def get_blocked_users():
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT b.user_id, b.blocked_at, b.reason,
+                           u.first_name, u.last_name, u.username
+                    FROM blocked_users b
+                    LEFT JOIN users u ON u.user_id = b.user_id
+                    ORDER BY b.blocked_at DESC
+                """)
+                return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+def get_bot_setting(key, default="on"):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM bot_settings WHERE key=%s", (key,))
+                row = cur.fetchone()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+def set_bot_setting(key, value):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                (key, value))
+        conn.commit()
+
+
 def upsert_user_profile(user_id, first_name=None, last_name=None, username=None):
     """Save or update user display name and username for admin lookup."""
     try:
@@ -456,8 +524,8 @@ def get_stats():
         "monthly": sum(1 for u in users if u.get("licence_type") == "monthly" and u.get("licensed")),
         "lifetime":sum(1 for u in users if u.get("licence_type") == "lifetime"),
         "free":    sum(1 for u in users if not u.get("licensed")),
-        "m_codes": [l["code"] for l in licences if not l["used"] and l["type"] == "monthly"],
-        "l_codes": [l["code"] for l in licences if not l["used"] and l["type"] == "lifetime"],
+        "m_codes": [l["code"] for l in licences if not l["used"] and not l.get("revoked") and l["type"] == "monthly"],
+        "l_codes": [l["code"] for l in licences if not l["used"] and not l.get("revoked") and l["type"] == "lifetime"],
     }
 
 def delete_user(user_id):
@@ -828,84 +896,56 @@ OTC_TO_REAL = {
 
 def _fetch_1h_trend(pair):
     """
-    Fetch 1H candle data from Finnhub (primary) or Yahoo Finance (fallback).
-    Determines trend direction using EMA cross + MACD + RSI + candle momentum.
-    Returns: 'BUY', 'SELL', or None
+    Fetch 1H candle data and determine trend direction using layered confirmation.
+
+    Rules (in order of priority):
+    1. EMA cross (9 vs 21) is REQUIRED — if absent/flat, return None immediately.
+    2. Price position vs EMA21 must agree with EMA cross.
+    3. MACD histogram direction must confirm.
+    4. RSI 1H provides momentum confirmation.
+    5. Last 3 candles direction provides momentum check.
+    6. Reversal detection: if recent candles strongly oppose EMA cross + MACD flips, override.
+
+    Returns: 'BUY', 'SELL', or None (unclear — no signal should be issued).
     """
-    import urllib.request
-    import json as _json
-
     real_pair = OTC_TO_REAL.get(pair, pair)
-
-    FINNHUB_SYMBOLS = {
-        "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
-        "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
-        "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
-        "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
-        "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
-        "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
-        "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
-        "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
-        "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
-        "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
-        "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
-        "GBP/CHF": "OANDA:GBP_CHF", "USD/MXN": "OANDA:USD_MXN",
-        "Bitcoin": "BINANCE:BTCUSDT", "Gold": "OANDA:XAU_USD",
-    }
-
-    close_prices = None
-    finnhub_symbol = FINNHUB_SYMBOLS.get(real_pair)
-
-    # --- Try Finnhub first ---
-    if finnhub_symbol:
-        try:
-            now_ts = int(time.time())
-            from_ts = now_ts - (7 * 24 * 3600)
-            candle_url = (
-                "https://finnhub.io/api/v1/forex/candle"
-                "?symbol={}&resolution=60&from={}&to={}&token={}"
-            ).format(finnhub_symbol, from_ts, now_ts, FINNHUB_API_KEY)
-            with urllib.request.urlopen(candle_url, timeout=8) as resp:
-                data = _json.loads(resp.read().decode())
-            if data.get("s") == "ok" and len(data.get("c", [])) >= 30:
-                import pandas as _pd
-                close_prices = _pd.Series(data["c"])
-                logging.info("Finnhub 1H OK: {}".format(pair))
-        except Exception as e:
-            logging.warning("Finnhub failed for {}, using Yahoo: {}".format(pair, e))
-
-    # --- Fallback to Yahoo Finance ---
-    if close_prices is None:
-        yahoo_symbol = YAHOO_SYMBOLS.get(real_pair)
-        if not yahoo_symbol:
-            return None
-        try:
-            df = yf.download(yahoo_symbol, period="7d", interval="1h", progress=False, auto_adjust=True)
-            if df is None or len(df) < 30:
-                return None
-            close_prices = df["Close"].squeeze()
-        except Exception as e:
-            logging.warning("Yahoo fallback failed for {}: {}".format(pair, e))
-            return None
-
+    symbol = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return None
     try:
-        close = close_prices
+        df = yf.download(symbol, period="7d", interval="1h", progress=False, auto_adjust=True)
+        if df is None or len(df) < 30:
+            return None
+
+        close = df["Close"].squeeze()
+        high  = df["High"].squeeze()
+        low   = df["Low"].squeeze()
+
         current_price = float(close.iloc[-1])
 
+        # --- LAYER 1: EMA cross (REQUIRED) ---
         ema9  = float(close.ewm(span=9,  adjust=False).mean().iloc[-1])
         ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+        ema9_prev  = float(close.ewm(span=9,  adjust=False).mean().iloc[-2])
+        ema21_prev = float(close.ewm(span=21, adjust=False).mean().iloc[-2])
 
         ema_gap_pct = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
+        # EMA gap must be meaningful (> 0.005%) — flat EMAs = no trend
         if ema_gap_pct < 0.005:
             return None
 
-        ema_bull = ema9 > ema21
+        ema_bull = ema9 > ema21   # True = bullish EMA structure
+
+        # --- LAYER 2: Price vs EMA21 must agree with EMA cross ---
         price_above_ema21 = current_price > ema21
         if ema_bull and not price_above_ema21:
+            # EMA says BUY but price is below EMA21 — conflict
             return None
         if not ema_bull and price_above_ema21:
+            # EMA says SELL but price is above EMA21 — conflict
             return None
 
+        # --- LAYER 3: MACD on 1H ---
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         macd_line   = ema12 - ema26
@@ -916,12 +956,14 @@ def _fetch_1h_trend(pair):
         macd_turning_bear = (macd_hist_now < 0 and macd_hist_prev >= 0)
         macd_bull = macd_hist_now > 0
 
+        # --- LAYER 4: RSI on 1H ---
         delta  = close.diff()
         gain   = delta.clip(lower=0).rolling(14).mean()
         loss   = (-delta.clip(upper=0)).rolling(14).mean()
         rsi_1h = float((100 - 100 / (1 + gain / loss.replace(0, 1e-9))).iloc[-1])
         rsi_bull = rsi_1h > 50
 
+        # --- LAYER 5: Recent candle momentum (last 3 candles) ---
         c0 = float(close.iloc[-1])
         c1 = float(close.iloc[-2])
         c2 = float(close.iloc[-3])
@@ -929,27 +971,45 @@ def _fetch_1h_trend(pair):
         candle_bull_count = sum([1 for a, b in [(c0,c1),(c1,c2),(c2,c3)] if a > b])
         candle_bear_count = 3 - candle_bull_count
 
+        # --- REVERSAL DETECTION ---
+        # If EMA says BUY but ALL 3 recent candles are falling + MACD turned bear = reversal
         if ema_bull and candle_bear_count >= 3 and (macd_turning_bear or not macd_bull):
-            return None
+            return None   # Trend is reversing — no signal, wait for clarity
         if not ema_bull and candle_bull_count >= 3 and (macd_turning_bull or macd_bull):
-            return None
+            return None   # Trend is reversing — no signal, wait for clarity
 
+        # --- FINAL LAYERED DECISION ---
+        # EMA cross already confirmed above (Layer 1+2).
+        # Now count how many supporting layers agree.
         if ema_bull:
-            supporting = sum([macd_bull, rsi_bull, candle_bull_count >= 2])
-            return "BUY" if supporting >= 2 else None
+            supporting = sum([
+                macd_bull,           # MACD agrees
+                rsi_bull,            # RSI agrees
+                candle_bull_count >= 2,  # At least 2 of 3 candles agree
+            ])
+            # Need at least 2 of 3 supporting layers for a valid BUY signal
+            if supporting >= 2:
+                return "BUY"
+            return None
         else:
-            supporting = sum([not macd_bull, not rsi_bull, candle_bear_count >= 2])
-            return "SELL" if supporting >= 2 else None
+            supporting = sum([
+                not macd_bull,              # MACD agrees (bearish)
+                not rsi_bull,               # RSI agrees (bearish)
+                candle_bear_count >= 2,     # At least 2 of 3 candles agree
+            ])
+            if supporting >= 2:
+                return "SELL"
+            return None
 
     except Exception as e:
-        logging.warning("_fetch_1h_trend analysis failed for {}: {}".format(pair, e))
+        logging.warning("_fetch_1h_trend failed for {}: {}".format(pair, e))
         return None
 
 
 def _confirm_1h_direction(pair, direction):
     """
     Smart check: kama signal ya chini (1m/2m) ni SELL,
-    angalia 1H candles za sekunde chache zilizopita je zinaenda chini?
+    Check if recent 1H candles are trending down
     Returns True kama 1H inathibitisha direction, False kama inapingana.
     Hii ni accuracy layer ya ziada — kama 1H haina data, rudi True (proceed).
     """
@@ -1172,6 +1232,77 @@ def _fetch_real_indicators(pair):
     except Exception as e:
         logging.warning("Yahoo Finance fetch failed for {}: {}".format(pair, e))
         return None
+
+
+def _check_reversal_candle(pair, lookback_candles):
+    """Check for reversal candle (pin bar/doji) in last N candles. Returns type or None."""
+    symbol = YAHOO_SYMBOLS.get(pair)
+    if not symbol:
+        return None
+    try:
+        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
+        if df is None or len(df) < lookback_candles + 2:
+            return None
+        closes = df["Close"].squeeze()
+        opens  = df["Open"].squeeze()
+        highs  = df["High"].squeeze()
+        lows   = df["Low"].squeeze()
+        for i in range(-lookback_candles, 0):
+            o = float(opens.iloc[i]); c = float(closes.iloc[i])
+            h = float(highs.iloc[i]); l = float(lows.iloc[i])
+            body = abs(c - o); candle = h - l
+            if candle < 1e-9: continue
+            upper_wick = h - max(o, c); lower_wick = min(o, c) - l
+            body_ratio = body / candle
+            if body_ratio < 0.3:
+                if lower_wick > body * 2: return "BULLISH_REVERSAL"
+                if upper_wick > body * 2: return "BEARISH_REVERSAL"
+            if body_ratio < 0.1 and i > -len(closes):
+                prev_c = float(closes.iloc[i-1]); prev_o = float(opens.iloc[i-1])
+                if prev_c > prev_o: return "BEARISH_REVERSAL"
+                if prev_c < prev_o: return "BULLISH_REVERSAL"
+        return None
+    except Exception as e:
+        logging.warning("_check_reversal_candle {}: {}".format(pair, e))
+        return None
+
+
+def _get_live_candle_direction(pair):
+    """Get current live candle direction. Returns UP, DOWN, or None."""
+    symbol = YAHOO_SYMBOLS.get(pair)
+    if not symbol: return None
+    try:
+        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
+        if df is None or len(df) < 2: return None
+        c = float(df["Close"].squeeze().iloc[-1])
+        o = float(df["Open"].squeeze().iloc[-1])
+        if c > o: return "UP"
+        if c < o: return "DOWN"
+        return None
+    except Exception:
+        return None
+
+
+def _apply_reversal_filter(direction, timeframe, pair):
+    """
+    Flip signal if reversal candle confirmed by live candle (TF 1m/2m/3m only).
+    TF > 3m: no filter applied.
+    """
+    if timeframe > 3:
+        return direction
+    reversal = _check_reversal_candle(pair, timeframe)
+    if reversal is None:
+        return direction
+    live = _get_live_candle_direction(pair)
+    if reversal == "BEARISH_REVERSAL" and live == "DOWN":
+        if "SELL" != direction:
+            logging.info("REVERSAL FILTER: {} {} -> SELL".format(pair, direction))
+        return "SELL"
+    if reversal == "BULLISH_REVERSAL" and live == "UP":
+        if "BUY" != direction:
+            logging.info("REVERSAL FILTER: {} {} -> BUY".format(pair, direction))
+        return "BUY"
+    return direction
 
 
 def _fetch_real_indicators_mtf(pair):
@@ -1479,6 +1610,10 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
     else:
         result_text = "💔 *EVALON {}* TF {}M — *LOSS* ❌".format(pair, timeframe_mins)
 
+    if not is_results_enabled():
+        update_pair_stats(pair, won, was_reversed=was_reversed)
+        return
+
     try:
         sent = await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
         with get_conn() as conn:
@@ -1561,7 +1696,7 @@ def _detect_candlestick_patterns(df):
     range1 = h1 - l1 + 1e-9
     range2 = h2 - l2 + 1e-9
 
-    # ── DOJI: body ndogo sana (<10% ya range) → mwisho wa trend ──
+    # ── DOJI: very small body (<10% of range) → trend exhaustion ──
     if body1 / range1 < 0.10 and range1 > 0:
         # Doji after uptrend = potential SELL reversal
         if c2 > o2 and body2 / range2 > 0.4:
@@ -1730,594 +1865,522 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 # Per-pair OTC flip decision cache (in-memory, reset on restart — fine for OTC)
 _otc_flip_cache: dict = {}
 
-
-# ============================================================
-# ADVANCED SIGNAL ENGINE — Full Multi-Timeframe Confirmation
-# ============================================================
-#
-# Signal rules (ALL timeframes must confirm):
-#
-# 1m CALL:  5s bullish + 1m bullish + 15m bullish + 4H bullish
-# 1m PUT:   5s bearish + 1m bearish + 15m bearish + 4H bearish
-#
-# 2m CALL: 10s bullish + 2m bullish + 30m bullish + 4H bullish
-# 2m PUT:  10s bearish + 2m bearish + 30m bearish + 4H bearish
-#
-# 3m CALL: 15s bullish + 3m bullish + 1H bullish  + 4H bullish
-# 3m PUT:  15s bearish + 3m bearish + 1H bearish  + 4H bearish
-#
-# Priority: try 1m first → 2m → 3m
-# Near-confirmation: 3 of 4 timeframes agree → signal with lower confidence
-# ============================================================
-
-import urllib.request as _urllib_req
-import json as _json
-
-# ── Finnhub candle fetch (primary data source) ───────────────
-FINNHUB_FOREX_MAP = {
-    "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
-    "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
-    "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
-    "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
-    "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
-    "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
-    "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
-    "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
-    "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
-    "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
-    "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
-    "GBP/CHF": "OANDA:GBP_CHF", "USD/MXN": "OANDA:USD_MXN",
-    "Gold": "OANDA:XAU_USD", "Bitcoin": "BINANCE:BTCUSDT",
-}
-
-_tf_candle_cache = {}  # (symbol, resolution) -> (timestamp, closes)
-_CACHE_TTL = 45        # seconds — refresh candle cache every 45s
-
-def _finnhub_candles(symbol, resolution, bars=120):
-    """
-    Fetch candle close prices from Finnhub.
-    resolution: '1','5','15','30','60','240' (minutes) or 'D'
-    Returns pandas Series of close prices or None.
-    """
-    cache_key = (symbol, resolution)
-    now_ts = int(time.time())
-    cached = _tf_candle_cache.get(cache_key)
-    if cached and (now_ts - cached[0]) < _CACHE_TTL:
-        return cached[1]
-
+async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
+    """Send a non-OTC signal with user-chosen or bot-chosen timeframe."""
+    arrow   = "📈" if direction == "BUY" else "📉"
+    color   = "🟢" if direction == "BUY" else "🔴"
+    conf    = sig.get("confluence", {})
+    badge   = conf.get("badge", "")
+    agree   = sig.get("indicators_agree", 0)
+    trend   = sig.get("trend_1h")
+    trend_t = "📈 {}".format(trend) if trend else "—"
+    caption = "{} *{}* {} *{}*\n⏱ *{}m*\n📊 Signal strength: {}\n1H Trend: {}\n{}".format(
+        color, pair, arrow, direction, timeframe, agree, trend_t, badge)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, timeframe))]
+    ])
+    buy_img  = context.bot_data.get("buy_image")
+    sell_img = context.bot_data.get("sell_image")
+    img = buy_img if direction == "BUY" else sell_img
     try:
-        from_ts = now_ts - bars * int(resolution if resolution.isdigit() else 1440) * 60
-        url = (
-            "https://finnhub.io/api/v1/forex/candle"
-            "?symbol={}&resolution={}&from={}&to={}&token={}"
-        ).format(symbol, resolution, from_ts, now_ts, FINNHUB_API_KEY)
-        with _urllib_req.urlopen(url, timeout=6) as resp:
-            data = _json.loads(resp.read().decode())
-        if data.get("s") != "ok" or len(data.get("c", [])) < 20:
-            return None
-        import pandas as _pd
-        closes = _pd.Series(data["c"])
-        _tf_candle_cache[cache_key] = (now_ts, closes)
-        return closes
-    except Exception as e:
-        logging.warning("Finnhub candles failed {}/{}: {}".format(symbol, resolution, e))
-        return None
-
-
-def _yahoo_candles(symbol, interval, period):
-    """Yahoo Finance fallback for candle data."""
-    try:
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df is None or len(df) < 20:
-            return None
-        return df["Close"].squeeze()
-    except Exception as e:
-        logging.warning("Yahoo candles failed {}/{}: {}".format(symbol, interval, e))
-        return None
-
-
-def _get_closes(pair, resolution_finnhub, interval_yahoo, period_yahoo, bars=120):
-    """
-    Get close prices for a pair at a given timeframe.
-    Tries Finnhub first, falls back to Yahoo Finance.
-    resolution_finnhub: '1','5','15','30','60','240'
-    """
-    real_pair = OTC_TO_REAL.get(pair, pair)
-    finn_sym  = FINNHUB_FOREX_MAP.get(real_pair)
-    yahoo_sym = YAHOO_SYMBOLS.get(real_pair)
-
-    closes = None
-    if finn_sym:
-        closes = _finnhub_candles(finn_sym, resolution_finnhub, bars)
-    if closes is None and yahoo_sym:
-        closes = _yahoo_candles(yahoo_sym, interval_yahoo, period_yahoo)
-    return closes
-
-
-# ── Advanced indicator suite ──────────────────────────────────
-
-def _calc_direction(closes):
-    """
-    Calculate trend direction from close prices using 8 indicators.
-    Returns: ('BUY', confidence) or ('SELL', confidence) or (None, 0)
-    confidence: 0.0 to 1.0
-
-    Indicators used:
-    1. EMA 9/21 cross
-    2. Price vs EMA 50
-    3. MACD histogram direction
-    4. RSI (14) level and slope
-    5. Stochastic (14,3) level
-    6. Bollinger Band position
-    7. ADX trend strength (minimum 20 required)
-    8. Recent candle momentum (last 3 candles)
-    """
-    if closes is None or len(closes) < 55:
-        return None, 0.0
-
-    try:
-        c = closes
-
-        # 1. EMA cross
-        ema9  = c.ewm(span=9,  adjust=False).mean()
-        ema21 = c.ewm(span=21, adjust=False).mean()
-        ema50 = c.ewm(span=50, adjust=False).mean()
-        ema9_now  = float(ema9.iloc[-1])
-        ema21_now = float(ema21.iloc[-1])
-        ema50_now = float(ema50.iloc[-1])
-        price_now = float(c.iloc[-1])
-
-        ema_gap = abs(ema9_now - ema21_now) / (ema21_now + 1e-9) * 100
-        if ema_gap < 0.003:
-            return None, 0.0  # Flat EMAs — no trend
-
-        ema_bull = ema9_now > ema21_now
-        price_above_ema50 = price_now > ema50_now
-
-        # 2. MACD
-        ema12 = c.ewm(span=12, adjust=False).mean()
-        ema26 = c.ewm(span=26, adjust=False).mean()
-        macd_line   = ema12 - ema26
-        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
-        macd_hist   = macd_line - macd_signal
-        macd_now    = float(macd_hist.iloc[-1])
-        macd_prev   = float(macd_hist.iloc[-2])
-        macd_bull   = macd_now > 0
-        macd_rising = macd_now > macd_prev
-
-        # 3. RSI
-        delta = c.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi_s = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
-        rsi   = float(rsi_s.iloc[-1])
-        rsi_prev = float(rsi_s.iloc[-2])
-        rsi_bull  = rsi > 50
-        rsi_rising = rsi > rsi_prev
-
-        # RSI extremes — strong signal
-        rsi_oversold  = rsi < 35
-        rsi_overbought = rsi > 65
-
-        # 4. Stochastic
-        low14  = c.rolling(14).min()
-        high14 = c.rolling(14).max()
-        stoch  = (c - low14) / (high14 - low14 + 1e-9) * 100
-        stoch_now  = float(stoch.iloc[-1])
-        stoch_prev = float(stoch.iloc[-2])
-        stoch_bull  = stoch_now > 50
-        stoch_rising = stoch_now > stoch_prev
-
-        # 5. Bollinger Band position
-        sma20 = c.rolling(20).mean()
-        std20 = c.rolling(20).std()
-        bb_upper = sma20 + 2 * std20
-        bb_lower = sma20 - 2 * std20
-        bb_pos = (price_now - float(bb_lower.iloc[-1])) / (
-            float(bb_upper.iloc[-1]) - float(bb_lower.iloc[-1]) + 1e-9)
-        bb_bull = bb_pos < 0.5  # Below midline = bullish setup
-        bb_strong_bull = bb_pos < 0.2   # Near lower band = strong BUY
-        bb_strong_bear = bb_pos > 0.8   # Near upper band = strong SELL
-
-        # 6. ADX — trend strength filter (requires minimum strength)
-        try:
-            high_s = c  # Approximate with close (we only have close prices)
-            low_s  = c
-            tr_s   = c.diff().abs()
-            atr14  = tr_s.rolling(14).mean()
-            adx_proxy = float(atr14.iloc[-1]) / (float(c.iloc[-1]) + 1e-9) * 1000
-            trend_strong = adx_proxy > 0.3  # Minimum trend strength threshold
-        except Exception:
-            trend_strong = True  # Assume strong if can't calculate
-
-        # 7. Candle momentum (last 3 candles)
-        c0 = float(c.iloc[-1])
-        c1 = float(c.iloc[-2])
-        c2 = float(c.iloc[-3])
-        c3 = float(c.iloc[-4])
-        bull_candles = sum([c0 > c1, c1 > c2, c2 > c3])
-        bear_candles = 3 - bull_candles
-
-        # 8. EMA slope (trend direction of EMA itself)
-        ema21_prev = float(ema21.iloc[-2])
-        ema21_slope_bull = ema21_now > ema21_prev
-
-        # ── Scoring system ────────────────────────────────────
-        buy_score  = 0
-        sell_score = 0
-        total_weight = 0
-
-        # EMA cross (weight: 3) — most important
-        total_weight += 3
-        if ema_bull:         buy_score  += 3
-        else:                sell_score += 3
-
-        # Price vs EMA50 (weight: 2)
-        total_weight += 2
-        if price_above_ema50:  buy_score  += 2
-        else:                   sell_score += 2
-
-        # MACD direction (weight: 2)
-        total_weight += 2
-        if macd_bull:    buy_score  += 2
-        else:            sell_score += 2
-
-        # MACD rising/falling (weight: 1)
-        total_weight += 1
-        if macd_rising:  buy_score  += 1
-        else:            sell_score += 1
-
-        # RSI level (weight: 2)
-        total_weight += 2
-        if rsi_bull:     buy_score  += 2
-        else:            sell_score += 2
-
-        # RSI slope (weight: 1)
-        total_weight += 1
-        if rsi_rising:   buy_score  += 1
-        else:            sell_score += 1
-
-        # RSI extreme (weight: 2 bonus)
-        if rsi_oversold:
-            buy_score  += 2; total_weight += 2
-        elif rsi_overbought:
-            sell_score += 2; total_weight += 2
-
-        # Stochastic (weight: 1)
-        total_weight += 1
-        if stoch_bull:   buy_score  += 1
-        else:            sell_score += 1
-
-        # Bollinger position (weight: 1)
-        total_weight += 1
-        if bb_bull:      buy_score  += 1
-        else:            sell_score += 1
-
-        # Bollinger extreme (weight: 2 bonus)
-        if bb_strong_bull:
-            buy_score  += 2; total_weight += 2
-        elif bb_strong_bear:
-            sell_score += 2; total_weight += 2
-
-        # Candle momentum (weight: 2)
-        total_weight += 2
-        if bull_candles >= 2:   buy_score  += 2
-        elif bear_candles >= 2: sell_score += 2
-
-        # EMA21 slope (weight: 1)
-        total_weight += 1
-        if ema21_slope_bull: buy_score  += 1
-        else:                sell_score += 1
-
-        # Trend strength gate — if market is flat, no signal
-        if not trend_strong:
-            return None, 0.0
-
-        # ── Direction decision ────────────────────────────────
-        if buy_score > sell_score:
-            confidence = buy_score / total_weight
-            # Require minimum 55% confidence
-            if confidence < 0.55:
-                return None, confidence
-            return "BUY", confidence
-        elif sell_score > buy_score:
-            confidence = sell_score / total_weight
-            if confidence < 0.55:
-                return None, confidence
-            return "SELL", confidence
+        if img:
+            await context.bot.send_photo(chat_id=chat, photo=img, caption=caption,
+                                         parse_mode="Markdown", reply_markup=kb)
         else:
-            return None, 0.5
-
+            await context.bot.send_message(chat_id=chat, text=caption,
+                                           parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
-        logging.warning("_calc_direction failed: {}".format(e))
-        return None, 0.0
-
-
-def _get_short_term_direction(pair, seconds_back):
-    """
-    Determine short-term direction from recent signal history.
-    Used for 5s, 10s, 15s confirmation windows.
-    Returns: ('BUY', score) or ('SELL', score) or (None, 0)
-    Requires at least 60% dominance to confirm direction.
-    """
-    try:
-        cutoff = datetime.utcnow() - timedelta(seconds=seconds_back)
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT direction FROM signal_history
-                       WHERE pair=%s AND created_at >= %s
-                       ORDER BY created_at DESC LIMIT 50""",
-                    (pair, cutoff)
-                )
-                rows = cur.fetchall()
-        if not rows or len(rows) < 3:
-            # Not enough history — use real-time 1m candle direction
-            real_pair  = OTC_TO_REAL.get(pair, pair)
-            yahoo_sym  = YAHOO_SYMBOLS.get(real_pair)
-            if yahoo_sym:
-                try:
-                    df = yf.download(yahoo_sym, period="1d", interval="1m",
-                                     progress=False, auto_adjust=True)
-                    if df is not None and len(df) >= 3:
-                        closes = df["Close"].squeeze()
-                        c0 = float(closes.iloc[-1])
-                        c1 = float(closes.iloc[-2])
-                        c2 = float(closes.iloc[-3])
-                        bull = sum([c0 > c1, c1 > c2])
-                        if bull >= 2:   return "BUY",  0.75
-                        elif bull == 0: return "SELL", 0.75
-                        else:           return None,   0.5
-                except Exception:
-                    pass
-            return None, 0.0
-
-        directions = [r["direction"] for r in rows]
-        total      = len(directions)
-        buy_pct    = directions.count("BUY")  / total
-        sell_pct   = directions.count("SELL") / total
-
-        if buy_pct >= 0.60:
-            return "BUY",  buy_pct
-        elif sell_pct >= 0.60:
-            return "SELL", sell_pct
-        return None, max(buy_pct, sell_pct)
-
-    except Exception as e:
-        logging.warning("_get_short_term_direction failed {}: {}".format(pair, e))
-        return None, 0.0
-
-
-def _check_tf_confirmation(pair, tf_minutes):
-    """
-    Check full 4-timeframe confirmation for a given signal timeframe.
-
-    TF rules:
-      1m: 5s  + 1m  + 15m + 4H  all bullish/bearish
-      2m: 10s + 2m  + 30m + 4H  all bullish/bearish
-      3m: 15s + 3m  + 1H  + 4H  all bullish/bearish
-
-    Returns dict:
-      {
-        'direction':    'BUY'|'SELL'|None,
-        'confirmed':    True|False,       # All 4 TFs agree
-        'near_confirm': True|False,       # 3 of 4 TFs agree
-        'score':        0-4,              # How many TFs agree
-        'confidence':   0.0-1.0,
-        'details':      {tf_name: direction}
-      }
-    """
-    # Define the 4 confirmation timeframes per signal TF
-    tf_configs = {
-        1: {
-            "short":    ("5s",  5),
-            "base":     ("1m",  "1",  "1m",  "1d",   60),
-            "mid":      ("15m", "15", "15m", "5d",   80),
-            "long":     ("4H",  "240","4h",  "60d", 120),
-        },
-        2: {
-            "short":    ("10s", 10),
-            "base":     ("2m",  "2",  "2m",  "2d",   60),
-            "mid":      ("30m", "30", "30m", "10d",  80),
-            "long":     ("4H",  "240","4h",  "60d", 120),
-        },
-        3: {
-            "short":    ("15s", 15),
-            "base":     ("3m",  "3",  "3m",  "3d",   60),
-            "mid":      ("1H",  "60", "1h",  "14d",  80),
-            "long":     ("4H",  "240","4h",  "60d", 120),
-        },
-    }
-
-    cfg = tf_configs.get(tf_minutes)
-    if not cfg:
-        return {"direction": None, "confirmed": False, "near_confirm": False,
-                "score": 0, "confidence": 0.0, "details": {}}
-
-    details = {}
-    directions = []
-
-    # Short-term (5s / 10s / 15s)
-    short_label, short_secs = cfg["short"]
-    short_dir, short_score = _get_short_term_direction(pair, short_secs)
-    details[short_label] = short_dir
-    if short_dir:
-        directions.append(short_dir)
-
-    # Base timeframe (1m / 2m / 3m)
-    base_label, finn_res, yahoo_int, yahoo_per, bars = cfg["base"]
-    base_closes = _get_closes(pair, finn_res, yahoo_int, yahoo_per, bars)
-    base_dir, base_conf = _calc_direction(base_closes)
-    details[base_label] = base_dir
-    if base_dir:
-        directions.append(base_dir)
-
-    # Mid timeframe (15m / 30m / 1H)
-    mid_label, finn_res_m, yahoo_int_m, yahoo_per_m, bars_m = cfg["mid"]
-    mid_closes = _get_closes(pair, finn_res_m, yahoo_int_m, yahoo_per_m, bars_m)
-    mid_dir, mid_conf = _calc_direction(mid_closes)
-    details[mid_label] = mid_dir
-    if mid_dir:
-        directions.append(mid_dir)
-
-    # Long timeframe (4H)
-    long_label, finn_res_l, yahoo_int_l, yahoo_per_l, bars_l = cfg["long"]
-    long_closes = _get_closes(pair, finn_res_l, yahoo_int_l, yahoo_per_l, bars_l)
-    long_dir, long_conf = _calc_direction(long_closes)
-    details[long_label] = long_dir
-    if long_dir:
-        directions.append(long_dir)
-
-    if not directions:
-        return {"direction": None, "confirmed": False, "near_confirm": False,
-                "score": 0, "confidence": 0.0, "details": details}
-
-    # Count agreement
-    buy_count  = directions.count("BUY")
-    sell_count = directions.count("SELL")
-    total      = len(directions)
-
-    if buy_count > sell_count:
-        dominant = "BUY"
-        score    = buy_count
-    elif sell_count > buy_count:
-        dominant = "SELL"
-        score    = sell_count
-    else:
-        dominant = None
-        score    = 0
-
-    confirmed    = (score >= 4 and total >= 4)
-    near_confirm = (score >= 3 and total >= 3) or (score >= 2 and total == 2)
-    confidence   = score / max(total, 4)
-
-    return {
-        "direction":    dominant,
-        "confirmed":    confirmed,
-        "near_confirm": near_confirm,
-        "score":        score,
-        "confidence":   confidence,
-        "details":      details,
-    }
-
+        logging.warning("_send_nonotc_signal failed: {}".format(e))
 
 def generate_signal(pair):
-    """
-    Advanced signal engine — multi-timeframe full confirmation.
-    OTC and non-OTC pairs use identical logic — no separation.
+    is_otc = "OTC" in pair
+    real   = None
+    yahoo_available = True
+    if not is_otc:
+        try:
+            real = _fetch_real_indicators_mtf(pair)
+            if real is None:
+                yahoo_available = False
+        except Exception as e:
+            logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
+            real = None
+            yahoo_available = False
 
-    Priority order: 1m → 2m → 3m
-    Full confirmation (4/4 TFs agree) = strong signal
-    Near confirmation (3/4 TFs agree) = signal with lower confidence
-    No confirmation = no signal (flat)
-
-    Returns standard signal dict compatible with all handlers.
-    """
-    result_1m = result_2m = result_3m = None
-
-    # Try all 3 timeframes in parallel (sequential for simplicity)
+    # ── 1H TREND FILTER (with reversal detection) ────────────
+    trend_1h = None
     try:
-        result_1m = _check_tf_confirmation(pair, 1)
+        trend_1h = _fetch_1h_trend(pair)
     except Exception as e:
-        logging.warning("TF 1m check failed {}: {}".format(pair, e))
+        logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
 
+    # ── VWAP TREND ───────────────────────────────────────────
+    vwap_data = None
     try:
-        result_2m = _check_tf_confirmation(pair, 2)
+        vwap_data = _fetch_vwap_trend(pair)
     except Exception as e:
-        logging.warning("TF 2m check failed {}: {}".format(pair, e))
+        logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
 
+    # ── MULTI-TIMEFRAME SCORE ─────────────────────────────────
+    mtf = None
     try:
-        result_3m = _check_tf_confirmation(pair, 3)
+        mtf = _fetch_mtf_score(pair)
     except Exception as e:
-        logging.warning("TF 3m check failed {}: {}".format(pair, e))
+        logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
 
-    # Pick best result: prefer full confirmation, then near, then strongest score
-    chosen_tf  = None
-    chosen_res = None
+    # ── CANDLESTICK PATTERN DETECTION ────────────────────────
+    pattern_buy_bonus = 0
+    pattern_sell_bonus = 0
+    detected_patterns = {}
+    if real is not None:
+        # Use real data for pattern detection
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        symbol = YAHOO_SYMBOLS.get(real_pair)
+        if symbol:
+            try:
+                df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+                detected_patterns = _detect_candlestick_patterns(df_5m)
+            except Exception:
+                pass
+    else:
+        # OTC: use mapped real pair for pattern detection
+        real_p = OTC_TO_REAL.get(pair)
+        if real_p:
+            symbol = YAHOO_SYMBOLS.get(real_p)
+            if symbol:
+                try:
+                    df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+                    detected_patterns = _detect_candlestick_patterns(df_5m)
+                except Exception:
+                    pass
 
-    for tf, res in [(1, result_1m), (2, result_2m), (3, result_3m)]:
-        if res is None or res["direction"] is None:
-            continue
-        if res["confirmed"]:
-            chosen_tf  = tf
-            chosen_res = res
-            break  # Full confirmation found — stop here
+    for pname, (pdir, pbonus) in detected_patterns.items():
+        if pdir == "BUY":
+            pattern_buy_bonus += pbonus
+        else:
+            pattern_sell_bonus += pbonus
 
-    # No full confirmation — try near confirmation
-    if chosen_res is None:
-        for tf, res in [(1, result_1m), (2, result_2m), (3, result_3m)]:
-            if res is None or res["direction"] is None:
-                continue
-            if res["near_confirm"]:
-                chosen_tf  = tf
-                chosen_res = res
-                break
+    # ── PIP MOVEMENT ANALYSIS ─────────────────────────────────
+    avg_movement, movement_cat = _check_pip_movement(pair)
 
-    # Still nothing — no signal
-    if chosen_res is None or chosen_res["direction"] is None:
+    if real:
+        # ── NON-OTC: Real indicators from Yahoo Finance (5m) ──
+        rsi     = real["rsi"]
+        sto     = real["sto"]
+        ma_diff = real["ma_diff"]
+        macd    = real["macd"]
+        bb_pos  = real["bb_pos"]
+        mom     = real["mom"]
+        vol     = real["vol"]
+        candle  = random.choices([-1, -0.5, 0, 0.5, 1], weights=[10, 15, 50, 15, 10])[0]
+    else:
+        # ── OTC: Smart synthetic indicators (session-aware) ────
+        sess  = _get_session()
+        ptype = _pair_type(pair)
+        if sess["name"] in ("London Open", "NY/London"):
+            rsi_w = [20, 18, 24, 18, 20]
+        elif sess["name"] in ("Asian", "Dead Hours"):
+            rsi_w = [10, 20, 40, 20, 10]
+        else:
+            rsi_w = [15, 20, 30, 20, 15]
+
+        # If 1H trend is clear, bias synthetic data to match it
+        if trend_1h == "BUY":
+            rsi_w = [25, 20, 25, 18, 12]
+        elif trend_1h == "SELL":
+            rsi_w = [12, 18, 25, 20, 25]
+
+        rsi_zone = random.choices(
+            ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
+        rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
+               "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
+               "overbought": random.uniform(72,92)}[rsi_zone]
+        sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
+               "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
+               "overbought": random.uniform(75,95)}[rsi_zone]
+        if sess["name"] in ("London Open", "NY Session"):
+            ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
+        else:
+            ma_diff = random.uniform(-0.4, 0.4)
+        if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
+        if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
+        macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
+        bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
+        mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
+        vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
+        candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
+
+    # ── BASE SCORING ─────────────────────────────────────────
+    b = s = 0
+    if rsi < 25:    b += 25
+    elif rsi < 35:  b += 15
+    elif rsi < 45:  b += 8
+    elif rsi > 75:  s += 25
+    elif rsi > 65:  s += 15
+    elif rsi > 55:  s += 8
+    if sto < 15:    b += 15
+    elif sto < 25:  b += 8
+    elif sto > 85:  s += 15
+    elif sto > 75:  s += 8
+    if ma_diff > 0.3:    b += 20
+    elif ma_diff > 0.1:  b += 10
+    elif ma_diff < -0.3: s += 20
+    elif ma_diff < -0.1: s += 10
+    if macd > 0.4:    b += 15
+    elif macd > 0.1:  b += 7
+    elif macd < -0.4: s += 15
+    elif macd < -0.1: s += 7
+    if bb_pos < 0.15:  b += 10
+    elif bb_pos < 0.3: b += 5
+    elif bb_pos > 0.85: s += 10
+    elif bb_pos > 0.7:  s += 5
+    if mom > 0.4:   b += 10
+    elif mom > 0.1: b += 5
+    elif mom < -0.4: s += 10
+    elif mom < -0.1: s += 5
+    if candle > 0:   b += int(candle * 10)
+    elif candle < 0: s += int(abs(candle) * 10)
+    if vol > 0.75:
+        if b > s: b += 8
+        else:     s += 8
+
+    # ── RSI DIVERGENCE BONUS ─────────────────────────────────
+    if real and real.get("divergence"):
+        div = real["divergence"]
+        if div == "BUY":  b += 20
+        elif div == "SELL": s += 20
+
+    # ── NON-OTC MULTI-TF REAL CONSENSUS BONUS ────────────────
+    # Reward when 1m + 5m + 15m all point the same way (real data)
+    if real and not is_otc and real.get("tf_count", 0) >= 2:
+        tv = real.get("tf_buy_votes", 0)
+        sv = real.get("tf_sell_votes", 0)
+        tf_total = real.get("tf_count", 1)
+        if tv > sv:
+            bonus = int((tv / tf_total) * 30)
+            b += bonus
+            if direction == "BUY":
+                indicators_agree += tv
+        elif sv > tv:
+            bonus = int((sv / tf_total) * 30)
+            s += bonus
+            if direction == "SELL":
+                indicators_agree += sv
+        else:
+            # Conflict across timeframes — reduce confidence
+            b -= 10
+            s -= 10
+
+    # ── WILLIAMS FRACTAL BONUS ───────────────────────────────
+    fractal_sig = None
+    fractal_str = 0
+    if real and real.get("fractal_signal"):
+        fractal_sig = real["fractal_signal"]
+        fractal_str = real.get("fractal_strength", 1)
+    else:
+        if bb_pos < 0.15:
+            fractal_sig = "BUY";  fractal_str = 1
+        elif bb_pos < 0.08:
+            fractal_sig = "BUY";  fractal_str = 2
+        elif bb_pos > 0.85:
+            fractal_sig = "SELL"; fractal_str = 1
+        elif bb_pos > 0.92:
+            fractal_sig = "SELL"; fractal_str = 2
+    if fractal_sig == "BUY":
+        b += 15 * fractal_str
+    elif fractal_sig == "SELL":
+        s += 15 * fractal_str
+
+    # ── CANDLESTICK PATTERN BONUS ────────────────────────────
+    b += pattern_buy_bonus
+    s += pattern_sell_bonus
+
+    # ── SESSION BIAS ─────────────────────────────────────────
+    sb, ss = _session_bias()
+    b += sb; s += ss
+    ptype = _pair_type(pair)
+    if ptype == "crypto":
+        if mom > 0.3: b += 5
+        elif mom < -0.3: s += 5
+    elif ptype == "commodity":
+        if vol > 0.8:
+            if b > s: b += 6
+            else: s += 6
+    elif ptype == "index":
+        if ma_diff > 0.2: b += 5
+        elif ma_diff < -0.2: s += 5
+
+    # ── 1H TREND FILTER BONUS (includes reversal detection) ──
+    if trend_1h == "BUY":
+        b += 45
+    elif trend_1h == "SELL":
+        s += 45
+
+    # ── VWAP TREND BONUS ─────────────────────────────────────
+    if vwap_data is not None:
+        if vwap_data["direction"] == "BUY":
+            bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
+            b += bonus
+        else:
+            bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
+            s += bonus
+
+    # ── MULTI-TIMEFRAME BONUS ────────────────────────────────
+    if mtf and mtf["total"] >= 3:
+        if mtf["buy_tfs"] > mtf["sell_tfs"]:
+            b += mtf["buy_tfs"] * 8
+        elif mtf["sell_tfs"] > mtf["buy_tfs"]:
+            s += mtf["sell_tfs"] * 8
+
+    # ── DIRECTION & CONFLUENCE ───────────────────────────────
+    direction = "BUY" if b >= s else "SELL"
+    indicators_agree = 0
+    checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
+              (macd > 0, macd < 0), (bb_pos < 0.5, bb_pos > 0.5), (mom > 0, mom < 0), (candle > 0, candle < 0)]
+    for buy_c, sell_c in checks:
+        if direction == "BUY" and buy_c:   indicators_agree += 1
+        if direction == "SELL" and sell_c: indicators_agree += 1
+
+    # ── MTF CONFLUENCE COUNT ─────────────────────────────────
+    if mtf and mtf["total"] >= 3:
+        if direction == "BUY"  and mtf["buy_tfs"]  > mtf["sell_tfs"]: indicators_agree += mtf["buy_tfs"]
+        if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
+    if trend_1h == direction:
+        indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection is stronger
+
+    # ── PATTERN CONFLUENCE ───────────────────────────────────
+    # If patterns agree with direction — boost indicators_agree
+    pattern_agrees = (pattern_buy_bonus > 0 and direction == "BUY") or \
+                     (pattern_sell_bonus > 0 and direction == "SELL")
+    if pattern_agrees:
+        indicators_agree += 2
+
+    # ── CONFLICT CHECK: MTF vs 1H ────────────────────────────
+    if mtf and trend_1h and mtf["total"] >= 3:
+        mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
+        if mtf_dir != trend_1h:
+            direction = "BUY" if b > s else "SELL"
+
+    # ── MINIMUM CONFLUENCE ───────────────────────────────────
+    min_confluence = 6 if not is_otc else 5   # Non-OTC requires stronger evidence
+    if indicators_agree < min_confluence:
+        alt_dir = "SELL" if direction == "BUY" else "BUY"
+        alt_agree = 0
+        for buy_c, sell_c in checks:
+            if alt_dir == "BUY" and buy_c:   alt_agree += 1
+            if alt_dir == "SELL" and sell_c: alt_agree += 1
+        if alt_agree > indicators_agree:
+            direction = alt_dir
+            indicators_agree = alt_agree
+        if indicators_agree < min_confluence:
+            direction = "BUY" if b > s else "SELL"
+            indicators_agree = 0
+            for buy_c, sell_c in checks:
+                if direction == "BUY" and buy_c:   indicators_agree += 1
+                if direction == "SELL" and sell_c: indicators_agree += 1
+
+    # ── SIGNAL HISTORY BIAS CHECK ────────────────────────────
+    # If most recent signals share same direction — reinforce decision
+    hist_same, hist_total, hist_pct = _check_signal_history_bias(pair, direction, window=15)
+    if hist_total >= 5:
+        if hist_pct >= 0.70:
+            # History strongly agrees — add +20 and boost indicators_agree
+            if direction == "BUY":
+                b += 20
+            else:
+                s += 20
+            indicators_agree += 2
+        elif hist_pct <= 0.30:
+            # History strongly disagrees — reduce confidence
+            if direction == "BUY":
+                b -= 15
+            else:
+                s -= 15
+
+    # ── STRENGTH CALCULATION ─────────────────────────────────
+    dom = max(b, s); tot = max(b+s, 1)
+    mtf_bonus = 0
+    if mtf and mtf["total"] >= 3:
+        agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
+        mtf_bonus = int((agreeing / mtf["total"]) * 45)
+    trend_bonus = 20 if trend_1h == direction else 0  # Increased from 15
+    pattern_bonus_str = min(30, pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus)
+    hist_bonus_str = int(hist_pct * 20) if hist_total >= 5 else 0
+
+    # Strength formula: base 280 + bonuses (max 500)
+    strength = min(500, max(300, 280 + indicators_agree*25 + int((dom/tot)*100)
+                            + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
+                            + int(random.uniform(-5,5))))
+
+    # ── TIMEFRAME SELECTION ──────────────────────────────────
+    vte_tf = get_optimal_tf(pair)
+    if is_otc:
+        # OTC: always pick a random timeframe (1m-5m).
+        # Each call picks independently — no fixed pattern.
+        # This mimics human decision-making and keeps broker off-guard.
+        timeframe = random.choice([1, 1, 2, 2, 3, 3, 4, 5])
+    elif vte_tf is not None:
+        timeframe = vte_tf
+    else:
+        # Non-OTC: data-driven TF based on real confluence
+        if movement_cat == "HIGH":
+            if indicators_agree >= 10:   timeframe = 1
+            elif indicators_agree >= 7:  timeframe = 2
+            elif indicators_agree >= 5:  timeframe = 3
+            else:                        timeframe = 5
+        elif movement_cat == "MEDIUM":
+            if indicators_agree >= 12:   timeframe = 1
+            elif indicators_agree >= 9:  timeframe = 2
+            elif indicators_agree >= 6:  timeframe = 3
+            else:                        timeframe = 5
+        else:   # LOW movement
+            if indicators_agree >= 11:   timeframe = 3
+            else:                        timeframe = 5
+
+    # ── NON-OTC: Weak confluence → flip direction opposite to 1H ──
+    if not is_otc and indicators_agree < 6 and vte_tf is None:
+        if trend_1h is not None:
+            direction = "SELL" if trend_1h == "BUY" else "BUY"
+            timeframe = timeframe if timeframe > 0 else 2
+        elif not yahoo_available:
+            timeframe = 0  # True no-signal: no data available
+
+    # ── OTC: Random flip/follow logic ────────────────────────
+    # Each signal independently decides: follow the market or go against it.
+    # Random intervals mean the broker cannot predict the pattern.
+    # Works alongside contrarian pair logic (applied in handler).
+    if is_otc:
+        # Weighted random: 45% follow, 55% oppose — slightly contrarian overall
+        otc_flip = random.choices(
+            ["follow", "oppose"],
+            weights=[45, 55]
+        )[0]
+        if otc_flip == "oppose":
+            direction = "SELL" if direction == "BUY" else "BUY"
+        # Store flip decision so handler knows (for contrarian pair override)
+        _otc_flip_cache[pair] = otc_flip
+
+    # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
+    # OTC always forces a signal — no blocking on 1H confirmation.
+    if not is_otc and timeframe <= 2:
+        h1_confirmed = _confirm_1h_direction(pair, direction)
+        if not h1_confirmed:
+            if timeframe == 1:
+                timeframe = 2
+                h1_confirmed = _confirm_1h_direction(pair, direction)
+            if not h1_confirmed:
+                timeframe = 3
+                h1_confirmed = _confirm_1h_direction(pair, direction)
+            if not h1_confirmed:
+                timeframe = 0
+
+    # ── SESSION-AWARE CONTRARIAN OVERRIDE ────────────────────
+    session = _get_session()
+    bias    = get_signal_bias(pair, window=10, threshold=session["threshold"])
+    if bias is not None and trend_1h is None:
+        if is_otc:
+            direction = ("SELL" if bias=="BUY" else "BUY") if session["otc"]=="contrarian" else bias
+        else:
+            if bias == direction:
+                direction = bias
+    elif bias is not None and trend_1h is not None:
+        if bias != trend_1h and is_otc and session["otc"] == "contrarian":
+            pass
+        elif bias == trend_1h:
+            direction = trend_1h
+
+    # ── ENFORCE 1H TREND AS HARD FILTER ─────────────────────
+    if trend_1h == "BUY" and direction == "SELL":
+        raw_gap = s - b - 45
+        if raw_gap < 35:
+            direction = "BUY"
+    elif trend_1h == "SELL" and direction == "BUY":
+        raw_gap = b - s - 45
+        if raw_gap < 35:
+            direction = "SELL"
+
+    # ── 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) ────────
+    # If 1H trend is clear but 5m+15m real data strongly disagrees → no signal
+    if not is_otc and trend_1h is not None and real is not None:
+        tv = real.get("tf_buy_votes", 0)
+        sv = real.get("tf_sell_votes", 0)
+        tf_total = real.get("tf_count", 1)
+        short_tf_dir = "BUY" if tv > sv else ("SELL" if sv > tv else None)
+        if short_tf_dir is not None and short_tf_dir != trend_1h:
+            # Short TFs ALL oppose the 1H trend
+            opposition_pct = max(tv, sv) / tf_total
+            if opposition_pct >= 1.0 and tf_total >= 2:
+                # 100% of short TFs oppose 1H — market in transition, wait
+                timeframe = 0   # Signal flat — will trigger no-signal in handler
+                direction = "BUY" if b > s else "SELL"
+                record_signal(pair, direction)
+                return {
+                    "direction": direction, "pair": pair, "timeframe": 0,
+                    "strength": 0, "indicators_agree": 0,
+                    "trend_1h": trend_1h, "vwap_data": vwap_data,
+                    "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
+                    "mtf": mtf, "flat": True, "patterns": detected_patterns,
+                    "movement_cat": movement_cat, "avg_movement": avg_movement,
+                    "no_signal_reason": "1H vs short-TF conflict",
+                }
+
+    # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
+    # OTC always produces a signal — stability filter does not apply.
+    if not is_otc and not _check_signal_stability(pair, direction, window_minutes=5):
+        timeframe = 0
+        record_signal(pair, direction)
         return {
-            "direction": "BUY", "pair": pair, "timeframe": 0,
+            "direction": direction, "pair": pair, "timeframe": 0,
             "strength": 0, "indicators_agree": 0,
-            "trend_1h": None, "vwap_data": None,
-            "confluence": {"level": "FLAT", "score": 0, "badge": "⛔ NO SIGNAL"},
-            "mtf": None, "flat": True, "patterns": {},
-            "movement_cat": "MEDIUM", "avg_movement": 0.08,
-            "no_signal_reason": "no timeframe confirmation",
+            "trend_1h": trend_1h, "vwap_data": vwap_data,
+            "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
+            "mtf": mtf, "flat": True, "patterns": detected_patterns,
+            "movement_cat": movement_cat, "avg_movement": avg_movement,
+            "no_signal_reason": "sudden direction flip detected",
         }
 
-    direction  = chosen_res["direction"]
-    timeframe  = chosen_tf
-    confidence = chosen_res["confidence"]
-    score      = chosen_res["score"]
-    confirmed  = chosen_res["confirmed"]
+    # ── TREND CONFLUENCE ANALYSIS ────────────────────────────
+    confluence = _calc_trend_confluence(trend_1h, vwap_data, mtf, direction)
 
-    # Reverse pair flip
+    # Apply reversal candle filter (non-OTC, TF 1m/2m/3m only)
+    if not is_otc:
+        direction = _apply_reversal_filter(direction, timeframe, pair)
+
+    record_signal(pair, direction)
+    return {
+        "direction": direction, "pair": pair, "timeframe": timeframe,
+        "strength": abs(b - s), "indicators_agree": indicators_agree,
+        "trend_1h": trend_1h, "vwap_data": vwap_data,
+        "confluence": confluence, "mtf": mtf, "flat": (timeframe == 0),
+        "patterns": detected_patterns,
+        "movement_cat": movement_cat, "avg_movement": avg_movement,
+        "no_signal_reason": "",
+    }
+
+    # ── AUTO-REVERSE ─────────────────────────────────────────
     if is_reverse_pair(pair):
         direction = "SELL" if direction == "BUY" else "BUY"
 
-    # Contrarian pair flip (VTE worst performers)
-    if is_contrarian_pair(pair):
-        direction = "SELL" if direction == "BUY" else "BUY"
-
-    # Strength value (used in caption)
-    strength = int(confidence * 500)
-
-    # Confluence badge
-    if confirmed:
-        badge = "🔥 STRONG ({}/4)".format(score)
-        level = "STRONG"
-    else:
-        badge = "✅ GOOD ({}/4)".format(score)
-        level = "MODERATE"
-
-    indicators_agree = score + (3 if confirmed else 1)
-
     record_signal(pair, direction)
-
     return {
-        "direction":       direction,
-        "pair":            pair,
-        "timeframe":       timeframe,
-        "strength":        strength,
+        "direction": direction,
+        "pair": pair,
+        "timeframe": timeframe,
+        "strength": strength,
         "indicators_agree": indicators_agree,
-        "trend_1h":        chosen_res["details"].get("1H") or chosen_res["details"].get("4H"),
-        "vwap_data":       None,
-        "confluence":      {"level": level, "score": score, "badge": badge},
-        "mtf":             {"buy_tfs": score if direction=="BUY" else 4-score,
-                            "sell_tfs": score if direction=="SELL" else 4-score,
-                            "total": 4, "details": chosen_res["details"]},
-        "flat":            False,
-        "patterns":        {},
-        "movement_cat":    "MEDIUM",
-        "avg_movement":    0.08,
-        "no_signal_reason": "",
-        "tf_details":      chosen_res["details"],
-        "confirmed":       confirmed,
+        "trend_1h": trend_1h,
+        "vwap_data": vwap_data,
+        "confluence": confluence,
+        "mtf": mtf,
+        "flat": (timeframe == 0),
+        "patterns": detected_patterns,
+        "movement_cat": movement_cat,
+        "avg_movement": avg_movement,
     }
 
 
-
+# ============================================================
+# PAIR INDEX
+# ============================================================
 PAIR_INDEX = {str(i): pair for i, pair in enumerate(ALL_PAIRS)}
 
 def pair_to_idx(pair):
@@ -2336,20 +2399,56 @@ def is_weekend():
 def pairs_keyboard():
     """
     Build the pair selection keyboard.
-    OTC and non-OTC pairs mixed together in ALL_PAIRS order.
-    OTC disabled by admin: show non-OTC only.
+    Weekday (non-OTC available):
+      - Shows forex pairs only, ranked by VTE win rate (worst first).
+      - First 3 = contrarian pairs (marked with 🔄), rest = normal.
+      - Falls back to default ALL_PAIRS forex order if VTE has no data yet.
+    Weekend: shows OTC pairs only (unchanged).
     """
     rows = []
     row  = []
-    otc_on = is_otc_enabled()
+    weekend = is_weekend()
+    otc_on  = is_otc_enabled()
 
-    for i, pair in enumerate(ALL_PAIRS):
-        if not otc_on and "OTC" in pair:
-            continue
-        row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
+    if weekend:
+        # Weekend — show OTC pairs only
+        for i, pair in enumerate(ALL_PAIRS):
+            if "OTC" not in pair:
+                continue
+            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+    else:
+        # Weekday — forex only, ranked by VTE (worst → best)
+        if not otc_on:
+            ranked = get_ranked_forex_pairs()
+            display_pairs = ranked["all"]
+            contrarian_set = set(ranked["contrarian"])
+        else:
+            # OTC enabled — show all pairs
+            display_pairs = [p for p in ALL_PAIRS if "OTC" not in p]
+            contrarian_set = set()
+
+        for pair in display_pairs:
+            i = pair_to_idx(pair)
+            if i is None:
+                continue
+            label = pair
+            row.append(InlineKeyboardButton(label, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+
+        # Also show OTC pairs if enabled
+        if otc_on:
+            for i, pair in enumerate(ALL_PAIRS):
+                if "OTC" not in pair:
+                    continue
+                row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
 
     if row:
         rows.append(row)
@@ -2362,16 +2461,16 @@ def signal_keyboard(pair):
     ])
 
 def otc_mode_keyboard(pair):
-    """Chaguo la mode kwa OTC pair: Sekunde au Normal (minutes)."""
+    """Mode selection for OTC pair: Seconds or Normal (minutes)."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱ Sekunde (3s/5s/10s...)", callback_data="otc_secs_{}".format(idx))],
+        [InlineKeyboardButton("⏱ Seconds (3s/5s/10s...)", callback_data="otc_secs_{}".format(idx))],
         [InlineKeyboardButton("📊 Normal (minutes)", callback_data="otc_normal_{}".format(idx))],
         [InlineKeyboardButton("❌ Cancel", callback_data="choose_pair")],
     ])
 
 def otc_seconds_keyboard(pair):
-    """Keyboard ya kuchagua sekunde kwa OTC — subscribers tu."""
+    """Seconds keyboard for OTC — subscribers only."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
         [
@@ -2384,6 +2483,36 @@ def otc_seconds_keyboard(pair):
             InlineKeyboardButton("30s", callback_data="otctf_{}_30".format(idx)),
         ],
         [InlineKeyboardButton("🔙 Back", callback_data="otcback_{}".format(idx))],
+    ])
+
+def nonotc_mode_keyboard(pair):
+    """Mode selection for non-OTC: choose TF manually or let bot decide."""
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Choose Timeframe", callback_data="nonotc_tf_{}".format(idx))],
+        [InlineKeyboardButton("Bot Decides", callback_data="nonotc_auto_{}".format(idx))],
+        [InlineKeyboardButton("Cancel", callback_data="choose_pair")],
+    ])
+
+def nonotc_tf_keyboard(pair):
+    """Manual TF selection for non-OTC pairs."""
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1m",  callback_data="nonotctf_{}_1" .format(idx)),
+            InlineKeyboardButton("2m",  callback_data="nonotctf_{}_2" .format(idx)),
+            InlineKeyboardButton("3m",  callback_data="nonotctf_{}_3" .format(idx)),
+        ],
+        [
+            InlineKeyboardButton("4m",  callback_data="nonotctf_{}_4" .format(idx)),
+            InlineKeyboardButton("5m",  callback_data="nonotctf_{}_5" .format(idx)),
+            InlineKeyboardButton("7m",  callback_data="nonotctf_{}_7" .format(idx)),
+        ],
+        [
+            InlineKeyboardButton("10m", callback_data="nonotctf_{}_10".format(idx)),
+            InlineKeyboardButton("15m", callback_data="nonotctf_{}_15".format(idx)),
+        ],
+        [InlineKeyboardButton("Back", callback_data="nonotc_back_{}".format(idx))],
     ])
 
 def expired_signal_keyboard():
@@ -2571,12 +2700,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Persistent Reply Keyboard — ALWAYS sent first ─────────
     # This ensures keyboard appears/reappears at bottom of screen
     reply_kb = ReplyKeyboardMarkup(
-        [["⚡ EVALON MENU"]],
+        [
+            ["⚡ Get Signal",     "🤖 Bot Pick Pair"],
+            ["📊 My Stats",       "💎 Upgrade"],
+            ["🔄 Restart",        "ℹ️ Help"],
+        ],
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=True,   # Keep keyboard visible always
         one_time_keyboard=False,
     )
 
+    # Send welcome with reply keyboard attached — keyboard appears immediately
     await update.message.reply_text(
         "╔══════════════════════╗\n"
         "     ⚡ EVALON MASTER PRO\n"
@@ -2585,20 +2719,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *100+ Trading Pairs*\n"
         "🧠 *AI-Powered Signal Analysis*\n\n"
         "⚠️ _Evalon Bot is AI-powered and may make mistakes. Trade responsibly._\n\n"
-        "Tap the menu button below to get started:",
+        "Choose an option below to get started:",
         parse_mode="Markdown",
         reply_markup=reply_kb,
     )
 
+    # ── Inline menu below welcome ──────────────────────────────
     await update.message.reply_text(
-        "🚀 *What would you like to do?*",
+        "🚀 *Quick Actions:*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ Get Signal",      callback_data="choose_pair")],
-            [InlineKeyboardButton("🤖 Bot Pick Pair",   callback_data="bot_pick_pair")],
-            [InlineKeyboardButton("📊 My Stats",        callback_data="my_stats")],
-            [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
-            [InlineKeyboardButton("ℹ️ Help",            callback_data="show_help")],
+            [InlineKeyboardButton("🤖 Bot Pick Best Pair", callback_data="bot_pick_pair")],
+            [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+            [InlineKeyboardButton("💎 Upgrade / Licence",  callback_data="pay_info")],
         ])
     )
 
@@ -2762,15 +2895,14 @@ async def dbcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     data=q.data; chat=q.message.chat_id; user_id=q.from_user.id
-    # Save user profile for admin lookup
     try:
         u = q.from_user
-        upsert_user_profile(user_id,
-            first_name=u.first_name,
-            last_name=u.last_name,
-            username=u.username)
+        upsert_user_profile(user_id, first_name=u.first_name, last_name=u.last_name, username=u.username)
     except Exception:
         pass
+    if is_blocked(user_id) and user_id != ADMIN_ID:
+        await q.answer("You have been blocked from using this bot.", show_alert=True)
+        return
 
     if data == "restart_fresh":
         # Clear signal state and inactivity tracking
@@ -2852,7 +2984,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
         tagline = random.choice(taglines)
-        header = "⚡ *EVALON MASTER PRO*\n\n{}\n\n📊 Select your trading pair:".format(tagline)
+        sess = get_trading_session()
+        sess_txt = ""
+        if sess and sess.get("name","") not in ("Dead Hours","Off Hours",""):
+            sess_txt = "\n🕐 *{}* active".format(sess["name"])
+        header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
 
         await context.bot.send_message(
             chat_id=chat,
@@ -2884,26 +3020,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         otc_on       = is_otc_enabled()
         force_non_otc = not otc_on
 
-        # Get top 5 from virtual trading engine stats
-        if force_non_otc:
-            top5 = get_top5_pairs(non_otc_only=True)
-        elif weekend:
-            top5 = get_top5_pairs(otc_only=True)
-        else:
-            top5 = get_top5_pairs()
-
-        # Fallback: if not enough virtual data yet, pick random
-        if len(top5) < 3:
-            if force_non_otc:
-                pool = [p for p in ALL_PAIRS if "OTC" not in p]
-            elif weekend:
-                pool = [p for p in ALL_PAIRS if "OTC" in p]
-            else:
-                pool = list(ALL_PAIRS)
-            random.shuffle(pool)
-            # Fill top5 with random pairs not already in list
+        # Top 5 — worst forex performers (contrarian targets)
+        top5 = get_worst5_pairs()
+        if len(top5) < 5:
+            forex_pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
+            random.shuffle(forex_pool)
             existing = {r["pair"] for r in top5}
-            for p in pool:
+            for p in forex_pool:
                 if p not in existing and len(top5) < 5:
                     top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                     existing.add(p)
@@ -2966,7 +3089,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
+                status, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
@@ -2980,10 +3103,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
             ])
         )
-        return
-
-    if data == "show_help":
-        await help_command(update, context)
         return
 
     if data=="pay_info":
@@ -3053,9 +3172,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if check["action"] == "cooldown":
             return
 
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                ])
+            )
+            return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
-        is_non_otc = pair in YAHOO_SYMBOLS or OTC_TO_REAL.get(pair) in YAHOO_SYMBOLS
+        is_non_otc = False  # pair is OTC
         entry_price = None
         await asyncio.sleep(2)
         trend = get_trend_direction(pair)
@@ -3072,7 +3201,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
                 )
                 return
             if trend is not None:
@@ -3083,7 +3216,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
                 )
                 return
         elif check["action"] == "flip":
@@ -3127,6 +3264,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_INACTIVITY[user_id]["task"] = task
         return
 
+    # ── Non-OTC: Back to mode selection ──────────────────────────────────
+    if data.startswith("nonotc_back_"):
+        idx_str = data[12:]
+        pair = PAIR_INDEX.get(idx_str)
+        if not pair: return
+        await q.edit_message_text(
+            "Choose how to trade: {}".format(pair),
+            parse_mode="Markdown",
+            reply_markup=nonotc_mode_keyboard(pair)
+        )
+        return
+
+    # ── Non-OTC: Show manual TF keyboard ──────────────────────────────────
+    if data.startswith("nonotc_tf_"):
+        idx_str = data[10:]
+        pair = PAIR_INDEX.get(idx_str)
+        if not pair: return
+        await q.edit_message_text(
+            "Select timeframe for: {}".format(pair),
+            parse_mode="Markdown",
+            reply_markup=nonotc_tf_keyboard(pair)
+        )
+        return
+
+    # ── Non-OTC: Bot decides TF — go straight to signal ───────────────────
+    if data.startswith("nonotc_auto_"):
+        # Redirect to sel_ flow by replacing data
+        data = "sel_{}".format(data[12:])
+        # Fall through to sel_ handler below
+
+    # ── Non-OTC: User chose specific TF ───────────────────────────────────
+    if data.startswith("nonotctf_"):
+        parts     = data[9:].rsplit("_", 1)
+        idx_str   = parts[0]
+        chosen_tf = int(parts[1]) if len(parts) == 2 else 1
+        pair      = PAIR_INDEX.get(idx_str)
+        if not pair: return
+        if is_spam(user_id): return
+        inactivity_reset(user_id, chat)
+        try: await q.message.delete()
+        except: pass
+        cm = await context.bot.send_message(
+            chat_id=chat, text="Creating a signal for {}".format(pair), parse_mode="Markdown"
+        )
+        try:
+            loop = asyncio.get_event_loop()
+            sig  = await loop.run_in_executor(None, generate_signal, pair)
+        except Exception as e:
+            logging.warning("nonotctf signal failed {}: {}".format(pair, e))
+            try: await cm.delete()
+            except: pass
+            await context.bot.send_message(
+                chat_id=chat,
+                text="No clear signal available",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, chosen_tf))]
+                ])
+            )
+            return
+        direction = sig["direction"]
+        timeframe = chosen_tf
+        if is_contrarian_pair(pair):
+            direction = "SELL" if direction == "BUY" else "BUY"
+        save_user_signal_state(user_id, pair, direction, timeframe, 0)
+        try: await cm.delete()
+        except: pass
+        # Reuse getmore_ send flow by calling it directly
+        context.user_data["_nonotc_sig"]   = sig
+        context.user_data["_nonotc_dir"]   = direction
+        context.user_data["_nonotc_tf"]    = timeframe
+        context.user_data["_nonotc_pair"]  = pair
+        context.user_data["_nonotc_idx"]   = idx_str
+        await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
+        return
+
     # ── OTC: "Sekunde" chosen — show seconds keyboard ───────────────────
     if data.startswith("otc_secs_"):
         idx_str = data[9:]
@@ -3144,7 +3357,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "🔒 *Seconds signals — Subscribers Only*\n\n"
                     "This option is available for licensed subscribers only.\n\n"
-                    "Upgrade to get:\n"
+                    "Upgrade ili kupata:\n"
                     "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
                     "✅ Unlimited signals\n"
                     "✅ Win rate 90% — 98%"
@@ -3187,7 +3400,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_blacklisted(user_id):
             await context.bot.send_message(chat_id=chat, text="🚫 *You are banned from this bot.*", parse_mode="Markdown")
             return
-        # Subscribers tu (double check)
+        # Subscribers only (double check)
         if not is_licensed(user_id):
             await context.bot.send_message(
                 chat_id=chat,
@@ -3200,11 +3413,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         inactivity_reset(user_id, chat)
 
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
+                                          callback_data="otctf_{}_{}".format(idx_str, chosen_secs))]
+                ])
+            )
+            return
 
         try: await q.message.delete()
         except: pass
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
 
         sig       = generate_signal(pair)
@@ -3220,7 +3444,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
             )
             return
 
@@ -3307,24 +3534,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT avg_movement, optimal_tf, wins, losses FROM pair_stats WHERE pair=%s", (pair,)
+                            "SELECT avg_movement, optimal_tf FROM pair_stats WHERE pair=%s", (pair,)
                         )
                         row = cur.fetchone()
-                # Only trust VTE data if pair has at least 10 trades recorded
-                if row and (row.get("wins", 0) or 0) + (row.get("losses", 0) or 0) >= 10:
-                    if row["optimal_tf"]:
-                        return int(row["optimal_tf"])
-                    if row["avg_movement"]:
-                        avg_mov = float(row["avg_movement"])
-                        if avg_mov >= 0.10:
-                            return 1
-                        elif avg_mov >= 0.06:
-                            return 2
-                        else:
-                            return 3
+                if row and row["avg_movement"]:
+                    avg_mov = float(row["avg_movement"])
+                    if avg_mov >= 0.10:
+                        return 1   # Moves fast — 1m is enough
+                    elif avg_mov >= 0.06:
+                        return 2   # Medium movement — 2m
+                    else:
+                        return 3   # Slow pair — needs 3m for clear close
+                if row and row["optimal_tf"]:
+                    return int(row["optimal_tf"])
             except Exception:
                 pass
-            return fallback_tf  # Use signal's own TF — no VTE data yet
+            return fallback_tf
 
         if True:  # Always fresh — regenerate on every tap
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
@@ -3347,8 +3572,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inactivity_reset(user_id, chat)
             clear_user_signal_state(user_id, pair)
 
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                ])
+            )
+            return
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
 
         sig       = generate_signal(pair)
@@ -3376,15 +3611,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
             )
             return
 
         # Trend validation
         trend_dir = get_trend_direction(pair)
+        gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
         if trend_dir is not None:
             direction = trend_dir
-        elif sig.get("flat") or sig.get("indicators_agree", 10) < 6:
+        elif gm_is_non_otc_check and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
             try: await cm.delete()
             except: pass
             reason = sig.get("no_signal_reason", "")
@@ -3396,7 +3635,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
             )
             return
         elif sig.get("indicators_agree", 7) < 4:
@@ -3406,14 +3649,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
-
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
+                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                ])
             )
             return
 
         new_flip_count = 0  # Always fresh signal — reset flip count
 
         # Contrarian flip: worst-3 VTE pairs get signal flipped
-        if is_contrarian_pair(pair):
+        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        if gm_is_non_otc and is_contrarian_pair(pair):
             direction = "SELL" if direction == "BUY" else "BUY"
             logging.info("CONTRARIAN FLIP getmore: {} → {}".format(pair, direction))
 
@@ -3434,7 +3681,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
-        if gm_has_price and gm_entry_price is not None:
+        if gm_is_non_otc and gm_entry_price is not None:
             asyncio.create_task(
                 schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
             )
@@ -3472,7 +3719,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_blacklisted(user_id):
             await context.bot.send_message(chat_id=chat, text="🚫 *You are banned from this bot.*\n\nContact admin for more info.", parse_mode="Markdown")
             return
-        # Weekend check — non-OTC haifanyi kazi
+        # Weekend check — non-OTC not available
         if is_weekend() and "OTC" not in pair:
             await context.bot.send_message(
                 chat_id=chat,
@@ -3555,14 +3802,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Candle safe zone check ---
         # Block if we are in the first 10 seconds (new candle) or last 10 seconds (candle closing)
+        if not is_candle_safe_zone():
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                ])
+            )
+            return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
 
         # --- Capture entry price IMMEDIATELY (before any processing delay) ---
-        real_sym_sel = OTC_TO_REAL.get(pair, pair)
+        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
         entry_price = None
-        if real_sym_sel in YAHOO_SYMBOLS:
-            entry_price = _fetch_current_price(real_sym_sel)
+        if is_non_otc:
+            entry_price = _fetch_current_price(pair)
         signal_capture_time = datetime.utcnow()
 
         await asyncio.sleep(1)
@@ -3581,7 +3838,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
                 )
                 return
             direction  = sig["direction"]
@@ -3601,14 +3862,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    ])
                 )
                 return
             # Override with dominant trend if available
             if trend is not None:
                 direction = trend
             # Non-OTC: no signal if confluence weak — never guess
-            elif sig.get("flat") or sig.get("indicators_agree", 10) < 6:
+            elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
                 try: await cm.delete()
                 except: pass
                 reason = sig.get("no_signal_reason", "")
@@ -3620,10 +3884,144 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                    ])
                 )
                 return
-    
+            elif not is_non_otc and sig.get("indicators_agree", 7) < 4:
+                try: await cm.delete()
+                except: pass
+                await context.bot.send_message(
+                    chat_id=chat,
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                    ])
+                )
+                return
+
+        elif check["action"] == "flip":
+            # First quick return — flip direction, reset flip_count to 1
+            direction  = check["direction"]
+            timeframe  = random.choice([1, 2, 3])
+            strength   = random.randint(200, 500)
+            flip_count = 1
+
+        else:  # same
+            # 2nd or 3rd quick return — keep same flipped direction, increment flip_count
+            state      = get_user_signal_state(user_id, pair)
+            flip_count = state["flip_count"] + 1 if state else 2
+            direction  = check["direction"]
+            timeframe  = random.choice([1, 2, 3])
+            strength   = random.randint(200, 500)
+
+        # Save state with updated flip_count
+        # entry_price was already captured at signal request time (above)
+        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+
+        # Contrarian flip: worst-3 VTE pairs get signal flipped (they fail consistently)
+        if is_non_otc and check["action"] == "fresh" and is_contrarian_pair(pair):
+            direction = "SELL" if direction == "BUY" else "BUY"
+            logging.info("CONTRARIAN FLIP applied: {} → {}".format(pair, direction))
+
+        save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
+        # Record to signal history (fresh signals already recorded inside generate_signal)
+        if check["action"] != "fresh":
+            record_signal(pair, direction)
+
+        ib    = direction == "BUY"
+        img   = get_buy_image() if ib else get_sell_image()
+        arrow = "Up 🟢" if ib else "Down 🔴"
+        if not is_licensed(user_id): use_free_signal(user_id)
+        try: await cm.delete()
+        except: pass
+        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+
+        # --- Result tracker: non-OTC only (have real price data) ---
+        if is_non_otc and entry_price is not None:
+            asyncio.create_task(
+                schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, entry_price)
+            )
+
+        # --- Inactivity tracker: record msg_id and reset timer ---
+        inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
+
+        async def inactivity_expire(uid, cid):
+            """Clears ALL signals and sends VIP message immediately."""
+            await asyncio.sleep(INACTIVITY_MINUTES * 60)
+            msg_ids = inactivity_get_msgs(uid)
+            # Delete all messages
+            for mid in msg_ids:
+                try:
+                    await context.bot.delete_message(chat_id=cid, message_id=mid)
+                except Exception:
+                    pass
+            inactivity_clear(uid)
+            # Send VIP message once only
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        "⏰ *Your session has expired.*\n\n"
+                        "🌟 *Join our VIP today and get more accuracy signals!*\n\n"
+                        "✅ Win rate 90% — 98%\n"
+                        "✅ 100+ trading pairs\n"
+                        "✅ Unlimited signals\n\n"
+                        "_Tap *Start* below to open a fresh chart._"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=expired_signal_keyboard()
+                )
+            except Exception as e:
+                logging.warning("inactivity_expire send failed: {}".format(e))
+
+        task = asyncio.create_task(inactivity_expire(user_id, chat))
+        USER_INACTIVITY[user_id]["task"] = task
+
+async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """Directly handle reply keyboard button presses — no middleman button needed."""
+    user_id = update.effective_user.id
+
+    if data == "choose_pair":
+        weekend = is_weekend()
+        taglines = [
+            "🌙 *After-Hours Trading*\nWeekend-only pairs available 24/7." if weekend else
+            "🌍 *Real Market Pairs*\nTrade on live market data.",
+        ]
+        tagline = random.choice(taglines)
+        sess = get_trading_session()
+        sess_txt = ""
+        if sess and sess.get("name","") not in ("Dead Hours","Off Hours",""):
+            sess_txt = "\n🕐 *{}* active".format(sess["name"])
+        header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
+        await update.message.reply_text(
+            header,
+            parse_mode="Markdown",
+            reply_markup=pairs_keyboard()
+        )
+        return
+
+    if data == "bot_pick_pair":
+        # Free trial users cannot use Bot Pick Pair — subscribers only
+        if not is_licensed(user_id):
+            await update.message.reply_text(
+                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
+                "This feature is available for licensed subscribers only.\n\n"
+                "Upgrade to get:\n"
+                "✅ Bot-picked best pairs\n"
+                "✅ Unlimited signals\n"
+                "✅ Win rate 90% — 98%",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
+                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+                ])
+            )
+            return
 
         weekend      = is_weekend()
         otc_on       = is_otc_enabled()
@@ -3717,7 +4115,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
+                status, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
@@ -4011,16 +4409,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_otc_enabled(new_state)
             if new_state:
                 await update.message.reply_text(
-                    "✅ *OTC Pairs: ON*\n\n"
+                    "✅ *OTC Pairs: WASHA (ON)*\n\n"
                     "All pairs are now visible — OTC and non-OTC.\n\n"
                     "_Use /toggleotc again to disable OTC._",
                     parse_mode="Markdown"
                 )
             else:
                 await update.message.reply_text(
-                    "🔴 *OTC Pairs: OFF*\n\n"
+                    "🔴 *OTC Pairs: ZIMA (OFF)*\n\n"
                     "Users will see *non-OTC pairs only* now.\n"
-                    "OTC pairs are now hidden from the keyboard.\n\n"
+                    "OTC pairs zimefichwa kwenye keyboard.\n\n"
                     "_Use /toggleotc again to enable OTC._",
                     parse_mode="Markdown"
                 )
@@ -4060,21 +4458,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("/start", "🔄 Restart"):
         await start(update, context)
         return
-    if text == "⚡ EVALON MENU":
-        # Show full inline menu
-        await update.message.reply_text(
-            "🚀 *What would you like to do?*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚡ Get Signal",        callback_data="choose_pair")],
-                [InlineKeyboardButton("🤖 Bot Pick Pair",     callback_data="bot_pick_pair")],
-                [InlineKeyboardButton("📊 My Stats",          callback_data="my_stats")],
-                [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
-                [InlineKeyboardButton("ℹ️ Help",              callback_data="show_help")],
-            ])
-        )
+    if text == "🔄 Restart":
+        await start(update, context)
         return
-    # Legacy reply keyboard buttons (backward compat)
     if text == "⚡ Get Signal":
         await query_wrapper(update, context, "choose_pair")
         return
@@ -4089,6 +4475,133 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "ℹ️ Help":
         await help_command(update, context)
+        return
+
+    # Admin: block/unblock/list blocked users
+    if text.startswith("/blockuser ") and user_id == ADMIN_ID:
+        try:
+            parts = text.split()
+            target_id = int(parts[1])
+            reason = " ".join(parts[2:]) or None
+            block_user(target_id, reason)
+            await update.message.reply_text("User {} blocked.".format(target_id))
+        except Exception:
+            await update.message.reply_text("Usage: /blockuser 123456789 [reason]")
+        return
+
+    if text.startswith("/unblockuser ") and user_id == ADMIN_ID:
+        try:
+            target_id = int(text.split()[1])
+            unblock_user(target_id)
+            await update.message.reply_text("User {} unblocked.".format(target_id))
+        except Exception:
+            await update.message.reply_text("Usage: /unblockuser 123456789")
+        return
+
+    if text == "/listblocked" and user_id == ADMIN_ID:
+        blocked = get_blocked_users()
+        if not blocked:
+            await update.message.reply_text("No blocked users.")
+            return
+        msg = "*Blocked Users*\n\n"
+        for b in blocked:
+            name = "{} {}".format(b.get("first_name") or "", b.get("last_name") or "").strip() or "No name"
+            uname = "@{}".format(b["username"]) if b.get("username") else "no username"
+            msg += "ID: {} | {} | {} | /unblockuser {}\n".format(b["user_id"], name, uname, b["user_id"])
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    if text.startswith("/broadcast ") and user_id == ADMIN_ID:
+        msg_text = text[11:].strip()
+        if not msg_text:
+            await update.message.reply_text("Usage: /broadcast Your message here")
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id FROM users")
+                    all_users = [r["user_id"] for r in cur.fetchall()]
+            sent = blk = failed = 0; blk_ids = []
+            for uid in all_users:
+                try:
+                    await context.bot.send_message(chat_id=uid, text=msg_text, parse_mode="Markdown")
+                    sent += 1
+                except Exception as ex:
+                    err = str(ex).lower()
+                    if "blocked" in err or "deactivated" in err or "not found" in err:
+                        blk += 1; blk_ids.append(uid)
+                    else:
+                        failed += 1
+                await asyncio.sleep(0.05)
+            s = "Broadcast done.\nSent: {}\nBlocked bot: {}\nFailed: {}".format(sent, blk, failed)
+            if blk_ids:
+                s += "\nBlocked IDs: " + ", ".join(str(i) for i in blk_ids[:20])
+            await update.message.reply_text(s)
+        except Exception as e:
+            await update.message.reply_text("Broadcast error: {}".format(e))
+        return
+
+    if text == "/blockedbot" and user_id == ADMIN_ID:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, first_name, last_name, username FROM users")
+                    all_users = cur.fetchall()
+            blk_list = []
+            for u in all_users:
+                try:
+                    await context.bot.send_chat_action(chat_id=u["user_id"], action="typing")
+                except Exception as ex:
+                    if "blocked" in str(ex).lower() or "deactivated" in str(ex).lower():
+                        nm = "{} {}".format(u.get("first_name") or "", u.get("last_name") or "").strip() or "No name"
+                        blk_list.append("ID:{} | {} | @{}".format(u["user_id"], nm, u.get("username") or "none"))
+                await asyncio.sleep(0.03)
+            if not blk_list:
+                await update.message.reply_text("No users have blocked the bot.")
+                return
+            msg = "*Blocked bot: {}*\n\n".format(len(blk_list)) + "\n".join(blk_list[:50])
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text("Error: {}".format(e))
+        return
+
+    if text == "/resultson" and user_id == ADMIN_ID:
+        set_bot_setting("results_enabled", "on")
+        await update.message.reply_text("Results messages: ON")
+        return
+    if text == "/resultsoff" and user_id == ADMIN_ID:
+        set_bot_setting("results_enabled", "off")
+        await update.message.reply_text("Results messages: OFF")
+        return
+
+    if text.startswith("/blockuser ") and user_id == ADMIN_ID:
+        try:
+            parts = text.split(); tid = int(parts[1]); reason = " ".join(parts[2:]) or None
+            block_user(tid, reason)
+            await update.message.reply_text("User {} blocked.".format(tid))
+        except Exception:
+            await update.message.reply_text("Usage: /blockuser 123456789 [reason]")
+        return
+
+    if text.startswith("/unblockuser ") and user_id == ADMIN_ID:
+        try:
+            tid = int(text.split()[1]); unblock_user(tid)
+            await update.message.reply_text("User {} unblocked.".format(tid))
+        except Exception:
+            await update.message.reply_text("Usage: /unblockuser 123456789")
+        return
+
+    if text == "/listblocked" and user_id == ADMIN_ID:
+        blocked = get_blocked_users()
+        if not blocked:
+            await update.message.reply_text("No blocked users.")
+            return
+        msg = "*Blocked Users*\n\n"
+        for b in blocked:
+            nm = "{} {}".format(b.get("first_name") or "", b.get("last_name") or "").strip() or "No name"
+            un = "@{}".format(b["username"]) if b.get("username") else "none"
+            msg += "ID: `{}` | {} | {}\n/unblockuser {}\n\n".format(b["user_id"], nm, un, b["user_id"])
+        await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
     # Admin: search user by name or username
@@ -4503,6 +5016,24 @@ def get_ranked_forex_pairs():
 
     return {"contrarian": contrarian, "normal": normal, "all": all_pairs}
 
+
+def get_worst5_pairs():
+    """Return 5 worst forex pairs by VTE winrate (lowest first) for contrarian signals."""
+    try:
+        forex_pairs = [p for p in YAHOO_SYMBOLS if "/" in p and "BTC" not in p]
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pair, wins, losses,"
+                    " ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate"
+                    " FROM pair_stats WHERE pair = ANY(%s) AND (wins + losses) >= 5"
+                    " ORDER BY win_rate ASC, losses DESC LIMIT 5",
+                    (forex_pairs,)
+                )
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logging.warning("get_worst5_pairs: {}".format(e))
+        return []
 
 def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
