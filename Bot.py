@@ -2017,13 +2017,13 @@ def _calc_direction(closes):
         # ── Direction decision ────────────────────────────────
         if buy_score > sell_score:
             confidence = buy_score / total_weight
-            # Require minimum 65% confidence
-            if confidence < 0.65:
+            # Require minimum 55% confidence
+            if confidence < 0.55:
                 return None, confidence
             return "BUY", confidence
         elif sell_score > buy_score:
             confidence = sell_score / total_weight
-            if confidence < 0.65:
+            if confidence < 0.55:
                 return None, confidence
             return "SELL", confidence
         else:
@@ -2188,8 +2188,8 @@ def _check_tf_confirmation(pair, tf_minutes):
         dominant = None
         score    = 0
 
-    confirmed    = (score == 4) or (score == total and total >= 4)
-    near_confirm = (score >= 3 and total >= 3)
+    confirmed    = (score >= 4 and total >= 4)
+    near_confirm = (score >= 3 and total >= 3) or (score >= 2 and total == 2)
     confidence   = score / max(total, 4)
 
     return {
@@ -2571,17 +2571,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Persistent Reply Keyboard — ALWAYS sent first ─────────
     # This ensures keyboard appears/reappears at bottom of screen
     reply_kb = ReplyKeyboardMarkup(
-        [
-            ["⚡ Get Signal",     "🤖 Bot Pick Pair"],
-            ["📊 My Stats",       "💎 Upgrade"],
-            ["🔄 Restart",        "ℹ️ Help"],
-        ],
+        [["⚡ EVALON MENU"]],
         resize_keyboard=True,
-        is_persistent=True,   # Keep keyboard visible always
+        is_persistent=True,
         one_time_keyboard=False,
     )
 
-    # Send welcome with reply keyboard attached — keyboard appears immediately
     await update.message.reply_text(
         "╔══════════════════════╗\n"
         "     ⚡ EVALON MASTER PRO\n"
@@ -2590,19 +2585,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *100+ Trading Pairs*\n"
         "🧠 *AI-Powered Signal Analysis*\n\n"
         "⚠️ _Evalon Bot is AI-powered and may make mistakes. Trade responsibly._\n\n"
-        "Choose an option below to get started:",
+        "Tap the menu button below to get started:",
         parse_mode="Markdown",
         reply_markup=reply_kb,
     )
 
-    # ── Inline menu below welcome ──────────────────────────────
     await update.message.reply_text(
-        "🚀 *Quick Actions:*",
+        "🚀 *What would you like to do?*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤖 Bot Pick Best Pair", callback_data="bot_pick_pair")],
-            [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
-            [InlineKeyboardButton("💎 Upgrade / Licence",  callback_data="pay_info")],
+            [InlineKeyboardButton("⚡ Get Signal",      callback_data="choose_pair")],
+            [InlineKeyboardButton("🤖 Bot Pick Pair",   callback_data="bot_pick_pair")],
+            [InlineKeyboardButton("📊 My Stats",        callback_data="my_stats")],
+            [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
+            [InlineKeyboardButton("ℹ️ Help",            callback_data="show_help")],
         ])
     )
 
@@ -2986,6 +2982,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "show_help":
+        await help_command(update, context)
+        return
+
     if data=="pay_info":
         await q.edit_message_text(
             PAYMENT_TEXT,
@@ -3053,16 +3053,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if check["action"] == "cooldown":
             return
 
-        if not is_candle_safe_zone():
-            await context.bot.send_message(
-                chat_id=chat,
-                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
-                ])
-            )
-            return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         is_non_otc = pair in YAHOO_SYMBOLS or OTC_TO_REAL.get(pair) in YAHOO_SYMBOLS
@@ -3081,12 +3071,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown"
                 )
                 return
             if trend is not None:
@@ -3096,12 +3082,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown"
                 )
                 return
         elif check["action"] == "flip":
@@ -3218,17 +3200,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         inactivity_reset(user_id, chat)
 
-        if not is_candle_safe_zone():
-            await context.bot.send_message(
-                chat_id=chat,
-                text="⏳ *Please wait...*\n\nWaiting for the right moment.\nTap *Get More* in a moment.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
-                                          callback_data="otctf_{}_{}".format(idx_str, chosen_secs))]
-                ])
-            )
-            return
 
         try: await q.message.delete()
         except: pass
@@ -3248,11 +3219,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                ])
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown"
             )
             return
 
@@ -3379,16 +3347,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inactivity_reset(user_id, chat)
             clear_user_signal_state(user_id, pair)
 
-        if not is_candle_safe_zone():
-            await context.bot.send_message(
-                chat_id=chat,
-                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
@@ -3412,16 +3370,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
                 elif "flip" in reason:
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                msg = "🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra)
+                msg = "🟡 *No clear signal available*"
             else:
-                msg = "🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair."
+                msg = "🟡 *No clear signal available*"
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                ])
+                parse_mode="Markdown"
             )
             return
 
@@ -3440,12 +3395,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extra = "\n\n_Market direction changed too quickly — waiting for stability._"
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                ])
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown"
             )
             return
         elif sig.get("indicators_agree", 7) < 4:
@@ -3453,12 +3404,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
+                text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                ])
+
             )
             return
 
@@ -3607,16 +3555,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Candle safe zone check ---
         # Block if we are in the first 10 seconds (new candle) or last 10 seconds (candle closing)
-        if not is_candle_safe_zone():
-            await context.bot.send_message(
-                chat_id=chat,
-                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
-                ])
-            )
-            return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
 
@@ -3642,12 +3580,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.".format(pair),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown"
                 )
                 return
             direction  = sig["direction"]
@@ -3666,11 +3600,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown"
                 )
                 return
             # Override with dominant trend if available
@@ -3688,12 +3619,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(pair_to_idx(pair)))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
+                    text="🟡 *No clear signal available*",
+                    parse_mode="Markdown"
                 )
                 return
     
@@ -4133,9 +4060,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("/start", "🔄 Restart"):
         await start(update, context)
         return
-    if text == "🔄 Restart":
-        await start(update, context)
+    if text == "⚡ EVALON MENU":
+        # Show full inline menu
+        await update.message.reply_text(
+            "🚀 *What would you like to do?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Get Signal",        callback_data="choose_pair")],
+                [InlineKeyboardButton("🤖 Bot Pick Pair",     callback_data="bot_pick_pair")],
+                [InlineKeyboardButton("📊 My Stats",          callback_data="my_stats")],
+                [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
+                [InlineKeyboardButton("ℹ️ Help",              callback_data="show_help")],
+            ])
+        )
         return
+    # Legacy reply keyboard buttons (backward compat)
     if text == "⚡ Get Signal":
         await query_wrapper(update, context, "choose_pair")
         return
