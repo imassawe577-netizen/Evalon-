@@ -1731,11 +1731,315 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 _otc_flip_cache: dict = {}
 
 
-def _check_short_history(pair, seconds_back):
+# ============================================================
+# ADVANCED SIGNAL ENGINE — Full Multi-Timeframe Confirmation
+# ============================================================
+#
+# Signal rules (ALL timeframes must confirm):
+#
+# 1m CALL:  5s bullish + 1m bullish + 15m bullish + 4H bullish
+# 1m PUT:   5s bearish + 1m bearish + 15m bearish + 4H bearish
+#
+# 2m CALL: 10s bullish + 2m bullish + 30m bullish + 4H bullish
+# 2m PUT:  10s bearish + 2m bearish + 30m bearish + 4H bearish
+#
+# 3m CALL: 15s bullish + 3m bullish + 1H bullish  + 4H bullish
+# 3m PUT:  15s bearish + 3m bearish + 1H bearish  + 4H bearish
+#
+# Priority: try 1m first → 2m → 3m
+# Near-confirmation: 3 of 4 timeframes agree → signal with lower confidence
+# ============================================================
+
+import urllib.request as _urllib_req
+import json as _json
+
+# ── Finnhub candle fetch (primary data source) ───────────────
+FINNHUB_FOREX_MAP = {
+    "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
+    "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
+    "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
+    "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
+    "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
+    "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
+    "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
+    "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
+    "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
+    "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
+    "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
+    "GBP/CHF": "OANDA:GBP_CHF", "USD/MXN": "OANDA:USD_MXN",
+    "Gold": "OANDA:XAU_USD", "Bitcoin": "BINANCE:BTCUSDT",
+}
+
+_tf_candle_cache = {}  # (symbol, resolution) -> (timestamp, closes)
+_CACHE_TTL = 45        # seconds — refresh candle cache every 45s
+
+def _finnhub_candles(symbol, resolution, bars=120):
     """
-    Count BUY vs SELL signals recorded in the last N seconds for this pair.
-    Returns: (dominant_direction, score) or (None, 0.0)
-    score = fraction of signals in dominant direction (0.0 to 1.0)
+    Fetch candle close prices from Finnhub.
+    resolution: '1','5','15','30','60','240' (minutes) or 'D'
+    Returns pandas Series of close prices or None.
+    """
+    cache_key = (symbol, resolution)
+    now_ts = int(time.time())
+    cached = _tf_candle_cache.get(cache_key)
+    if cached and (now_ts - cached[0]) < _CACHE_TTL:
+        return cached[1]
+
+    try:
+        from_ts = now_ts - bars * int(resolution if resolution.isdigit() else 1440) * 60
+        url = (
+            "https://finnhub.io/api/v1/forex/candle"
+            "?symbol={}&resolution={}&from={}&to={}&token={}"
+        ).format(symbol, resolution, from_ts, now_ts, FINNHUB_API_KEY)
+        with _urllib_req.urlopen(url, timeout=6) as resp:
+            data = _json.loads(resp.read().decode())
+        if data.get("s") != "ok" or len(data.get("c", [])) < 20:
+            return None
+        import pandas as _pd
+        closes = _pd.Series(data["c"])
+        _tf_candle_cache[cache_key] = (now_ts, closes)
+        return closes
+    except Exception as e:
+        logging.warning("Finnhub candles failed {}/{}: {}".format(symbol, resolution, e))
+        return None
+
+
+def _yahoo_candles(symbol, interval, period):
+    """Yahoo Finance fallback for candle data."""
+    try:
+        df = yf.download(symbol, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 20:
+            return None
+        return df["Close"].squeeze()
+    except Exception as e:
+        logging.warning("Yahoo candles failed {}/{}: {}".format(symbol, interval, e))
+        return None
+
+
+def _get_closes(pair, resolution_finnhub, interval_yahoo, period_yahoo, bars=120):
+    """
+    Get close prices for a pair at a given timeframe.
+    Tries Finnhub first, falls back to Yahoo Finance.
+    resolution_finnhub: '1','5','15','30','60','240'
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    finn_sym  = FINNHUB_FOREX_MAP.get(real_pair)
+    yahoo_sym = YAHOO_SYMBOLS.get(real_pair)
+
+    closes = None
+    if finn_sym:
+        closes = _finnhub_candles(finn_sym, resolution_finnhub, bars)
+    if closes is None and yahoo_sym:
+        closes = _yahoo_candles(yahoo_sym, interval_yahoo, period_yahoo)
+    return closes
+
+
+# ── Advanced indicator suite ──────────────────────────────────
+
+def _calc_direction(closes):
+    """
+    Calculate trend direction from close prices using 8 indicators.
+    Returns: ('BUY', confidence) or ('SELL', confidence) or (None, 0)
+    confidence: 0.0 to 1.0
+
+    Indicators used:
+    1. EMA 9/21 cross
+    2. Price vs EMA 50
+    3. MACD histogram direction
+    4. RSI (14) level and slope
+    5. Stochastic (14,3) level
+    6. Bollinger Band position
+    7. ADX trend strength (minimum 20 required)
+    8. Recent candle momentum (last 3 candles)
+    """
+    if closes is None or len(closes) < 55:
+        return None, 0.0
+
+    try:
+        c = closes
+
+        # 1. EMA cross
+        ema9  = c.ewm(span=9,  adjust=False).mean()
+        ema21 = c.ewm(span=21, adjust=False).mean()
+        ema50 = c.ewm(span=50, adjust=False).mean()
+        ema9_now  = float(ema9.iloc[-1])
+        ema21_now = float(ema21.iloc[-1])
+        ema50_now = float(ema50.iloc[-1])
+        price_now = float(c.iloc[-1])
+
+        ema_gap = abs(ema9_now - ema21_now) / (ema21_now + 1e-9) * 100
+        if ema_gap < 0.003:
+            return None, 0.0  # Flat EMAs — no trend
+
+        ema_bull = ema9_now > ema21_now
+        price_above_ema50 = price_now > ema50_now
+
+        # 2. MACD
+        ema12 = c.ewm(span=12, adjust=False).mean()
+        ema26 = c.ewm(span=26, adjust=False).mean()
+        macd_line   = ema12 - ema26
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist   = macd_line - macd_signal
+        macd_now    = float(macd_hist.iloc[-1])
+        macd_prev   = float(macd_hist.iloc[-2])
+        macd_bull   = macd_now > 0
+        macd_rising = macd_now > macd_prev
+
+        # 3. RSI
+        delta = c.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi_s = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+        rsi   = float(rsi_s.iloc[-1])
+        rsi_prev = float(rsi_s.iloc[-2])
+        rsi_bull  = rsi > 50
+        rsi_rising = rsi > rsi_prev
+
+        # RSI extremes — strong signal
+        rsi_oversold  = rsi < 35
+        rsi_overbought = rsi > 65
+
+        # 4. Stochastic
+        low14  = c.rolling(14).min()
+        high14 = c.rolling(14).max()
+        stoch  = (c - low14) / (high14 - low14 + 1e-9) * 100
+        stoch_now  = float(stoch.iloc[-1])
+        stoch_prev = float(stoch.iloc[-2])
+        stoch_bull  = stoch_now > 50
+        stoch_rising = stoch_now > stoch_prev
+
+        # 5. Bollinger Band position
+        sma20 = c.rolling(20).mean()
+        std20 = c.rolling(20).std()
+        bb_upper = sma20 + 2 * std20
+        bb_lower = sma20 - 2 * std20
+        bb_pos = (price_now - float(bb_lower.iloc[-1])) / (
+            float(bb_upper.iloc[-1]) - float(bb_lower.iloc[-1]) + 1e-9)
+        bb_bull = bb_pos < 0.5  # Below midline = bullish setup
+        bb_strong_bull = bb_pos < 0.2   # Near lower band = strong BUY
+        bb_strong_bear = bb_pos > 0.8   # Near upper band = strong SELL
+
+        # 6. ADX — trend strength filter (requires minimum strength)
+        try:
+            high_s = c  # Approximate with close (we only have close prices)
+            low_s  = c
+            tr_s   = c.diff().abs()
+            atr14  = tr_s.rolling(14).mean()
+            adx_proxy = float(atr14.iloc[-1]) / (float(c.iloc[-1]) + 1e-9) * 1000
+            trend_strong = adx_proxy > 0.3  # Minimum trend strength threshold
+        except Exception:
+            trend_strong = True  # Assume strong if can't calculate
+
+        # 7. Candle momentum (last 3 candles)
+        c0 = float(c.iloc[-1])
+        c1 = float(c.iloc[-2])
+        c2 = float(c.iloc[-3])
+        c3 = float(c.iloc[-4])
+        bull_candles = sum([c0 > c1, c1 > c2, c2 > c3])
+        bear_candles = 3 - bull_candles
+
+        # 8. EMA slope (trend direction of EMA itself)
+        ema21_prev = float(ema21.iloc[-2])
+        ema21_slope_bull = ema21_now > ema21_prev
+
+        # ── Scoring system ────────────────────────────────────
+        buy_score  = 0
+        sell_score = 0
+        total_weight = 0
+
+        # EMA cross (weight: 3) — most important
+        total_weight += 3
+        if ema_bull:         buy_score  += 3
+        else:                sell_score += 3
+
+        # Price vs EMA50 (weight: 2)
+        total_weight += 2
+        if price_above_ema50:  buy_score  += 2
+        else:                   sell_score += 2
+
+        # MACD direction (weight: 2)
+        total_weight += 2
+        if macd_bull:    buy_score  += 2
+        else:            sell_score += 2
+
+        # MACD rising/falling (weight: 1)
+        total_weight += 1
+        if macd_rising:  buy_score  += 1
+        else:            sell_score += 1
+
+        # RSI level (weight: 2)
+        total_weight += 2
+        if rsi_bull:     buy_score  += 2
+        else:            sell_score += 2
+
+        # RSI slope (weight: 1)
+        total_weight += 1
+        if rsi_rising:   buy_score  += 1
+        else:            sell_score += 1
+
+        # RSI extreme (weight: 2 bonus)
+        if rsi_oversold:
+            buy_score  += 2; total_weight += 2
+        elif rsi_overbought:
+            sell_score += 2; total_weight += 2
+
+        # Stochastic (weight: 1)
+        total_weight += 1
+        if stoch_bull:   buy_score  += 1
+        else:            sell_score += 1
+
+        # Bollinger position (weight: 1)
+        total_weight += 1
+        if bb_bull:      buy_score  += 1
+        else:            sell_score += 1
+
+        # Bollinger extreme (weight: 2 bonus)
+        if bb_strong_bull:
+            buy_score  += 2; total_weight += 2
+        elif bb_strong_bear:
+            sell_score += 2; total_weight += 2
+
+        # Candle momentum (weight: 2)
+        total_weight += 2
+        if bull_candles >= 2:   buy_score  += 2
+        elif bear_candles >= 2: sell_score += 2
+
+        # EMA21 slope (weight: 1)
+        total_weight += 1
+        if ema21_slope_bull: buy_score  += 1
+        else:                sell_score += 1
+
+        # Trend strength gate — if market is flat, no signal
+        if not trend_strong:
+            return None, 0.0
+
+        # ── Direction decision ────────────────────────────────
+        if buy_score > sell_score:
+            confidence = buy_score / total_weight
+            # Require minimum 65% confidence
+            if confidence < 0.65:
+                return None, confidence
+            return "BUY", confidence
+        elif sell_score > buy_score:
+            confidence = sell_score / total_weight
+            if confidence < 0.65:
+                return None, confidence
+            return "SELL", confidence
+        else:
+            return None, 0.5
+
+    except Exception as e:
+        logging.warning("_calc_direction failed: {}".format(e))
+        return None, 0.0
+
+
+def _get_short_term_direction(pair, seconds_back):
+    """
+    Determine short-term direction from recent signal history.
+    Used for 5s, 10s, 15s confirmation windows.
+    Returns: ('BUY', score) or ('SELL', score) or (None, 0)
+    Requires at least 60% dominance to confirm direction.
     """
     try:
         cutoff = datetime.utcnow() - timedelta(seconds=seconds_back)
@@ -1744,545 +2048,276 @@ def _check_short_history(pair, seconds_back):
                 cur.execute(
                     """SELECT direction FROM signal_history
                        WHERE pair=%s AND created_at >= %s
-                       ORDER BY created_at DESC LIMIT 30""",
+                       ORDER BY created_at DESC LIMIT 50""",
                     (pair, cutoff)
                 )
                 rows = cur.fetchall()
-        if not rows:
+        if not rows or len(rows) < 3:
+            # Not enough history — use real-time 1m candle direction
+            real_pair  = OTC_TO_REAL.get(pair, pair)
+            yahoo_sym  = YAHOO_SYMBOLS.get(real_pair)
+            if yahoo_sym:
+                try:
+                    df = yf.download(yahoo_sym, period="1d", interval="1m",
+                                     progress=False, auto_adjust=True)
+                    if df is not None and len(df) >= 3:
+                        closes = df["Close"].squeeze()
+                        c0 = float(closes.iloc[-1])
+                        c1 = float(closes.iloc[-2])
+                        c2 = float(closes.iloc[-3])
+                        bull = sum([c0 > c1, c1 > c2])
+                        if bull >= 2:   return "BUY",  0.75
+                        elif bull == 0: return "SELL", 0.75
+                        else:           return None,   0.5
+                except Exception:
+                    pass
             return None, 0.0
+
         directions = [r["direction"] for r in rows]
         total      = len(directions)
-        buy_count  = directions.count("BUY")
-        sell_count = directions.count("SELL")
-        if buy_count > sell_count:
-            return "BUY", buy_count / total
-        elif sell_count > buy_count:
-            return "SELL", sell_count / total
-        return None, 0.5
+        buy_pct    = directions.count("BUY")  / total
+        sell_pct   = directions.count("SELL") / total
+
+        if buy_pct >= 0.60:
+            return "BUY",  buy_pct
+        elif sell_pct >= 0.60:
+            return "SELL", sell_pct
+        return None, max(buy_pct, sell_pct)
+
     except Exception as e:
-        logging.warning("_check_short_history failed {}: {}".format(pair, e))
+        logging.warning("_get_short_term_direction failed {}: {}".format(pair, e))
         return None, 0.0
 
 
-def _pick_best_tf(pair, trend_1h):
+def _check_tf_confirmation(pair, tf_minutes):
     """
-    Pick best timeframe by checking short-term candle history:
-      1m → look back 5s
-      2m → look back 10s
-      3m → look back 15s
+    Check full 4-timeframe confirmation for a given signal timeframe.
 
-    Each TF gets a real score from actual history data.
-    The TF whose history most strongly agrees with the 1H trend wins.
+    TF rules:
+      1m: 5s  + 1m  + 15m + 4H  all bullish/bearish
+      2m: 10s + 2m  + 30m + 4H  all bullish/bearish
+      3m: 15s + 3m  + 1H  + 4H  all bullish/bearish
 
-    If history is empty for all TFs (new pair / first signal):
-      - Use current UTC second to pick TF (5s→1m, 10s→2m, 15s→3m)
-      - Direction comes from trend_1h or defaults to indicator score
-
-    Returns: (best_tf, best_direction)
+    Returns dict:
+      {
+        'direction':    'BUY'|'SELL'|None,
+        'confirmed':    True|False,       # All 4 TFs agree
+        'near_confirm': True|False,       # 3 of 4 TFs agree
+        'score':        0-4,              # How many TFs agree
+        'confidence':   0.0-1.0,
+        'details':      {tf_name: direction}
+      }
     """
-    seconds_map = {1: 5, 2: 10, 3: 15}
-    results = {}  # tf -> (hist_dir, hist_score)
+    # Define the 4 confirmation timeframes per signal TF
+    tf_configs = {
+        1: {
+            "short":    ("5s",  5),
+            "base":     ("1m",  "1",  "1m",  "1d",   60),
+            "mid":      ("15m", "15", "15m", "5d",   80),
+            "long":     ("4H",  "240","4h",  "60d", 120),
+        },
+        2: {
+            "short":    ("10s", 10),
+            "base":     ("2m",  "2",  "2m",  "2d",   60),
+            "mid":      ("30m", "30", "30m", "10d",  80),
+            "long":     ("4H",  "240","4h",  "60d", 120),
+        },
+        3: {
+            "short":    ("15s", 15),
+            "base":     ("3m",  "3",  "3m",  "3d",   60),
+            "mid":      ("1H",  "60", "1h",  "14d",  80),
+            "long":     ("4H",  "240","4h",  "60d", 120),
+        },
+    }
 
-    for tf in [1, 2, 3]:
-        secs = seconds_map[tf]
-        hist_dir, hist_score = _check_short_history(pair, secs)
-        results[tf] = (hist_dir, hist_score)
-        logging.info("TF {}m ({} s back): dir={} score={:.2f}".format(
-            tf, secs, hist_dir, hist_score))
+    cfg = tf_configs.get(tf_minutes)
+    if not cfg:
+        return {"direction": None, "confirmed": False, "near_confirm": False,
+                "score": 0, "confidence": 0.0, "details": {}}
 
-    # Find TF with real history data (score > 0) that agrees with trend
-    best_tf    = None
-    best_score = 0.0
-    best_dir   = None
+    details = {}
+    directions = []
 
-    for tf in [1, 2, 3]:
-        hist_dir, hist_score = results[tf]
-        if hist_dir is None or hist_score == 0.0:
-            continue  # No real data for this window
-        # Prefer direction that matches 1H trend
-        if trend_1h is not None:
-            if hist_dir == trend_1h and hist_score > best_score:
-                best_score = hist_score
-                best_tf    = tf
-                best_dir   = hist_dir
-        else:
-            if hist_score > best_score:
-                best_score = hist_score
-                best_tf    = tf
-                best_dir   = hist_dir
+    # Short-term (5s / 10s / 15s)
+    short_label, short_secs = cfg["short"]
+    short_dir, short_score = _get_short_term_direction(pair, short_secs)
+    details[short_label] = short_dir
+    if short_dir:
+        directions.append(short_dir)
 
-    # If no TF had real history data → use time-based selection
-    if best_tf is None:
-        sec = datetime.utcnow().second % 15  # cycle 0-14
-        if sec <= 4:
-            best_tf = 1
-        elif sec <= 9:
-            best_tf = 2
-        else:
-            best_tf = 3
-        best_dir = trend_1h  # direction from 1H trend
-        logging.info("TF fallback (no history): {}m dir={}".format(best_tf, best_dir))
+    # Base timeframe (1m / 2m / 3m)
+    base_label, finn_res, yahoo_int, yahoo_per, bars = cfg["base"]
+    base_closes = _get_closes(pair, finn_res, yahoo_int, yahoo_per, bars)
+    base_dir, base_conf = _calc_direction(base_closes)
+    details[base_label] = base_dir
+    if base_dir:
+        directions.append(base_dir)
 
-    return best_tf, best_dir
+    # Mid timeframe (15m / 30m / 1H)
+    mid_label, finn_res_m, yahoo_int_m, yahoo_per_m, bars_m = cfg["mid"]
+    mid_closes = _get_closes(pair, finn_res_m, yahoo_int_m, yahoo_per_m, bars_m)
+    mid_dir, mid_conf = _calc_direction(mid_closes)
+    details[mid_label] = mid_dir
+    if mid_dir:
+        directions.append(mid_dir)
 
+    # Long timeframe (4H)
+    long_label, finn_res_l, yahoo_int_l, yahoo_per_l, bars_l = cfg["long"]
+    long_closes = _get_closes(pair, finn_res_l, yahoo_int_l, yahoo_per_l, bars_l)
+    long_dir, long_conf = _calc_direction(long_closes)
+    details[long_label] = long_dir
+    if long_dir:
+        directions.append(long_dir)
 
-def generate_signal(pair):
-    is_otc = "OTC" in pair
-    real   = None
-    if not is_otc:
-        try:
-            real = _fetch_real_indicators_mtf(pair)
-        except Exception as e:
-            logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
-            real = None
+    if not directions:
+        return {"direction": None, "confirmed": False, "near_confirm": False,
+                "score": 0, "confidence": 0.0, "details": details}
 
-    # ── 1H TREND FILTER (with reversal detection) ────────────
-    trend_1h = None
-    try:
-        trend_1h = _fetch_1h_trend(pair)
-    except Exception as e:
-        logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
+    # Count agreement
+    buy_count  = directions.count("BUY")
+    sell_count = directions.count("SELL")
+    total      = len(directions)
 
-    # ── VWAP TREND ───────────────────────────────────────────
-    vwap_data = None
-    try:
-        vwap_data = _fetch_vwap_trend(pair)
-    except Exception as e:
-        logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
-
-    # ── MULTI-TIMEFRAME SCORE ─────────────────────────────────
-    mtf = None
-    try:
-        mtf = _fetch_mtf_score(pair)
-    except Exception as e:
-        logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
-
-    # ── CANDLESTICK PATTERN DETECTION ────────────────────────
-    pattern_buy_bonus = 0
-    pattern_sell_bonus = 0
-    detected_patterns = {}
-    if real is not None:
-        # Use real data for pattern detection
-        real_pair = OTC_TO_REAL.get(pair, pair)
-        symbol = YAHOO_SYMBOLS.get(real_pair)
-        if symbol:
-            try:
-                df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
-                detected_patterns = _detect_candlestick_patterns(df_5m)
-            except Exception:
-                pass
+    if buy_count > sell_count:
+        dominant = "BUY"
+        score    = buy_count
+    elif sell_count > buy_count:
+        dominant = "SELL"
+        score    = sell_count
     else:
-        # OTC: use mapped real pair for pattern detection
-        real_p = OTC_TO_REAL.get(pair)
-        if real_p:
-            symbol = YAHOO_SYMBOLS.get(real_p)
-            if symbol:
-                try:
-                    df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
-                    detected_patterns = _detect_candlestick_patterns(df_5m)
-                except Exception:
-                    pass
+        dominant = None
+        score    = 0
 
-    for pname, (pdir, pbonus) in detected_patterns.items():
-        if pdir == "BUY":
-            pattern_buy_bonus += pbonus
-        else:
-            pattern_sell_bonus += pbonus
+    confirmed    = (score == 4) or (score == total and total >= 4)
+    near_confirm = (score >= 3 and total >= 3)
+    confidence   = score / max(total, 4)
 
-    # ── PIP MOVEMENT ANALYSIS ─────────────────────────────────
-    avg_movement, movement_cat = _check_pip_movement(pair)
-
-    if real:
-        # ── NON-OTC: Real indicators from Yahoo Finance (5m) ──
-        rsi     = real["rsi"]
-        sto     = real["sto"]
-        ma_diff = real["ma_diff"]
-        macd    = real["macd"]
-        bb_pos  = real["bb_pos"]
-        mom     = real["mom"]
-        vol     = real["vol"]
-        candle  = random.choices([-1, -0.5, 0, 0.5, 1], weights=[10, 15, 50, 15, 10])[0]
-    else:
-        # ── OTC: Smart synthetic indicators (session-aware) ────
-        sess  = _get_session()
-        ptype = _pair_type(pair)
-        if sess["name"] in ("London Open", "NY/London"):
-            rsi_w = [20, 18, 24, 18, 20]
-        elif sess["name"] in ("Asian", "Dead Hours"):
-            rsi_w = [10, 20, 40, 20, 10]
-        else:
-            rsi_w = [15, 20, 30, 20, 15]
-
-        # If 1H trend is clear, bias synthetic data to match it
-        if trend_1h == "BUY":
-            rsi_w = [25, 20, 25, 18, 12]
-        elif trend_1h == "SELL":
-            rsi_w = [12, 18, 25, 20, 25]
-
-        rsi_zone = random.choices(
-            ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
-        rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
-               "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
-               "overbought": random.uniform(72,92)}[rsi_zone]
-        sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
-               "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
-               "overbought": random.uniform(75,95)}[rsi_zone]
-        if sess["name"] in ("London Open", "NY Session"):
-            ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
-        else:
-            ma_diff = random.uniform(-0.4, 0.4)
-        if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
-        if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
-        macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
-        bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
-        mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
-        vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
-        candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
-
-    # ── BASE SCORING ─────────────────────────────────────────
-    b = s = 0
-    if rsi < 25:    b += 25
-    elif rsi < 35:  b += 15
-    elif rsi < 45:  b += 8
-    elif rsi > 75:  s += 25
-    elif rsi > 65:  s += 15
-    elif rsi > 55:  s += 8
-    if sto < 15:    b += 15
-    elif sto < 25:  b += 8
-    elif sto > 85:  s += 15
-    elif sto > 75:  s += 8
-    if ma_diff > 0.3:    b += 20
-    elif ma_diff > 0.1:  b += 10
-    elif ma_diff < -0.3: s += 20
-    elif ma_diff < -0.1: s += 10
-    if macd > 0.4:    b += 15
-    elif macd > 0.1:  b += 7
-    elif macd < -0.4: s += 15
-    elif macd < -0.1: s += 7
-    if bb_pos < 0.15:  b += 10
-    elif bb_pos < 0.3: b += 5
-    elif bb_pos > 0.85: s += 10
-    elif bb_pos > 0.7:  s += 5
-    if mom > 0.4:   b += 10
-    elif mom > 0.1: b += 5
-    elif mom < -0.4: s += 10
-    elif mom < -0.1: s += 5
-    if candle > 0:   b += int(candle * 10)
-    elif candle < 0: s += int(abs(candle) * 10)
-    if vol > 0.75:
-        if b > s: b += 8
-        else:     s += 8
-
-    # ── RSI DIVERGENCE BONUS ─────────────────────────────────
-    if real and real.get("divergence"):
-        div = real["divergence"]
-        if div == "BUY":  b += 20
-        elif div == "SELL": s += 20
-
-    # ── NON-OTC MULTI-TF REAL CONSENSUS BONUS ────────────────
-    # Reward when 1m + 5m + 15m all point the same way (real data)
-    if real and not is_otc and real.get("tf_count", 0) >= 2:
-        tv = real.get("tf_buy_votes", 0)
-        sv = real.get("tf_sell_votes", 0)
-        tf_total = real.get("tf_count", 1)
-        if tv > sv:
-            bonus = int((tv / tf_total) * 30)
-            b += bonus
-        elif sv > tv:
-            bonus = int((sv / tf_total) * 30)
-            s += bonus
-        else:
-            # Conflict across timeframes — reduce confidence
-            b -= 10
-            s -= 10
-
-    # ── WILLIAMS FRACTAL BONUS ───────────────────────────────
-    fractal_sig = None
-    fractal_str = 0
-    if real and real.get("fractal_signal"):
-        fractal_sig = real["fractal_signal"]
-        fractal_str = real.get("fractal_strength", 1)
-    else:
-        if bb_pos < 0.15:
-            fractal_sig = "BUY";  fractal_str = 1
-        elif bb_pos < 0.08:
-            fractal_sig = "BUY";  fractal_str = 2
-        elif bb_pos > 0.85:
-            fractal_sig = "SELL"; fractal_str = 1
-        elif bb_pos > 0.92:
-            fractal_sig = "SELL"; fractal_str = 2
-    if fractal_sig == "BUY":
-        b += 15 * fractal_str
-    elif fractal_sig == "SELL":
-        s += 15 * fractal_str
-
-    # ── CANDLESTICK PATTERN BONUS ────────────────────────────
-    b += pattern_buy_bonus
-    s += pattern_sell_bonus
-
-    # ── SESSION BIAS ─────────────────────────────────────────
-    sb, ss = _session_bias()
-    b += sb; s += ss
-    ptype = _pair_type(pair)
-    if ptype == "crypto":
-        if mom > 0.3: b += 5
-        elif mom < -0.3: s += 5
-    elif ptype == "commodity":
-        if vol > 0.8:
-            if b > s: b += 6
-            else: s += 6
-    elif ptype == "index":
-        if ma_diff > 0.2: b += 5
-        elif ma_diff < -0.2: s += 5
-
-    # ── 1H TREND FILTER BONUS (includes reversal detection) ──
-    if trend_1h == "BUY":
-        b += 45
-    elif trend_1h == "SELL":
-        s += 45
-
-    # ── VWAP TREND BONUS ─────────────────────────────────────
-    if vwap_data is not None:
-        if vwap_data["direction"] == "BUY":
-            bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
-            b += bonus
-        else:
-            bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
-            s += bonus
-
-    # ── MULTI-TIMEFRAME BONUS ────────────────────────────────
-    if mtf and mtf["total"] >= 3:
-        if mtf["buy_tfs"] > mtf["sell_tfs"]:
-            b += mtf["buy_tfs"] * 8
-        elif mtf["sell_tfs"] > mtf["buy_tfs"]:
-            s += mtf["sell_tfs"] * 8
-
-    # ── DIRECTION & CONFLUENCE ───────────────────────────────
-    direction = "BUY" if b >= s else "SELL"
-    indicators_agree = 0
-    checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
-              (macd > 0, macd < 0), (bb_pos < 0.5, bb_pos > 0.5), (mom > 0, mom < 0), (candle > 0, candle < 0)]
-    for buy_c, sell_c in checks:
-        if direction == "BUY" and buy_c:   indicators_agree += 1
-        if direction == "SELL" and sell_c: indicators_agree += 1
-
-    # ── MTF CONFLUENCE COUNT ─────────────────────────────────
-    if mtf and mtf["total"] >= 3:
-        if direction == "BUY"  and mtf["buy_tfs"]  > mtf["sell_tfs"]: indicators_agree += mtf["buy_tfs"]
-        if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
-    if trend_1h == direction:
-        indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection is stronger
-
-    # ── PATTERN CONFLUENCE ───────────────────────────────────
-    # If patterns agree with direction — boost indicators_agree
-    pattern_agrees = (pattern_buy_bonus > 0 and direction == "BUY") or \
-                     (pattern_sell_bonus > 0 and direction == "SELL")
-    if pattern_agrees:
-        indicators_agree += 2
-
-    # ── CONFLICT CHECK: MTF vs 1H ────────────────────────────
-    if mtf and trend_1h and mtf["total"] >= 3:
-        mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
-        if mtf_dir != trend_1h:
-            direction = "BUY" if b > s else "SELL"
-
-    # ── MINIMUM CONFLUENCE ───────────────────────────────────
-    min_confluence = 6 if not is_otc else 5   # Non-OTC requires stronger evidence
-    if indicators_agree < min_confluence:
-        alt_dir = "SELL" if direction == "BUY" else "BUY"
-        alt_agree = 0
-        for buy_c, sell_c in checks:
-            if alt_dir == "BUY" and buy_c:   alt_agree += 1
-            if alt_dir == "SELL" and sell_c: alt_agree += 1
-        if alt_agree > indicators_agree:
-            direction = alt_dir
-            indicators_agree = alt_agree
-        if indicators_agree < min_confluence:
-            direction = "BUY" if b > s else "SELL"
-            indicators_agree = 0
-            for buy_c, sell_c in checks:
-                if direction == "BUY" and buy_c:   indicators_agree += 1
-                if direction == "SELL" and sell_c: indicators_agree += 1
-
-    # ── SIGNAL HISTORY BIAS CHECK ────────────────────────────
-    # If most recent signals share same direction — reinforce decision
-    hist_same, hist_total, hist_pct = _check_signal_history_bias(pair, direction, window=15)
-    if hist_total >= 5:
-        if hist_pct >= 0.70:
-            # History strongly agrees — add +20 and boost indicators_agree
-            if direction == "BUY":
-                b += 20
-            else:
-                s += 20
-            indicators_agree += 2
-        elif hist_pct <= 0.30:
-            # History strongly disagrees — reduce confidence
-            if direction == "BUY":
-                b -= 15
-            else:
-                s -= 15
-
-    # ── STRENGTH CALCULATION ─────────────────────────────────
-    dom = max(b, s); tot = max(b+s, 1)
-    mtf_bonus = 0
-    if mtf and mtf["total"] >= 3:
-        agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
-        mtf_bonus = int((agreeing / mtf["total"]) * 45)
-    trend_bonus = 20 if trend_1h == direction else 0  # Increased from 15
-    pattern_bonus_str = min(30, pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus)
-    hist_bonus_str = int(hist_pct * 20) if hist_total >= 5 else 0
-
-    # Strength formula: base 280 + bonuses (max 500)
-    strength = min(500, max(300, 280 + indicators_agree*25 + int((dom/tot)*100)
-                            + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
-                            + int(random.uniform(-5,5))))
-
-    # ── TIMEFRAME SELECTION ──────────────────────────────────
-    vte_tf = get_optimal_tf(pair)
-    if is_otc:
-        # Pick best TF by checking short history windows:
-        # 1m → check 5s history, 2m → 10s, 3m → 15s
-        # The TF with most candles agreeing with 1H trend wins
-        best_tf, best_dir = _pick_best_tf(pair, trend_1h)
-        timeframe = best_tf
-        # Override direction if best_dir is clear
-        if best_dir is not None:
-            direction = best_dir
-    elif vte_tf is not None:
-        timeframe = vte_tf
-    else:
-        # Non-OTC: data-driven TF based on real confluence
-        if movement_cat == "HIGH":
-            if indicators_agree >= 10:   timeframe = 1
-            elif indicators_agree >= 7:  timeframe = 2
-            elif indicators_agree >= 5:  timeframe = 3
-            else:                        timeframe = 5
-        elif movement_cat == "MEDIUM":
-            if indicators_agree >= 12:   timeframe = 1
-            elif indicators_agree >= 9:  timeframe = 2
-            elif indicators_agree >= 6:  timeframe = 3
-            else:                        timeframe = 5
-        else:   # LOW movement
-            if indicators_agree >= 11:   timeframe = 3
-            else:                        timeframe = 5
-
-    # ── NON-OTC: No signal if confluence too weak ─────────────
-    if not is_otc and indicators_agree < 6 and vte_tf is None:
-        timeframe = 0   # Triggers no-signal in handler
-
-    # ── OTC: Direction is now set by trend + short history (no random flip) ──
-    # Direction was already determined by _pick_best_tf above.
-    # Store in cache for handler reference.
-    if is_otc:
-        _otc_flip_cache[pair] = "follow"
-
-    # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
-    # OTC always forces a signal — no blocking on 1H confirmation.
-    if not is_otc and timeframe <= 2:
-        h1_confirmed = _confirm_1h_direction(pair, direction)
-        if not h1_confirmed:
-            if timeframe == 1:
-                timeframe = 2
-                h1_confirmed = _confirm_1h_direction(pair, direction)
-            if not h1_confirmed:
-                timeframe = 3
-                h1_confirmed = _confirm_1h_direction(pair, direction)
-            if not h1_confirmed:
-                timeframe = 0
-
-    # ── SESSION-AWARE CONTRARIAN OVERRIDE ────────────────────
-    session = _get_session()
-    bias    = get_signal_bias(pair, window=10, threshold=session["threshold"])
-    if bias is not None and trend_1h is None:
-        if is_otc:
-            direction = ("SELL" if bias=="BUY" else "BUY") if session["otc"]=="contrarian" else bias
-        else:
-            if bias == direction:
-                direction = bias
-    elif bias is not None and trend_1h is not None:
-        if bias != trend_1h and is_otc and session["otc"] == "contrarian":
-            pass
-        elif bias == trend_1h:
-            direction = trend_1h
-
-    # ── ENFORCE 1H TREND AS HARD FILTER ─────────────────────
-    if trend_1h == "BUY" and direction == "SELL":
-        raw_gap = s - b - 45
-        if raw_gap < 35:
-            direction = "BUY"
-    elif trend_1h == "SELL" and direction == "BUY":
-        raw_gap = b - s - 45
-        if raw_gap < 35:
-            direction = "SELL"
-
-    # ── 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) ────────
-    # If 1H trend is clear but 5m+15m real data strongly disagrees → no signal
-    if not is_otc and trend_1h is not None and real is not None:
-        tv = real.get("tf_buy_votes", 0)
-        sv = real.get("tf_sell_votes", 0)
-        tf_total = real.get("tf_count", 1)
-        short_tf_dir = "BUY" if tv > sv else ("SELL" if sv > tv else None)
-        if short_tf_dir is not None and short_tf_dir != trend_1h:
-            # Short TFs ALL oppose the 1H trend
-            opposition_pct = max(tv, sv) / tf_total
-            if opposition_pct >= 1.0 and tf_total >= 2:
-                # 100% of short TFs oppose 1H — market in transition, wait
-                timeframe = 0   # Signal flat — will trigger no-signal in handler
-                direction = "BUY" if b > s else "SELL"
-                record_signal(pair, direction)
-                return {
-                    "direction": direction, "pair": pair, "timeframe": 0,
-                    "strength": 0, "indicators_agree": 0,
-                    "trend_1h": trend_1h, "vwap_data": vwap_data,
-                    "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
-                    "mtf": mtf, "flat": True, "patterns": detected_patterns,
-                    "movement_cat": movement_cat, "avg_movement": avg_movement,
-                    "no_signal_reason": "1H vs short-TF conflict",
-                }
-
-    # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
-    # OTC always produces a signal — stability filter does not apply.
-    if not is_otc and not _check_signal_stability(pair, direction, window_minutes=5):
-        timeframe = 0
-        record_signal(pair, direction)
-        return {
-            "direction": direction, "pair": pair, "timeframe": 0,
-            "strength": 0, "indicators_agree": 0,
-            "trend_1h": trend_1h, "vwap_data": vwap_data,
-            "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
-            "mtf": mtf, "flat": True, "patterns": detected_patterns,
-            "movement_cat": movement_cat, "avg_movement": avg_movement,
-            "no_signal_reason": "sudden direction flip detected",
-        }
-
-    # ── TREND CONFLUENCE ANALYSIS ────────────────────────────
-    confluence = _calc_trend_confluence(trend_1h, vwap_data, mtf, direction)
-
-    # ── AUTO-REVERSE ─────────────────────────────────────────
-    if is_reverse_pair(pair):
-        direction = "SELL" if direction == "BUY" else "BUY"
-
-    record_signal(pair, direction)
     return {
-        "direction": direction,
-        "pair": pair,
-        "timeframe": timeframe,
-        "strength": strength,
-        "indicators_agree": indicators_agree,
-        "trend_1h": trend_1h,
-        "vwap_data": vwap_data,
-        "confluence": confluence,
-        "mtf": mtf,
-        "flat": (timeframe == 0),
-        "patterns": detected_patterns,
-        "movement_cat": movement_cat,
-        "avg_movement": avg_movement,
+        "direction":    dominant,
+        "confirmed":    confirmed,
+        "near_confirm": near_confirm,
+        "score":        score,
+        "confidence":   confidence,
+        "details":      details,
     }
 
 
-# ============================================================
-# PAIR INDEX
-# ============================================================
+def generate_signal(pair):
+    """
+    Advanced signal engine — multi-timeframe full confirmation.
+    OTC and non-OTC pairs use identical logic — no separation.
+
+    Priority order: 1m → 2m → 3m
+    Full confirmation (4/4 TFs agree) = strong signal
+    Near confirmation (3/4 TFs agree) = signal with lower confidence
+    No confirmation = no signal (flat)
+
+    Returns standard signal dict compatible with all handlers.
+    """
+    result_1m = result_2m = result_3m = None
+
+    # Try all 3 timeframes in parallel (sequential for simplicity)
+    try:
+        result_1m = _check_tf_confirmation(pair, 1)
+    except Exception as e:
+        logging.warning("TF 1m check failed {}: {}".format(pair, e))
+
+    try:
+        result_2m = _check_tf_confirmation(pair, 2)
+    except Exception as e:
+        logging.warning("TF 2m check failed {}: {}".format(pair, e))
+
+    try:
+        result_3m = _check_tf_confirmation(pair, 3)
+    except Exception as e:
+        logging.warning("TF 3m check failed {}: {}".format(pair, e))
+
+    # Pick best result: prefer full confirmation, then near, then strongest score
+    chosen_tf  = None
+    chosen_res = None
+
+    for tf, res in [(1, result_1m), (2, result_2m), (3, result_3m)]:
+        if res is None or res["direction"] is None:
+            continue
+        if res["confirmed"]:
+            chosen_tf  = tf
+            chosen_res = res
+            break  # Full confirmation found — stop here
+
+    # No full confirmation — try near confirmation
+    if chosen_res is None:
+        for tf, res in [(1, result_1m), (2, result_2m), (3, result_3m)]:
+            if res is None or res["direction"] is None:
+                continue
+            if res["near_confirm"]:
+                chosen_tf  = tf
+                chosen_res = res
+                break
+
+    # Still nothing — no signal
+    if chosen_res is None or chosen_res["direction"] is None:
+        return {
+            "direction": "BUY", "pair": pair, "timeframe": 0,
+            "strength": 0, "indicators_agree": 0,
+            "trend_1h": None, "vwap_data": None,
+            "confluence": {"level": "FLAT", "score": 0, "badge": "⛔ NO SIGNAL"},
+            "mtf": None, "flat": True, "patterns": {},
+            "movement_cat": "MEDIUM", "avg_movement": 0.08,
+            "no_signal_reason": "no timeframe confirmation",
+        }
+
+    direction  = chosen_res["direction"]
+    timeframe  = chosen_tf
+    confidence = chosen_res["confidence"]
+    score      = chosen_res["score"]
+    confirmed  = chosen_res["confirmed"]
+
+    # Reverse pair flip
+    if is_reverse_pair(pair):
+        direction = "SELL" if direction == "BUY" else "BUY"
+
+    # Contrarian pair flip (VTE worst performers)
+    if is_contrarian_pair(pair):
+        direction = "SELL" if direction == "BUY" else "BUY"
+
+    # Strength value (used in caption)
+    strength = int(confidence * 500)
+
+    # Confluence badge
+    if confirmed:
+        badge = "🔥 STRONG ({}/4)".format(score)
+        level = "STRONG"
+    else:
+        badge = "✅ GOOD ({}/4)".format(score)
+        level = "MODERATE"
+
+    indicators_agree = score + (3 if confirmed else 1)
+
+    record_signal(pair, direction)
+
+    return {
+        "direction":       direction,
+        "pair":            pair,
+        "timeframe":       timeframe,
+        "strength":        strength,
+        "indicators_agree": indicators_agree,
+        "trend_1h":        chosen_res["details"].get("1H") or chosen_res["details"].get("4H"),
+        "vwap_data":       None,
+        "confluence":      {"level": level, "score": score, "badge": badge},
+        "mtf":             {"buy_tfs": score if direction=="BUY" else 4-score,
+                            "sell_tfs": score if direction=="SELL" else 4-score,
+                            "total": 4, "details": chosen_res["details"]},
+        "flat":            False,
+        "patterns":        {},
+        "movement_cat":    "MEDIUM",
+        "avg_movement":    0.08,
+        "no_signal_reason": "",
+        "tf_details":      chosen_res["details"],
+        "confirmed":       confirmed,
+    }
+
+
+
 PAIR_INDEX = {str(i): pair for i, pair in enumerate(ALL_PAIRS)}
 
 def pair_to_idx(pair):
@@ -2301,56 +2336,20 @@ def is_weekend():
 def pairs_keyboard():
     """
     Build the pair selection keyboard.
-    Weekday (non-OTC available):
-      - Shows forex pairs only, ranked by VTE win rate (worst first).
-      - First 3 = contrarian pairs (marked with 🔄), rest = normal.
-      - Falls back to default ALL_PAIRS forex order if VTE has no data yet.
-    Weekend: shows OTC pairs only (unchanged).
+    OTC and non-OTC pairs mixed together in ALL_PAIRS order.
+    OTC disabled by admin: show non-OTC only.
     """
     rows = []
     row  = []
-    weekend = is_weekend()
-    otc_on  = is_otc_enabled()
+    otc_on = is_otc_enabled()
 
-    if weekend:
-        # Weekend — show OTC pairs only
-        for i, pair in enumerate(ALL_PAIRS):
-            if "OTC" not in pair:
-                continue
-            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-            if len(row) == 3:
-                rows.append(row)
-                row = []
-    else:
-        # Weekday — forex only, ranked by VTE (worst → best)
-        if not otc_on:
-            ranked = get_ranked_forex_pairs()
-            display_pairs = ranked["all"]
-            contrarian_set = set(ranked["contrarian"])
-        else:
-            # OTC enabled — show all pairs
-            display_pairs = [p for p in ALL_PAIRS if "OTC" not in p]
-            contrarian_set = set()
-
-        for pair in display_pairs:
-            i = pair_to_idx(pair)
-            if i is None:
-                continue
-            label = pair
-            row.append(InlineKeyboardButton(label, callback_data="sel_{}".format(i)))
-            if len(row) == 3:
-                rows.append(row)
-                row = []
-
-        # Also show OTC pairs if enabled
-        if otc_on:
-            for i, pair in enumerate(ALL_PAIRS):
-                if "OTC" not in pair:
-                    continue
-                row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
+    for i, pair in enumerate(ALL_PAIRS):
+        if not otc_on and "OTC" in pair:
+            continue
+        row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
 
     if row:
         rows.append(row)
@@ -3066,7 +3065,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
-        is_non_otc = False  # pair ni OTC
+        is_non_otc = pair in YAHOO_SYMBOLS or OTC_TO_REAL.get(pair) in YAHOO_SYMBOLS
         entry_price = None
         await asyncio.sleep(2)
         trend = get_trend_direction(pair)
@@ -3428,10 +3427,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Trend validation
         trend_dir = get_trend_direction(pair)
-        gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
         if trend_dir is not None:
             direction = trend_dir
-        elif gm_is_non_otc_check and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
+        elif sig.get("flat") or sig.get("indicators_agree", 10) < 6:
             try: await cm.delete()
             except: pass
             reason = sig.get("no_signal_reason", "")
@@ -3467,8 +3465,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_flip_count = 0  # Always fresh signal — reset flip count
 
         # Contrarian flip: worst-3 VTE pairs get signal flipped
-        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-        if gm_is_non_otc and is_contrarian_pair(pair):
+        if is_contrarian_pair(pair):
             direction = "SELL" if direction == "BUY" else "BUY"
             logging.info("CONTRARIAN FLIP getmore: {} → {}".format(pair, direction))
 
@@ -3489,7 +3486,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
-        if gm_is_non_otc and gm_entry_price is not None:
+        if gm_has_price and gm_entry_price is not None:
             asyncio.create_task(
                 schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
             )
@@ -3624,10 +3621,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
 
         # --- Capture entry price IMMEDIATELY (before any processing delay) ---
-        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        real_sym_sel = OTC_TO_REAL.get(pair, pair)
         entry_price = None
-        if is_non_otc:
-            entry_price = _fetch_current_price(pair)
+        if real_sym_sel in YAHOO_SYMBOLS:
+            entry_price = _fetch_current_price(real_sym_sel)
         signal_capture_time = datetime.utcnow()
 
         await asyncio.sleep(1)
@@ -3680,7 +3677,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if trend is not None:
                 direction = trend
             # Non-OTC: no signal if confluence weak — never guess
-            elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
+            elif sig.get("flat") or sig.get("indicators_agree", 10) < 6:
                 try: await cm.delete()
                 except: pass
                 reason = sig.get("no_signal_reason", "")
@@ -3699,135 +3696,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ])
                 )
                 return
-            elif not is_non_otc and sig.get("indicators_agree", 7) < 4:
-                try: await cm.delete()
-                except: pass
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Wait for a better setup or try another pair.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(pair_to_idx(pair)))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
-                    ])
-                )
-                return
-
-        elif check["action"] == "flip":
-            # First quick return — flip direction, reset flip_count to 1
-            direction  = check["direction"]
-            timeframe  = random.choice([1, 2, 3])
-            strength   = random.randint(200, 500)
-            flip_count = 1
-
-        else:  # same
-            # 2nd or 3rd quick return — keep same flipped direction, increment flip_count
-            state      = get_user_signal_state(user_id, pair)
-            flip_count = state["flip_count"] + 1 if state else 2
-            direction  = check["direction"]
-            timeframe  = random.choice([1, 2, 3])
-            strength   = random.randint(200, 500)
-
-        # Save state with updated flip_count
-        # entry_price was already captured at signal request time (above)
-        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-
-        # Contrarian flip: worst-3 VTE pairs get signal flipped (they fail consistently)
-        if is_non_otc and check["action"] == "fresh" and is_contrarian_pair(pair):
-            direction = "SELL" if direction == "BUY" else "BUY"
-            logging.info("CONTRARIAN FLIP applied: {} → {}".format(pair, direction))
-
-        save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
-        # Record to signal history (fresh signals already recorded inside generate_signal)
-        if check["action"] != "fresh":
-            record_signal(pair, direction)
-
-        ib    = direction == "BUY"
-        img   = get_buy_image() if ib else get_sell_image()
-        arrow = "Up 🟢" if ib else "Down 🔴"
-        if not is_licensed(user_id): use_free_signal(user_id)
-        try: await cm.delete()
-        except: pass
-        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
-        sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
-
-        # --- Result tracker: non-OTC only (have real price data) ---
-        if is_non_otc and entry_price is not None:
-            asyncio.create_task(
-                schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, entry_price)
-            )
-
-        # --- Inactivity tracker: record msg_id and reset timer ---
-        inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
-
-        async def inactivity_expire(uid, cid):
-            """Clears ALL signals and sends VIP message immediately."""
-            await asyncio.sleep(INACTIVITY_MINUTES * 60)
-            msg_ids = inactivity_get_msgs(uid)
-            # Delete all messages
-            for mid in msg_ids:
-                try:
-                    await context.bot.delete_message(chat_id=cid, message_id=mid)
-                except Exception:
-                    pass
-            inactivity_clear(uid)
-            # Send VIP message once only
-            try:
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text=(
-                        "⏰ *Your session has expired.*\n\n"
-                        "🌟 *Join our VIP today and get more accuracy signals!*\n\n"
-                        "✅ Win rate 90% — 98%\n"
-                        "✅ 100+ trading pairs\n"
-                        "✅ Unlimited signals\n\n"
-                        "_Tap *Start* below to open a fresh chart._"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=expired_signal_keyboard()
-                )
-            except Exception as e:
-                logging.warning("inactivity_expire send failed: {}".format(e))
-
-        task = asyncio.create_task(inactivity_expire(user_id, chat))
-        USER_INACTIVITY[user_id]["task"] = task
-
-async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Directly handle reply keyboard button presses — no middleman button needed."""
-    user_id = update.effective_user.id
-
-    if data == "choose_pair":
-        weekend = is_weekend()
-        taglines = [
-            "🌙 *After-Hours Trading*\nWeekend-only pairs available 24/7." if weekend else
-            "🌍 *Real Market Pairs*\nTrade on live market data.",
-        ]
-        tagline = random.choice(taglines)
-        header = "⚡ *EVALON MASTER PRO*\n\n{}\n\n📊 Select your trading pair:".format(tagline)
-        await update.message.reply_text(
-            header,
-            parse_mode="Markdown",
-            reply_markup=pairs_keyboard()
-        )
-        return
-
-    if data == "bot_pick_pair":
-        # Free trial users cannot use Bot Pick Pair — subscribers only
-        if not is_licensed(user_id):
-            await update.message.reply_text(
-                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
-                "This feature is available for licensed subscribers only.\n\n"
-                "Upgrade to get:\n"
-                "✅ Bot-picked best pairs\n"
-                "✅ Unlimited signals\n"
-                "✅ Win rate 90% — 98%",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
-                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
-                ])
-            )
-            return
+    
 
         weekend      = is_weekend()
         otc_on       = is_otc_enabled()
