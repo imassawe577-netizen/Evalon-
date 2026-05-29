@@ -48,11 +48,11 @@ CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
-SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (haibadiliki)
+SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
 
 def support_url():
-    """Returns support link — fungua support bot na neno 'admin' tayari kwenye text box."""
+    """Returns support link — opens support bot with 'admin' pre-filled."""
     return "https://t.me/{}?text=admin".format(SUPPORT_BOT)
 
 # Health check handled by webhook server at /health path
@@ -98,17 +98,6 @@ def init_db():
                     direction TEXT NOT NULL,
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
-                CREATE TABLE IF NOT EXISTS blocked_users (
-                    user_id BIGINT PRIMARY KEY,
-                    blocked_at TIMESTAMP DEFAULT NOW(),
-                    reason TEXT DEFAULT NULL
-                );
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                INSERT INTO bot_settings (key, value) VALUES ('results_enabled','on') ON CONFLICT (key) DO NOTHING;
-                INSERT INTO bot_settings (key, value) VALUES ('broadcast_enabled','on') ON CONFLICT (key) DO NOTHING;
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
@@ -197,8 +186,19 @@ def update_pair_stats(pair, won, was_reversed=False):
                             losses = pair_stats.losses + 1,
                             consecutive_losses = pair_stats.consecutive_losses + 1
                     """, (pair,))
-                    # Reset consecutive losses counter
-                    cur.execute("UPDATE pair_stats SET consecutive_losses=0 WHERE pair=%s", (pair,))
+                    # Check if consecutive losses hit 3 — auto-reverse
+                    cur.execute("SELECT consecutive_losses FROM pair_stats WHERE pair=%s", (pair,))
+                    row = cur.fetchone()
+                    if row and row["consecutive_losses"] >= 3:
+                        # Auto-reverse: flip pair and reset streak
+                        if is_reverse_pair(pair):
+                            remove_reverse_pair(pair)
+                            logging.info("AUTO-REVERSE OFF: {} after {} consecutive losses (was reversed)".format(pair, row["consecutive_losses"]))
+                        else:
+                            add_reverse_pair(pair)
+                            logging.info("AUTO-REVERSE ON: {} after {} consecutive losses".format(pair, row["consecutive_losses"]))
+                        # Reset consecutive losses after reversing
+                        cur.execute("UPDATE pair_stats SET consecutive_losses=0 WHERE pair=%s", (pair,))
             conn.commit()
     except Exception as e:
         logging.warning("update_pair_stats failed: {}".format(e))
@@ -237,10 +237,10 @@ def get_best_pair(otc_only=False):
 
 def auto_manage_reverse_pairs():
     """
-    Bot ijiangalie yenyewe:
-    - Pair yenye win rate chini ya 40% (minimum 5 signals) → iongeze kwenye reverse_pairs
-    - Pair yenye win rate juu ya 60% (minimum 5 signals) → iondoe kutoka reverse_pairs (hata kama ilikuwepo)
-    Called automatically ndani ya generate_signal flow.
+    Bot self-manages:
+    - Pairs with win rate below 40% (minimum 5 signals) → add to reverse_pairs
+    - Pairs with win rate above 60% (minimum 5 signals) → remove from reverse_pairs (even if previously set)
+    Called automatically within generate_signal flow.
     """
     try:
         with get_conn() as conn:
@@ -351,68 +351,6 @@ def get_user(user_id):
             row = cur.fetchone()
             return dict(row) if row else {}
 
-def is_blocked(user_id):
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM blocked_users WHERE user_id=%s", (user_id,))
-                return cur.fetchone() is not None
-    except Exception:
-        return False
-
-def block_user(user_id, reason=None):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO blocked_users (user_id, reason, blocked_at) VALUES (%s,%s,NOW()) ON CONFLICT DO NOTHING",
-                (user_id, reason))
-        conn.commit()
-
-def unblock_user(user_id):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM blocked_users WHERE user_id=%s", (user_id,))
-        conn.commit()
-
-def get_blocked_users():
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT b.user_id, b.blocked_at, b.reason,
-                           u.first_name, u.last_name, u.username
-                    FROM blocked_users b
-                    LEFT JOIN users u ON u.user_id = b.user_id
-                    ORDER BY b.blocked_at DESC
-                """)
-                return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
-
-def get_bot_setting(key, default="on"):
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT value FROM bot_settings WHERE key=%s", (key,))
-                row = cur.fetchone()
-        return row["value"] if row else default
-    except Exception:
-        return default
-
-def set_bot_setting(key, value):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO bot_settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-                (key, value))
-        conn.commit()
-
-def is_results_enabled():
-    return get_bot_setting("results_enabled", "on") == "on"
-
-def is_broadcast_enabled():
-    return get_bot_setting("broadcast_enabled", "on") == "on"
-
 def upsert_user_profile(user_id, first_name=None, last_name=None, username=None):
     """Save or update user display name and username for admin lookup."""
     try:
@@ -517,8 +455,8 @@ def get_stats():
         "monthly": sum(1 for u in users if u.get("licence_type") == "monthly" and u.get("licensed")),
         "lifetime":sum(1 for u in users if u.get("licence_type") == "lifetime"),
         "free":    sum(1 for u in users if not u.get("licensed")),
-        "m_codes": [l["code"] for l in licences if not l["used"] and not l.get("revoked") and l["type"] == "monthly"],
-        "l_codes": [l["code"] for l in licences if not l["used"] and not l.get("revoked") and l["type"] == "lifetime"],
+        "m_codes": [l["code"] for l in licences if not l["used"] and l["type"] == "monthly"],
+        "l_codes": [l["code"] for l in licences if not l["used"] and l["type"] == "lifetime"],
     }
 
 def delete_user(user_id):
@@ -1002,7 +940,7 @@ def _fetch_1h_trend(pair):
 def _confirm_1h_direction(pair, direction):
     """
     Smart check: kama signal ya chini (1m/2m) ni SELL,
-    Check if recent 1H candles are trending down
+    angalia 1H candles za sekunde chache zilizopita je zinaenda chini?
     Returns True kama 1H inathibitisha direction, False kama inapingana.
     Hii ni accuracy layer ya ziada — kama 1H haina data, rudi True (proceed).
     """
@@ -1225,123 +1163,6 @@ def _fetch_real_indicators(pair):
     except Exception as e:
         logging.warning("Yahoo Finance fetch failed for {}: {}".format(pair, e))
         return None
-
-
-def _check_reversal_candle(pair, lookback_candles):
-    """
-    Check if there is a reversal candle within the last N candles.
-    A reversal candle is: pin bar, engulfing, or doji.
-    Returns: 'BEARISH_REVERSAL', 'BULLISH_REVERSAL', or None
-    """
-    symbol = YAHOO_SYMBOLS.get(pair)
-    if not symbol:
-        return None
-    try:
-        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
-        if df is None or len(df) < lookback_candles + 2:
-            return None
-        closes = df["Close"].squeeze()
-        opens  = df["Open"].squeeze()
-        highs  = df["High"].squeeze()
-        lows   = df["Low"].squeeze()
-
-        # Check last N candles for reversal pattern
-        for i in range(-lookback_candles, 0):
-            o = float(opens.iloc[i])
-            c = float(closes.iloc[i])
-            h = float(highs.iloc[i])
-            l = float(lows.iloc[i])
-            body   = abs(c - o)
-            candle = h - l
-            if candle < 1e-9:
-                continue
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-            body_ratio = body / candle
-
-            # Pin bar (reversal): small body, long wick
-            if body_ratio < 0.3:
-                if lower_wick > body * 2:  # Long lower wick = bullish reversal
-                    return "BULLISH_REVERSAL"
-                if upper_wick > body * 2:  # Long upper wick = bearish reversal
-                    return "BEARISH_REVERSAL"
-
-            # Doji: very small body
-            if body_ratio < 0.1:
-                # Direction of previous candle determines reversal type
-                if i > -len(closes):
-                    prev_c = float(closes.iloc[i-1])
-                    prev_o = float(opens.iloc[i-1])
-                    if prev_c > prev_o:   return "BEARISH_REVERSAL"
-                    if prev_c < prev_o:   return "BULLISH_REVERSAL"
-
-        return None
-    except Exception as e:
-        logging.warning("_check_reversal_candle failed {}: {}".format(pair, e))
-        return None
-
-
-def _get_live_candle_direction(pair):
-    """
-    Get direction of the current live candle (last 1m candle).
-    Returns: 'UP', 'DOWN', or None
-    """
-    symbol = YAHOO_SYMBOLS.get(pair)
-    if not symbol:
-        return None
-    try:
-        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
-        if df is None or len(df) < 2:
-            return None
-        c = float(df["Close"].squeeze().iloc[-1])
-        o = float(df["Open"].squeeze().iloc[-1])
-        if c > o:   return "UP"
-        if c < o:   return "DOWN"
-        return None
-    except Exception:
-        return None
-
-
-def _apply_reversal_filter(direction, timeframe, pair):
-    """
-    Apply reversal candle filter before issuing signal.
-    Rules:
-      TF=1m → check 1 candle back for reversal
-      TF=2m → check 2 candles back for reversal
-      TF=3m → check 3 candles back for reversal
-      TF>=4m → no filter (longer TF = less noise)
-
-    If reversal found AND live candle confirms opposite → flip signal.
-    If reversal found but live candle not confirmed → keep original signal.
-    If no reversal → keep original signal.
-    """
-    if timeframe > 3:
-        return direction  # No filter for longer TFs
-
-    lookback = timeframe  # 1m=1, 2m=2, 3m=3
-    reversal = _check_reversal_candle(pair, lookback)
-    if reversal is None:
-        return direction
-
-    live = _get_live_candle_direction(pair)
-
-    # Bearish reversal found + live candle falling → flip to SELL
-    if reversal == "BEARISH_REVERSAL" and live == "DOWN":
-        new_dir = "SELL"
-        if new_dir != direction:
-            logging.info("REVERSAL FILTER: {} {} → {} (bearish reversal, live DOWN)".format(
-                pair, direction, new_dir))
-        return new_dir
-
-    # Bullish reversal found + live candle rising → flip to BUY
-    if reversal == "BULLISH_REVERSAL" and live == "UP":
-        new_dir = "BUY"
-        if new_dir != direction:
-            logging.info("REVERSAL FILTER: {} {} → {} (bullish reversal, live UP)".format(
-                pair, direction, new_dir))
-        return new_dir
-
-    return direction  # Reversal found but not confirmed by live candle
 
 
 def _fetch_real_indicators_mtf(pair):
@@ -1900,46 +1721,15 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 # Per-pair OTC flip decision cache (in-memory, reset on restart — fine for OTC)
 _otc_flip_cache: dict = {}
 
-async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
-    """Send a non-OTC signal with user-chosen or bot-chosen timeframe."""
-    arrow   = "📈" if direction == "BUY" else "📉"
-    color   = "🟢" if direction == "BUY" else "🔴"
-    conf    = sig.get("confluence", {})
-    badge   = conf.get("badge", "")
-    agree   = sig.get("indicators_agree", 0)
-    trend   = sig.get("trend_1h")
-    trend_t = "📈 {}".format(trend) if trend else "—"
-    caption = "{} *{}* {} *{}*\n⏱ *{}m*\n📊 Signal strength: {}\n1H Trend: {}\n{}".format(
-        color, pair, arrow, direction, timeframe, agree, trend_t, badge)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, timeframe))]
-    ])
-    buy_img  = context.bot_data.get("buy_image")
-    sell_img = context.bot_data.get("sell_image")
-    img = buy_img if direction == "BUY" else sell_img
-    try:
-        if img:
-            await context.bot.send_photo(chat_id=chat, photo=img, caption=caption,
-                                         parse_mode="Markdown", reply_markup=kb)
-        else:
-            await context.bot.send_message(chat_id=chat, text=caption,
-                                           parse_mode="Markdown", reply_markup=kb)
-    except Exception as e:
-        logging.warning("_send_nonotc_signal failed: {}".format(e))
-
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
-    yahoo_available = True
     if not is_otc:
         try:
             real = _fetch_real_indicators_mtf(pair)
-            if real is None:
-                yahoo_available = False
         except Exception as e:
             logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
             real = None
-            yahoo_available = False
 
     # ── 1H TREND FILTER (with reversal detection) ────────────
     trend_1h = None
@@ -2093,13 +1883,9 @@ def generate_signal(pair):
         if tv > sv:
             bonus = int((tv / tf_total) * 30)
             b += bonus
-            if direction == "BUY":
-                indicators_agree += tv
         elif sv > tv:
             bonus = int((sv / tf_total) * 30)
             s += bonus
-            if direction == "SELL":
-                indicators_agree += sv
         else:
             # Conflict across timeframes — reduce confidence
             b -= 10
@@ -2271,14 +2057,9 @@ def generate_signal(pair):
             if indicators_agree >= 11:   timeframe = 3
             else:                        timeframe = 5
 
-    # ── NON-OTC: Weak confluence → flip direction (opposite of 1H) ──
-    # Only say no-signal if 1H or Yahoo data was unavailable
+    # ── NON-OTC: No signal if confluence too weak ─────────────
     if not is_otc and indicators_agree < 6 and vte_tf is None:
-        if trend_1h is not None:
-            direction = "SELL" if trend_1h == "BUY" else "BUY"
-            timeframe = timeframe if timeframe > 0 else 2
-        elif not yahoo_available:
-            timeframe = 0  # True no-signal: no data at all
+        timeframe = 0   # Triggers no-signal in handler
 
     # ── OTC: Random flip/follow logic ────────────────────────
     # Each signal independently decides: follow the market or go against it.
@@ -2348,17 +2129,15 @@ def generate_signal(pair):
                 # 100% of short TFs oppose 1H — market in transition, wait
                 timeframe = 0   # Signal flat — will trigger no-signal in handler
                 direction = "BUY" if b > s else "SELL"
-                # Flip direction opposite to 1H trend instead of no-signal
-                flipped = "SELL" if trend_1h == "BUY" else "BUY"
-                record_signal(pair, flipped)
+                record_signal(pair, direction)
                 return {
-                    "direction": flipped, "pair": pair, "timeframe": timeframe if timeframe > 0 else 1,
-                    "strength": 50, "indicators_agree": indicators_agree,
+                    "direction": direction, "pair": pair, "timeframe": 0,
+                    "strength": 0, "indicators_agree": 0,
                     "trend_1h": trend_1h, "vwap_data": vwap_data,
-                    "confluence": {"level": "CONTRARIAN", "score": 50, "badge": "🔄"},
-                    "mtf": mtf, "flat": False, "patterns": detected_patterns,
+                    "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
+                    "mtf": mtf, "flat": True, "patterns": detected_patterns,
                     "movement_cat": movement_cat, "avg_movement": avg_movement,
-                    "no_signal_reason": "",
+                    "no_signal_reason": "1H vs short-TF conflict",
                 }
 
     # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
@@ -2379,21 +2158,316 @@ def generate_signal(pair):
     # ── TREND CONFLUENCE ANALYSIS ────────────────────────────
     confluence = _calc_trend_confluence(trend_1h, vwap_data, mtf, direction)
 
-    # Apply reversal candle filter (TF 1m/2m/3m only, non-OTC)
-    if not is_otc:
-        direction = _apply_reversal_filter(direction, timeframe, pair)
+    # ── AUTO-REVERSE ─────────────────────────────────────────
+    if is_reverse_pair(pair):
+        direction = "SELL" if direction == "BUY" else "BUY"
 
     record_signal(pair, direction)
     return {
-        "direction": direction, "pair": pair, "timeframe": timeframe,
-        "strength": abs(b - s), "indicators_agree": indicators_agree,
-        "trend_1h": trend_1h, "vwap_data": vwap_data,
-        "confluence": confluence, "mtf": mtf, "flat": (timeframe == 0),
+        "direction": direction,
+        "pair": pair,
+        "timeframe": timeframe,
+        "strength": strength,
+        "indicators_agree": indicators_agree,
+        "trend_1h": trend_1h,
+        "vwap_data": vwap_data,
+        "confluence": confluence,
+        "mtf": mtf,
+        "flat": (timeframe == 0),
         "patterns": detected_patterns,
-        "movement_cat": movement_cat, "avg_movement": avg_movement,
-        "no_signal_reason": "",
+        "movement_cat": movement_cat,
+        "avg_movement": avg_movement,
     }
 
+
+# ============================================================
+# PAIR INDEX
+# ============================================================
+PAIR_INDEX = {str(i): pair for i, pair in enumerate(ALL_PAIRS)}
+
+def pair_to_idx(pair):
+    for idx, p in PAIR_INDEX.items():
+        if p == pair:
+            return idx
+    return None
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+def is_weekend():
+    """Jumatatu=0 ... Ijumaa=4, Jumamosi=5, Jumapili=6 (UTC)"""
+    return datetime.utcnow().weekday() >= 5
+
+def pairs_keyboard():
+    """
+    Build the pair selection keyboard.
+    Weekday (non-OTC available):
+      - Shows forex pairs only, ranked by VTE win rate (worst first).
+      - First 3 = contrarian pairs (marked with 🔄), rest = normal.
+      - Falls back to default ALL_PAIRS forex order if VTE has no data yet.
+    Weekend: shows OTC pairs only (unchanged).
+    """
+    rows = []
+    row  = []
+    weekend = is_weekend()
+    otc_on  = is_otc_enabled()
+
+    if weekend:
+        # Weekend — show OTC pairs only
+        for i, pair in enumerate(ALL_PAIRS):
+            if "OTC" not in pair:
+                continue
+            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+    else:
+        # Weekday — forex only, ranked by VTE (worst → best)
+        if not otc_on:
+            ranked = get_ranked_forex_pairs()
+            display_pairs = ranked["all"]
+            contrarian_set = set(ranked["contrarian"])
+        else:
+            # OTC enabled — show all pairs
+            display_pairs = [p for p in ALL_PAIRS if "OTC" not in p]
+            contrarian_set = set()
+
+        for pair in display_pairs:
+            i = pair_to_idx(pair)
+            if i is None:
+                continue
+            label = pair
+            row.append(InlineKeyboardButton(label, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+
+        # Also show OTC pairs if enabled
+        if otc_on:
+            for i, pair in enumerate(ALL_PAIRS):
+                if "OTC" not in pair:
+                    continue
+                row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+def signal_keyboard(pair):
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
+    ])
+
+def otc_mode_keyboard(pair):
+    """Chaguo la mode kwa OTC pair: Sekunde au Normal (minutes)."""
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ Sekunde (3s/5s/10s...)", callback_data="otc_secs_{}".format(idx))],
+        [InlineKeyboardButton("📊 Normal (minutes)", callback_data="otc_normal_{}".format(idx))],
+        [InlineKeyboardButton("❌ Cancel", callback_data="choose_pair")],
+    ])
+
+def otc_seconds_keyboard(pair):
+    """Keyboard ya kuchagua sekunde kwa OTC — subscribers tu."""
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("3s",  callback_data="otctf_{}_3".format(idx)),
+            InlineKeyboardButton("5s",  callback_data="otctf_{}_5".format(idx)),
+            InlineKeyboardButton("10s", callback_data="otctf_{}_10".format(idx)),
+        ],
+        [
+            InlineKeyboardButton("15s", callback_data="otctf_{}_15".format(idx)),
+            InlineKeyboardButton("30s", callback_data="otctf_{}_30".format(idx)),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="otcback_{}".format(idx))],
+    ])
+
+def expired_signal_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Support", url=support_url())],
+        [InlineKeyboardButton("▶️ Start", callback_data="restart_fresh")],
+    ])
+
+def unlock_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Payment Info & Methods", callback_data="pay_info")],
+        [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
+    ])
+
+def payment_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Support", url=support_url())],
+        [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_unlock")],
+    ])
+
+def admin_image_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Set BUY Image", callback_data="set_buy_img")],
+        [InlineKeyboardButton("📉 Set SELL Image", callback_data="set_sell_img")],
+    ])
+
+# ============================================================
+# PAYMENT TEXT
+# ============================================================
+PAYMENT_TEXT = """💰 *UNLOCK EVALON MASTER PRO*
+
+🥈 *MONTHLY ACCESS — $50*
+✅ Unlimited signals for 30 days
+✅ Win rate 90% — 98%
+✅ 100+ trading pairs
+
+💎 *LIFETIME ACCESS — $150*
+✅ Unlimited signals forever
+✅ Win rate 90% — 98%
+✅ Free updates forever
+✅ 100+ trading pairs
+
+━━━━━━━━━━━━━━━━━━
+💳 *PAYMENT METHODS:*
+
+📱 *Mobile Money (Tanzania):*
+M-Pesa / Tigo / Airtel / Halotel
+Select Lipa Namba: `353481341`
+Account: EVALON STORE
+
+🟡 *Binance ID:* `1222890272`
+Account: Master Indicators Pro
+Send USDT or BUSD via Binance Pay
+
+🔵 *USDT TRC-20 (Tron):*
+`TEUwK1aElmdCeG3n36LDySqSkwobMh37Xf`
+TRC-20 Tron ONLY — wrong network = lost funds
+
+💠 *Ethereum ERC-20:*
+`0x230badccf11a0de2b8a261ae3f99c07235174d6b`
+Send ETH or USDT on Ethereum network
+
+🟠 *BNB Smart Chain BEP-20:*
+`0x230badccf11a0de2b8a261ae3f99c07235174d6b`
+Send USDT or BNB on BNB Smart Chain
+
+💎 *TON Network (Telegram Wallet):*
+`UQCo4q9770JLpocRVdZlzdfTz_Mc2f954Zps74s7S-WdBemZ`
+Send TON or USDT via Telegram Wallet
+
+━━━━━━━━━━━━━━━━━━
+📸 Send payment screenshot to admin
+👤 You will receive your unique licence code!"""
+
+# ============================================================
+# CHANNEL JOIN REQUEST TRACKING
+# ============================================================
+def save_join_request(user_id):
+    """Save user_id when they send a join request to the channel."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO join_requests (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (user_id,)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("save_join_request failed: {}".format(e))
+
+def has_join_request(user_id):
+    """Check if user has ever sent a join request."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM join_requests WHERE user_id = %s", (user_id,))
+                return cur.fetchone() is not None
+    except Exception as e:
+        logging.warning("has_join_request failed: {}".format(e))
+        return False
+
+async def is_channel_member(bot, user_id):
+    """Check if user is already a full member/admin of the channel."""
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+async def check_channel_and_proceed(update, context):
+    """
+    Returns True if user can proceed.
+    Returns False and sends join message if they haven't joined or requested.
+    Admin always passes through.
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        return True
+
+    # Admin always bypasses channel check
+    if user_id == ADMIN_ID:
+        return True
+
+    # Full member check
+    try:
+        if await is_channel_member(context.bot, user_id):
+            return True
+    except Exception:
+        # Can't check — let them through rather than blocking everyone
+        return True
+
+    # Pending join request
+    if has_join_request(user_id):
+        return True
+
+    # Not joined, not requested — show join message
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_INVITE)],
+        [InlineKeyboardButton("✅ I've Requested", callback_data="check_join")],
+    ])
+    msg = (
+        "⚠️ *Join Required*\n\n"
+        "To use EVALON MASTER PRO you must first join our channel.\n\n"
+        "1️⃣ Tap *Join Channel* below\n"
+        "2️⃣ Send a join request\n"
+        "3️⃣ Tap *I've Requested* to continue\n\n"
+        "_You don't need to wait for approval — just send the request._"
+    )
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    return False
+
+async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggered automatically when user sends a join request to the channel.
+    Saves their user_id — bot does NOT approve the request (admin does that).
+    """
+    user_id = update.chat_join_request.from_user.id
+    save_join_request(user_id)
+    logging.info("Join request received from user {}".format(user_id))
+
+# ============================================================
+# HANDLERS
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    user_id = update.effective_user.id
+    get_user(user_id)
+    # Referral check
+    if context.args:
+        try:
+            arg = context.args[0]
+            referrer_id = int(arg.replace("REF_", ""))
+            if referrer_id != user_id:
+                register_referral(user_id, referrer_id)
+        except Exception:
+            pass
+    # Channel membership check
+    if not await check_channel_and_proceed(update, context):
+        return
 
     # ── Persistent Reply Keyboard — ALWAYS sent first ─────────
     # This ensures keyboard appears/reappears at bottom of screen
@@ -2593,14 +2667,15 @@ async def dbcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     data=q.data; chat=q.message.chat_id; user_id=q.from_user.id
+    # Save user profile for admin lookup
     try:
         u = q.from_user
-        upsert_user_profile(user_id, first_name=u.first_name, last_name=u.last_name, username=u.username)
+        upsert_user_profile(user_id,
+            first_name=u.first_name,
+            last_name=u.last_name,
+            username=u.username)
     except Exception:
         pass
-    if is_blocked(user_id) and user_id != ADMIN_ID:
-        await q.answer("You have been blocked from using this bot.", show_alert=True)
-        return
 
     if data == "restart_fresh":
         # Clear signal state and inactivity tracking
@@ -2682,11 +2757,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
         tagline = random.choice(taglines)
-        sess = get_trading_session()
-        sess_txt = ""
-        if sess and sess.get("name","") not in ("Dead Hours","Off Hours",""):
-            sess_txt = "\n🕐 *{}* active".format(sess["name"])
-        header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
+        header = "⚡ *EVALON MASTER PRO*\n\n{}\n\n📊 Select your trading pair:".format(tagline)
 
         await context.bot.send_message(
             chat_id=chat,
@@ -2718,13 +2789,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         otc_on       = is_otc_enabled()
         force_non_otc = not otc_on
 
-        # Top 5 — worst forex performers (lowest winrate = contrarian targets)
-        top5 = get_worst5_pairs()
-        if len(top5) < 5:
-            forex_pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
-            random.shuffle(forex_pool)
+        # Get top 5 from virtual trading engine stats
+        if force_non_otc:
+            top5 = get_top5_pairs(non_otc_only=True)
+        elif weekend:
+            top5 = get_top5_pairs(otc_only=True)
+        else:
+            top5 = get_top5_pairs()
+
+        # Fallback: if not enough virtual data yet, pick random
+        if len(top5) < 3:
+            if force_non_otc:
+                pool = [p for p in ALL_PAIRS if "OTC" not in p]
+            elif weekend:
+                pool = [p for p in ALL_PAIRS if "OTC" in p]
+            else:
+                pool = list(ALL_PAIRS)
+            random.shuffle(pool)
+            # Fill top5 with random pairs not already in list
             existing = {r["pair"] for r in top5}
-            for p in forex_pool:
+            for p in pool:
                 if p not in existing and len(top5) < 5:
                     top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                     existing.add(p)
@@ -2787,7 +2871,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
@@ -2873,7 +2957,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -2898,7 +2982,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -2913,7 +2997,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -2962,82 +3046,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_INACTIVITY[user_id]["task"] = task
         return
 
-    # ── Non-OTC: Back to mode selection ──────────────────────────────────
-    if data.startswith("nonotc_back_"):
-        idx_str = data[12:]
-        pair = PAIR_INDEX.get(idx_str)
-        if not pair: return
-        await q.edit_message_text(
-            "Choose how to trade: {}".format(pair),
-            parse_mode="Markdown",
-            reply_markup=nonotc_mode_keyboard(pair)
-        )
-        return
-
-    # ── Non-OTC: Show manual TF keyboard ──────────────────────────────────
-    if data.startswith("nonotc_tf_"):
-        idx_str = data[10:]
-        pair = PAIR_INDEX.get(idx_str)
-        if not pair: return
-        await q.edit_message_text(
-            "Select timeframe for: {}".format(pair),
-            parse_mode="Markdown",
-            reply_markup=nonotc_tf_keyboard(pair)
-        )
-        return
-
-    # ── Non-OTC: Bot decides TF — go straight to signal ───────────────────
-    if data.startswith("nonotc_auto_"):
-        # Redirect to sel_ flow by replacing data
-        data = "sel_{}".format(data[12:])
-        # Fall through to sel_ handler below
-
-    # ── Non-OTC: User chose specific TF ───────────────────────────────────
-    if data.startswith("nonotctf_"):
-        parts     = data[9:].rsplit("_", 1)
-        idx_str   = parts[0]
-        chosen_tf = int(parts[1]) if len(parts) == 2 else 1
-        pair      = PAIR_INDEX.get(idx_str)
-        if not pair: return
-        if is_spam(user_id): return
-        inactivity_reset(user_id, chat)
-        try: await q.message.delete()
-        except: pass
-        cm = await context.bot.send_message(
-            chat_id=chat, text="Creating a signal for {}".format(pair), parse_mode="Markdown"
-        )
-        try:
-            loop = asyncio.get_event_loop()
-            sig  = await loop.run_in_executor(None, generate_signal, pair)
-        except Exception as e:
-            logging.warning("nonotctf signal failed {}: {}".format(pair, e))
-            try: await cm.delete()
-            except: pass
-            await context.bot.send_message(
-                chat_id=chat,
-                text="No clear signal available",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, chosen_tf))]
-                ])
-            )
-            return
-        direction = sig["direction"]
-        timeframe = chosen_tf
-        if is_contrarian_pair(pair):
-            direction = "SELL" if direction == "BUY" else "BUY"
-        save_user_signal_state(user_id, pair, direction, timeframe, 0)
-        try: await cm.delete()
-        except: pass
-        # Reuse getmore_ send flow by calling it directly
-        context.user_data["_nonotc_sig"]   = sig
-        context.user_data["_nonotc_dir"]   = direction
-        context.user_data["_nonotc_tf"]    = timeframe
-        context.user_data["_nonotc_pair"]  = pair
-        context.user_data["_nonotc_idx"]   = idx_str
-        await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
-        return
-
     # ── OTC: "Sekunde" chosen — show seconds keyboard ───────────────────
     if data.startswith("otc_secs_"):
         idx_str = data[9:]
@@ -3055,7 +3063,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "🔒 *Seconds signals — Subscribers Only*\n\n"
                     "This option is available for licensed subscribers only.\n\n"
-                    "Upgrade ili kupata:\n"
+                    "Upgrade to get:\n"
                     "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
                     "✅ Unlimited signals\n"
                     "✅ Win rate 90% — 98%"
@@ -3114,7 +3122,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="⏳ *Please wait...*\n\nWaiting for the right moment.\nTap *Get More* in a moment.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
@@ -3126,7 +3134,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
 
         sig       = generate_signal(pair)
@@ -3141,7 +3149,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
@@ -3273,7 +3281,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
@@ -3281,7 +3289,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing signal for {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
 
         sig       = generate_signal(pair)
@@ -3303,9 +3311,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
                 elif "flip" in reason:
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                msg = "🟡 *No clear signal available*"
+                msg = "🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra)
             else:
-                msg = "🟡 *No clear signal available*"
+                msg = "🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair."
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
@@ -3332,7 +3340,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extra = "\n\n_Market direction changed too quickly — waiting for stability._"
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
@@ -3345,7 +3353,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Try again or choose another pair.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
@@ -3503,7 +3511,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text="⏳ *Please wait...*\n\nWaiting for the right moment to enter.\nTap *Get More* in a few seconds.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -3535,7 +3543,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.".format(pair),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
@@ -3559,7 +3567,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
@@ -3581,10 +3589,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *Market conditions unclear.*\n\nNo high-confidence signal available for *{}* right now.{}".format(pair, extra),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                        [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(pair_to_idx(pair)))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
                     ])
                 )
                 return
@@ -3593,10 +3602,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text="🟡 *No clear signal available.*\n\nMarket conditions are unclear right now. Wait for a better setup or try another pair.",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
+                        [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(pair_to_idx(pair)))],
+                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
                     ])
                 )
                 return
@@ -3691,11 +3701,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
             "🌍 *Real Market Pairs*\nTrade on live market data.",
         ]
         tagline = random.choice(taglines)
-        sess = get_trading_session()
-        sess_txt = ""
-        if sess and sess.get("name","") not in ("Dead Hours","Off Hours",""):
-            sess_txt = "\n🕐 *{}* active".format(sess["name"])
-        header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
+        header = "⚡ *EVALON MASTER PRO*\n\n{}\n\n📊 Select your trading pair:".format(tagline)
         await update.message.reply_text(
             header,
             parse_mode="Markdown",
@@ -3813,7 +3819,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
@@ -4066,7 +4072,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("📊 *PAIR STATS*\n\nNo data yet.", parse_mode="Markdown")
                 return
             msg = "📊 *PAIR WIN/LOSS STATS*\n\n"
-            for r in stats[:30]:  # Onyesha top 30
+            for r in stats[:30]:  # Show top 30
                 total = r["wins"] + r["losses"]
                 rate  = int(r["wins"] / max(total, 1) * 100)
                 bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
@@ -4107,16 +4113,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_otc_enabled(new_state)
             if new_state:
                 await update.message.reply_text(
-                    "✅ *OTC Pairs: WASHA (ON)*\n\n"
+                    "✅ *OTC Pairs: ON*\n\n"
                     "All pairs are now visible — OTC and non-OTC.\n\n"
                     "_Use /toggleotc again to disable OTC._",
                     parse_mode="Markdown"
                 )
             else:
                 await update.message.reply_text(
-                    "🔴 *OTC Pairs: ZIMA (OFF)*\n\n"
+                    "🔴 *OTC Pairs: OFF*\n\n"
                     "Users will see *non-OTC pairs only* now.\n"
-                    "OTC pairs zimefichwa kwenye keyboard.\n\n"
+                    "OTC pairs are now hidden from the keyboard.\n\n"
                     "_Use /toggleotc again to enable OTC._",
                     parse_mode="Markdown"
                 )
@@ -4173,110 +4179,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "ℹ️ Help":
         await help_command(update, context)
-        return
-
-    # Admin: block/unblock/list blocked users
-    if text.startswith("/blockuser ") and user_id == ADMIN_ID:
-        try:
-            parts = text.split()
-            target_id = int(parts[1])
-            reason = " ".join(parts[2:]) or None
-            block_user(target_id, reason)
-            await update.message.reply_text("User {} blocked.".format(target_id))
-        except Exception:
-            await update.message.reply_text("Usage: /blockuser 123456789 [reason]")
-        return
-
-    if text.startswith("/unblockuser ") and user_id == ADMIN_ID:
-        try:
-            target_id = int(text.split()[1])
-            unblock_user(target_id)
-            await update.message.reply_text("User {} unblocked.".format(target_id))
-        except Exception:
-            await update.message.reply_text("Usage: /unblockuser 123456789")
-        return
-
-    if text == "/listblocked" and user_id == ADMIN_ID:
-        blocked = get_blocked_users()
-        if not blocked:
-            await update.message.reply_text("No blocked users.")
-            return
-        msg = "*Blocked Users*\n\n"
-        for b in blocked:
-            name = "{} {}".format(b.get("first_name") or "", b.get("last_name") or "").strip() or "No name"
-            uname = "@{}".format(b["username"]) if b.get("username") else "no username"
-            msg += "ID: {} | {} | {} | /unblockuser {}\n".format(b["user_id"], name, uname, b["user_id"])
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    # Admin: broadcast message to all users
-    if text.startswith("/broadcast ") and user_id == ADMIN_ID:
-        msg_text = text[11:].strip()
-        if not msg_text:
-            await update.message.reply_text("Usage: /broadcast Your message here")
-            return
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT user_id FROM users")
-                    all_users = [r["user_id"] for r in cur.fetchall()]
-            sent = blocked = failed = 0
-            blocked_ids = []
-            for uid in all_users:
-                try:
-                    await context.bot.send_message(chat_id=uid, text=msg_text, parse_mode="Markdown")
-                    sent += 1
-                except Exception as ex:
-                    err = str(ex).lower()
-                    if "blocked" in err or "deactivated" in err or "not found" in err:
-                        blocked += 1
-                        blocked_ids.append(uid)
-                    else:
-                        failed += 1
-                await asyncio.sleep(0.05)
-            summary = "Broadcast done.\nSent: {}\nBlocked bot: {}\nFailed: {}".format(sent, blocked, failed)
-            if blocked_ids:
-                summary += "\nBlocked IDs:\n" + "\n".join(str(i) for i in blocked_ids[:20])
-            await update.message.reply_text(summary)
-        except Exception as e:
-            await update.message.reply_text("Broadcast error: {}".format(e))
-        return
-
-    # Admin: show users who blocked the bot
-    if text == "/blockedbot" and user_id == ADMIN_ID:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT user_id, first_name, last_name, username FROM users")
-                    all_users = cur.fetchall()
-            blocked_list = []
-            for u in all_users:
-                try:
-                    await context.bot.send_chat_action(chat_id=u["user_id"], action="typing")
-                except Exception as ex:
-                    if "blocked" in str(ex).lower() or "deactivated" in str(ex).lower():
-                        name = "{} {}".format(u.get("first_name") or "", u.get("last_name") or "").strip() or "No name"
-                        blocked_list.append("ID:{} | {} | @{}".format(
-                            u["user_id"], name, u.get("username") or "—"))
-                await asyncio.sleep(0.03)
-            if not blocked_list:
-                await update.message.reply_text("No users have blocked the bot.")
-                return
-            msg = "*Users who blocked the bot: {}*\n\n".format(len(blocked_list))
-            msg += "\n".join(blocked_list[:50])
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except Exception as e:
-            await update.message.reply_text("Error: {}".format(e))
-        return
-
-    # Admin: toggle results on/off
-    if text == "/resultson" and user_id == ADMIN_ID:
-        set_bot_setting("results_enabled", "on")
-        await update.message.reply_text("Results messages ON")
-        return
-    if text == "/resultsoff" and user_id == ADMIN_ID:
-        set_bot_setting("results_enabled", "off")
-        await update.message.reply_text("Results messages OFF")
         return
 
     # Admin: search user by name or username
@@ -4691,25 +4593,6 @@ def get_ranked_forex_pairs():
 
     return {"contrarian": contrarian, "normal": normal, "all": all_pairs}
 
-
-def get_worst5_pairs():
-    """Return 5 worst forex pairs by VTE winrate (lowest first) — for contrarian signals."""
-    try:
-        forex_pairs = [p for p in YAHOO_SYMBOLS if "/" in p and "BTC" not in p]
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT pair, wins, losses,
-                           ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate
-                    FROM pair_stats
-                    WHERE pair = ANY(%s) AND (wins + losses) >= 5
-                    ORDER BY win_rate ASC, losses DESC
-                    LIMIT 5
-                """, (forex_pairs,))
-                return [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        logging.warning("get_worst5_pairs failed: {}".format(e))
-        return []
 
 def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
