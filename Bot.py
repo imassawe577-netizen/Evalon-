@@ -160,6 +160,14 @@ def init_db():
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS consecutive_losses INTEGER DEFAULT 0;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS optimal_tf INTEGER DEFAULT NULL;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS avg_movement DOUBLE PRECISION DEFAULT NULL;
+                CREATE TABLE IF NOT EXISTS tf_session_stats (
+                    pair TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    tf_mins INTEGER NOT NULL,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    PRIMARY KEY (pair, session, tf_mins)
+                );
                 CREATE TABLE IF NOT EXISTS reverse_pairs (
                     pair TEXT PRIMARY KEY
                 );
@@ -2502,6 +2510,22 @@ def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
     yahoo_available = True
+
+    # News filter — block non-OTC signals during high-impact events
+    if not is_otc:
+        _near_news, _news_name = is_news_time()
+        if _near_news:
+            logging.info("NEWS FILTER: blocking signal for {} — {}".format(pair, _news_name))
+            return {
+                "direction": "BUY", "pair": pair, "timeframe": 0,
+                "strength": 0, "indicators_agree": 0,
+                "trend_1h": None, "vwap_data": None,
+                "confluence": {}, "mtf": None, "flat": True,
+                "patterns": [], "movement_cat": "LOW",
+                "avg_movement": 0.0,
+                "no_signal_reason": "⚠️ High-impact news in {} — signal paused for safety.".format(_news_name),
+            }
+
     if not is_otc:
         try:
             real = _fetch_real_indicators_mtf(pair)
@@ -2824,23 +2848,22 @@ def generate_signal(pair):
         # Each call picks independently — no fixed pattern.
         # This mimics human decision-making and keeps broker off-guard.
         timeframe = random.choice([1, 1, 2, 2, 3, 3])
-    elif vte_tf is not None:
-        timeframe = vte_tf
     else:
-        # Non-OTC: data-driven TF based on real confluence
-        if movement_cat == "HIGH":
-            if indicators_agree >= 10:   timeframe = 1
-            elif indicators_agree >= 7:  timeframe = 2
-            elif indicators_agree >= 5:  timeframe = 3
-            else:                        timeframe = 3
-        elif movement_cat == "MEDIUM":
-            if indicators_agree >= 12:   timeframe = 1
-            elif indicators_agree >= 9:  timeframe = 2
-            elif indicators_agree >= 6:  timeframe = 3
-            else:                        timeframe = 3
-        else:   # LOW movement
-            if indicators_agree >= 11:   timeframe = 3
-            else:                        timeframe = 3
+        # Non-OTC: pick best TF (1m/2m/3m) from VTE session-aware stats
+        # Apply confidence threshold per TF
+        best = get_best_tf_for_session(pair)
+        if best == 1 and indicators_agree >= 8:
+            timeframe = 1
+        elif best == 2 and indicators_agree >= 7:
+            timeframe = 2
+        elif best == 3 and indicators_agree >= 6:
+            timeframe = 3
+        elif indicators_agree >= 8:
+            timeframe = 1
+        elif indicators_agree >= 7:
+            timeframe = 2
+        else:
+            timeframe = 3
 
     # ── NON-OTC: Weak confluence → flip direction opposite to 1H ──
     if not is_otc and indicators_agree < 6 and vte_tf is None:
@@ -3557,6 +3580,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data=="choose_pair":
+        # Delete previous menu/signal messages
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
 
@@ -3585,12 +3610,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sess_txt = "\n🕐 *{}* active".format(sess["name"])
         header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
 
-        await context.bot.send_message(
+        _pm = await context.bot.send_message(
             chat_id=chat,
             text=header,
             parse_mode="Markdown",
             reply_markup=pairs_keyboard()
         )
+        save_last_bot_msg(user_id, _pm.message_id)
         return
 
     if data=="bot_pick_pair":
@@ -3790,7 +3816,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -3815,7 +3841,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -3830,7 +3856,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -4034,7 +4060,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
@@ -4062,7 +4088,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -4196,7 +4222,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
@@ -4254,9 +4280,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
                 elif "flip" in reason:
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                msg = "🟡 *No clear signal available*"
+                msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
             else:
-                msg = "🟡 *No clear signal available*"
+                msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
@@ -4283,7 +4309,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extra = "\n\n_Market direction changed too quickly — waiting for stability._"
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
@@ -4297,7 +4323,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
@@ -4469,7 +4495,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_candle_safe_zone():
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -4502,7 +4528,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
@@ -4527,7 +4553,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -4550,7 +4576,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -4563,7 +4589,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text="🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -5620,6 +5646,19 @@ async def _vt_check_results():
                 conn.commit()
                 logging.info("VTE RESULT: {} W:{} L:{} | best_tf={}m | avg_move={:.4f}%".format(
                     pair, total_wins, total_losses, best_tf, avg_mov))
+
+                # Update session-aware TF stats (1m/2m/3m only)
+                session = get_trading_session()
+                sess_name = session.get("name", "Unknown") if session else "Unknown"
+                for tf_secs, d in tf_data.items():
+                    tf_m = tf_secs // 60
+                    if tf_m not in [1, 2, 3]:
+                        continue
+                    for _ in range(d["wins"]):
+                        update_tf_session_stats(pair, tf_m, sess_name, True)
+                    for _ in range(d["losses"]):
+                        update_tf_session_stats(pair, tf_m, sess_name, False)
+
         except Exception as e:
             logging.warning("VTE result save failed {}: {}".format(pair, e))
 
@@ -5663,6 +5702,113 @@ def get_optimal_tf(pair, fallback=None):
     except Exception as e:
         logging.warning("get_optimal_tf failed {}: {}".format(pair, e))
     return fallback
+
+
+# ── NEWS FILTER ─────────────────────────────────────────────
+# High-impact news events (UTC times, approximate)
+# These repeat weekly/monthly — bot avoids signals ±15 min around them
+
+_HIGH_IMPACT_NEWS = [
+    # (weekday, hour, minute, description)
+    # weekday: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+    (4, 13, 30, "NFP"),           # First Friday of month ~13:30 UTC
+    (4, 13, 30, "US Jobs"),
+    (1, 13, 30, "CPI"),           # Varies but often Tue/Wed
+    (2, 13, 30, "CPI"),
+    (2, 18, 0,  "FOMC"),          # Fed meetings — Wednesdays ~18:00 UTC
+    (3, 12, 0,  "ECB"),           # ECB — Thursdays ~12:00 UTC
+    (3, 13, 30, "US GDP"),
+    (3, 13, 30, "Unemployment"),
+    (4, 13, 30, "PCE"),
+]
+
+_NEWS_BUFFER_MINUTES = 15  # avoid signals ±15 min around news
+
+def is_news_time():
+    """
+    Returns (True, event_name) if we are within NEWS_BUFFER_MINUTES of a
+    high-impact event, else (False, None).
+    """
+    try:
+        now_utc = datetime.utcnow()
+        wd  = now_utc.weekday()   # 0=Mon
+        h   = now_utc.hour
+        m   = now_utc.minute
+        now_mins = h * 60 + m
+
+        for (event_wd, event_h, event_m, name) in _HIGH_IMPACT_NEWS:
+            if wd != event_wd:
+                continue
+            event_mins = event_h * 60 + event_m
+            if abs(now_mins - event_mins) <= _NEWS_BUFFER_MINUTES:
+                return True, name
+    except Exception:
+        pass
+    return False, None
+
+
+def get_best_tf_for_session(pair):
+    """
+    Pick best TF (1m/2m/3m) for a pair based on session-aware win rate from VTE.
+    Falls back to overall optimal_tf, then to 2m default.
+    Only considers TFs 1/2/3 minutes.
+    """
+    session = get_trading_session()
+    sess_name = session.get("name", "Unknown") if session else "Unknown"
+    target_tfs = [1, 2, 3]
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Try session-specific first
+                cur.execute("""
+                    SELECT tf_mins,
+                           ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair=%s AND session=%s AND tf_mins = ANY(%s)
+                      AND (wins + losses) >= 5
+                    ORDER BY win_rate DESC, total DESC
+                    LIMIT 1
+                """, (pair, sess_name, target_tfs))
+                row = cur.fetchone()
+                if row:
+                    return int(row["tf_mins"])
+
+                # Fallback: overall best TF from pair_stats (if in 1/2/3)
+                cur.execute(
+                    "SELECT optimal_tf FROM pair_stats WHERE pair=%s",
+                    (pair,)
+                )
+                row2 = cur.fetchone()
+                if row2 and row2["optimal_tf"] and int(row2["optimal_tf"]) in target_tfs:
+                    return int(row2["optimal_tf"])
+    except Exception as e:
+        logging.warning("get_best_tf_for_session failed {}: {}".format(pair, e))
+    return 2  # Default: 2m
+
+
+def update_tf_session_stats(pair, tf_mins, session_name, won):
+    """Update session-specific TF stats after VTE result."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if won:
+                    cur.execute("""
+                        INSERT INTO tf_session_stats (pair, session, tf_mins, wins, losses)
+                        VALUES (%s, %s, %s, 1, 0)
+                        ON CONFLICT (pair, session, tf_mins) DO UPDATE
+                        SET wins = tf_session_stats.wins + 1
+                    """, (pair, session_name, tf_mins))
+                else:
+                    cur.execute("""
+                        INSERT INTO tf_session_stats (pair, session, tf_mins, wins, losses)
+                        VALUES (%s, %s, %s, 0, 1)
+                        ON CONFLICT (pair, session, tf_mins) DO UPDATE
+                        SET losses = tf_session_stats.losses + 1
+                    """, (pair, session_name, tf_mins))
+            conn.commit()
+    except Exception as e:
+        logging.warning("update_tf_session_stats failed: {}".format(e))
 
 
 def get_ranked_forex_pairs():
