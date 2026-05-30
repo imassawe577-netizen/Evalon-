@@ -3,3 +3,4 @@ psycopg2-binary
 aiohttp>=3.9.0
 yfinance
 pandas
+websockets>=11.0
