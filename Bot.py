@@ -50,11 +50,257 @@ CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
-SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
+SUPPORT_BOT  = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
+DERIV_TOKEN  = os.environ.get("DERIV_TOKEN", "pat_c518f7669d62cbae95d46e0052ff8b44d07601a1b89bb035fd668a2e35fafdb4")
+# ============================================================
+# DERIV WEBSOCKET — MICRO CANDLE ENGINE (5s/10s/15s)
+# Used to confirm 1m signals before sending
+# ============================================================
+import websockets
+import json as _json
+import asyncio as _asyncio
+from collections import defaultdict as _defaultdict
+from datetime import datetime as _dt
+
+# Deriv symbol mapping — Pocket Option pair → Deriv symbol
+DERIV_SYMBOLS = {
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY": "frxUSDJPY",
+    "USD/CHF": "frxUSDCHF",
+    "USD/CAD": "frxUSDCAD",
+    "AUD/USD": "frxAUDUSD",
+    "NZD/USD": "frxNZDUSD",
+    "EUR/GBP": "frxEURGBP",
+    "EUR/JPY": "frxEURJPY",
+    "EUR/AUD": "frxEURAUD",
+    "EUR/CAD": "frxEURCAD",
+    "EUR/CHF": "frxEURCHF",
+    "GBP/JPY": "frxGBPJPY",
+    "GBP/AUD": "frxGBPAUD",
+    "GBP/CAD": "frxGBPCAD",
+    "GBP/CHF": "frxGBPCHF",
+    "AUD/JPY": "frxAUDJPY",
+    "AUD/CAD": "frxAUDCAD",
+    "AUD/CHF": "frxAUDCHF",
+    "CAD/JPY": "frxCADJPY",
+    "CAD/CHF": "frxCADCHF",
+    "CHF/JPY": "frxCHFJPY",
+    "NZD/JPY": "frxNZDJPY",
+    "USD/MXN": "frxUSDMXN",
+}
+
+# Cache: {pair: {"5s": [...ticks], "10s": [...], "15s": [...], "ts": timestamp}}
+_DERIV_CACHE = {}
+_DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+
+async def _fetch_deriv_ticks(pair, seconds=15):
+    """
+    Fetch last N ticks from Deriv WebSocket for a pair.
+    Build synthetic candles from ticks.
+    Returns dict with trend info or None on failure.
+    """
+    symbol = DERIV_SYMBOLS.get(pair)
+    if not symbol:
+        return None
+
+    try:
+        async with websockets.connect(_DERIV_WS_URL, close_timeout=5) as ws:
+            # Authorize
+            await ws.send(_json.dumps({"authorize": DERIV_TOKEN}))
+            auth = _json.loads(await _asyncio.wait_for(ws.recv(), timeout=5))
+            if auth.get("error"):
+                logging.warning("Deriv auth failed: {}".format(auth["error"]))
+                return None
+
+            # Request last 60 ticks
+            await ws.send(_json.dumps({
+                "ticks_history": symbol,
+                "end": "latest",
+                "count": 60,
+                "style": "ticks"
+            }))
+            resp = _json.loads(await _asyncio.wait_for(ws.recv(), timeout=8))
+            if resp.get("error") or "history" not in resp:
+                logging.warning("Deriv ticks error {}: {}".format(pair, resp.get("error","")))
+                return None
+
+            prices = resp["history"]["prices"]
+            times  = resp["history"]["times"]
+
+            if len(prices) < 10:
+                return None
+
+            # Build micro-candles for 5s, 10s, 15s
+            results = {}
+            for candle_secs in [5, 10, 15]:
+                candles = _build_micro_candles(prices, times, candle_secs)
+                if len(candles) >= 3:
+                    trend = _micro_trend(candles)
+                    results["{}_s".format(candle_secs)] = trend
+
+            return results if results else None
+
+    except Exception as e:
+        logging.warning("Deriv fetch failed {}: {}".format(pair, e))
+        return None
+
+
+def _build_micro_candles(prices, times, interval_secs):
+    """Group ticks into candles of interval_secs duration."""
+    if not prices:
+        return []
+    candles = []
+    bucket_start = times[0]
+    o = h = l = c = prices[0]
+
+    for i in range(len(prices)):
+        t, p = times[i], prices[i]
+        if t - bucket_start >= interval_secs:
+            candles.append({"open": o, "high": h, "low": l, "close": c})
+            bucket_start = t
+            o = h = l = c = p
+        else:
+            h = max(h, p)
+            l = min(l, p)
+            c = p
+
+    if o is not None:
+        candles.append({"open": o, "high": h, "low": l, "close": c})
+    return candles
+
+
+def _micro_trend(candles):
+    """
+    Analyze micro candles.
+    Returns: {"direction": "BUY"/"SELL"/"FLAT", "strength": 0-100,
+              "reversal": bool, "momentum": float}
+    """
+    if len(candles) < 3:
+        return {"direction": "FLAT", "strength": 0, "reversal": False, "momentum": 0}
+
+    closes = [c["close"] for c in candles]
+
+    # Count bullish vs bearish candles
+    bulls = sum(1 for c in candles if c["close"] > c["open"])
+    bears = sum(1 for c in candles if c["close"] < c["open"])
+    total = len(candles)
+
+    # Momentum: last 3 candles direction
+    last3 = closes[-3:]
+    momentum = (last3[-1] - last3[0]) / last3[0] * 100 if last3[0] != 0 else 0
+
+    # Check reversal: last candle opposes previous trend
+    prev_dir = "BUY" if closes[-2] > closes[-3] else "SELL"
+    last_dir = "BUY" if closes[-1] > closes[-2] else "SELL"
+    reversal = (prev_dir != last_dir)
+
+    if bulls > bears:
+        direction = "BUY"
+        strength  = int(bulls / total * 100)
+    elif bears > bulls:
+        direction = "SELL"
+        strength  = int(bears / total * 100)
+    else:
+        direction = "FLAT"
+        strength  = 50
+
+    return {
+        "direction": direction,
+        "strength":  strength,
+        "reversal":  reversal,
+        "momentum":  round(momentum, 5),
+    }
+
+
+async def pick_best_tf_deriv(pair, signal_direction):
+    """
+    Fetch Deriv micro-candles and pick the best timeframe:
+      1m → check 5s trend
+      2m → check 10s trend
+      3m → check 15s trend
+    Compare strength of all 3. Return the TF with strongest
+    trend matching signal_direction.
+    Returns: (best_tf_mins, strength, reason)
+    Falls back to (2, 0, reason) if Deriv unavailable.
+    """
+    if pair not in DERIV_SYMBOLS:
+        return (2, 0, "pair not in Deriv")
+
+    try:
+        data = await _asyncio.wait_for(
+            _fetch_deriv_ticks(pair, seconds=15),
+            timeout=10
+        )
+    except Exception as e:
+        logging.warning("Deriv pick_best_tf failed {}: {}".format(pair, e))
+        return (2, 0, "Deriv error")
+
+    if not data:
+        return (2, 0, "no Deriv data")
+
+    # Map: trade TF minutes → micro candle seconds key
+    tf_map = {
+        1: "5_s",   # 1m trade → 5s micro trend
+        2: "10_s",  # 2m trade → 10s micro trend
+        3: "15_s",  # 3m trade → 15s micro trend
+    }
+
+    best_tf     = None
+    best_str    = -1
+    best_reason = ""
+
+    for trade_tf, micro_key in tf_map.items():
+        trend = data.get(micro_key)
+        if not trend:
+            continue
+
+        direction = trend["direction"]
+        strength  = trend["strength"]
+
+        # Only consider TFs where micro-trend agrees with signal
+        if direction == signal_direction and not trend["reversal"]:
+            if strength > best_str:
+                best_str    = strength
+                best_tf     = trade_tf
+                best_reason = "{}s micro: {}% {}".format(
+                    trade_tf * 5, strength, direction)
+
+    if best_tf is None:
+        # No TF agrees with signal — check if any is FLAT (neutral)
+        for trade_tf, micro_key in tf_map.items():
+            trend = data.get(micro_key)
+            if trend and trend["direction"] == "FLAT":
+                best_tf  = trade_tf
+                best_str = 50
+                best_reason = "FLAT micro — using {}m".format(trade_tf)
+                break
+
+    if best_tf is None:
+        # All micro-trends oppose signal — use 3m (most forgiving)
+        best_tf     = 3
+        best_str    = 0
+        best_reason = "all micro-trends oppose signal — defaulting to 3m"
+
+    logging.info("Deriv pick_best_tf {}: {}m (str={}) — {}".format(
+        pair, best_tf, best_str, best_reason))
+    return (best_tf, best_str, best_reason)
+
+
+# Keep old name as alias for backward compatibility
+async def confirm_signal_with_deriv(pair, signal_direction):
+    tf, strength, reason = await pick_best_tf_deriv(pair, signal_direction)
+    if strength >= 60:
+        return ("CONFIRM", reason)
+    elif strength == 0:
+        return ("REJECT", reason)
+    return ("SKIP", reason)
+
+
 
 def support_url():
-    """Returns support link — fungua support bot na neno 'admin' tayari kwenye text box."""
+    """Returns support link — opens support bot with 'admin' pre-filled."""
     return "https://t.me/{}?text=admin".format(SUPPORT_BOT)
 
 # Health check handled by webhook server at /health path
@@ -155,11 +401,17 @@ def init_db():
                     losses INTEGER DEFAULT 0,
                     consecutive_losses INTEGER DEFAULT 0,
                     optimal_tf INTEGER DEFAULT NULL,
-                    avg_movement DOUBLE PRECISION DEFAULT NULL
+                    avg_movement DOUBLE PRECISION DEFAULT NULL,
+                    wins_today INTEGER DEFAULT 0,
+                    losses_today INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT NOW()
                 );
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS consecutive_losses INTEGER DEFAULT 0;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS optimal_tf INTEGER DEFAULT NULL;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS avg_movement DOUBLE PRECISION DEFAULT NULL;
+                ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS wins_today INTEGER DEFAULT 0;
+                ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS losses_today INTEGER DEFAULT 0;
+                ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
                 CREATE TABLE IF NOT EXISTS tf_session_stats (
                     pair TEXT NOT NULL,
                     session TEXT NOT NULL,
@@ -716,7 +968,7 @@ def total_free_allowed(user_id):
     return 3 + get_bonus_signals(user_id)
 
 # ============================================================
-# ALL PAIRS — Pocket Option (mchanganyiko, N/A chini)
+# ALL PAIRS — Pocket Option (forex, OTC, indices, stocks, commodities)
 # ============================================================
 ALL_PAIRS = [
     # Currencies — mix of OTC and non-OTC
@@ -745,20 +997,20 @@ ALL_PAIRS = [
     "LBP/USD OTC", "UAH/USD OTC",
     "SAR/CNY OTC", "QAR/CNY OTC", "AED/CNY OTC",
     "BHD/CNY OTC", "OMR/CNY OTC", "JOD/CNY OTC",
-    # Commodities — mchanganyiko
+    # Commodities OTC
     "Brent Oil OTC", "WTI Crude Oil OTC", "Gold OTC",
     "Natural Gas OTC", "Palladium spot OTC", "Platinum spot OTC",
-    # Cryptocurrencies — mchanganyiko
+    # Cryptocurrencies OTC
     "Dogecoin OTC", "Ethereum OTC", "Litecoin OTC",
     "Bitcoin ETF OTC", "Chainlink OTC", "Solana OTC",
     "BNB OTC", "Polkadot OTC", "Cardano OTC", "TRON OTC",
-    "Polygon OTC", "Toncoin OTC", "Avalanche OTC", "Bitcoin",
-    # Indices — mchanganyiko
+    "Polygon OTC", "Toncoin OTC", "Avalanche OTC",
+    # Indices OTC
     "AUS 200 OTC", "100GBP OTC", "D30EUR OTC", "DJI30 OTC",
     "E35EUR OTC", "E35EUR", "E50EUR OTC", "F40EUR OTC",
     "JPN225 OTC", "US100 OTC", "US100", "SP500 OTC", "SP500",
     "CAC 40", "SMI 20",
-    # Stocks — mchanganyiko
+    # Stocks OTC
     "Apple OTC", "American Express OTC", "Boeing Company OTC",
     "FACEBOOK INC OTC", "Intel OTC", "Johnson & Johnson OTC",
     "Citigroup Inc OTC", "Coinbase Global OTC", "FedEx OTC",
@@ -767,17 +1019,8 @@ ALL_PAIRS = [
     "Marathon Digital Holdings OTC", "Pfizer Inc OTC",
     "Palantir Technologies OTC", "VISA OTC", "Alibaba OTC",
     "Cisco OTC", "Advanced Micro Devices OTC",
-    # N/A pairs — lowest priority
-    "Silver OTC", "Brent Oil", "WTI Crude Oil", "XAG/EUR", "XAU/EUR",
-    "Gold", "Natural Gas", "Palladium spot", "Platinum spot", "Silver",
-    "Ethereum", "Dash", "BCH/EUR", "BCH/GBP", "BCH/JPY",
-    "BTC/GBP", "BTC/JPY", "Chainlink",
-    "100GBP", "AEX 25", "D30/EUR", "DJI30", "E50/EUR", "F40/EUR",
-    "HONG KONG 33", "JPN225", "AUS 200",
-    "Apple", "American Express", "Boeing Company", "FACEBOOK INC",
-    "Johnson & Johnson", "JPMorgan Chase & Co", "Microsoft",
-    "Pfizer Inc", "Tesla", "Alibaba", "Citigroup Inc",
-    "Netflix", "Cisco", "ExxonMobil", "McDonald's", "Intel",
+    # Non-OTC non-forex removed (crypto, indices, stocks, commodities)
+    # Only forex pairs with "/" notation remain as non-OTC
 ]
 
 # ============================================================
@@ -792,7 +1035,6 @@ YAHOO_SYMBOLS = {
     "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X", "NZD/JPY": "NZDJPY=X",
     "EUR/CHF": "EURCHF=X", "CHF/JPY": "CHFJPY=X", "CAD/JPY": "CADJPY=X",
     "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X", "USD/MXN": "USDMXN=X",
-    "Bitcoin": "BTC-USD",
     "US100": "^NDX", "SP500": "^GSPC", "CAC 40": "^FCHI",
     "SMI 20": "^SSMI", "E35EUR": "^STOXX",
 }
@@ -3042,13 +3284,10 @@ def is_weekend():
     return False
 
 def pairs_keyboard():
-    """
-    Build the pair selection keyboard.
-    Weekday (non-OTC available):
-      - Shows forex pairs only, ranked by VTE win rate (worst first).
-      - First 3 = contrarian pairs (marked with 🔄), rest = normal.
-      - Falls back to default ALL_PAIRS forex order if VTE has no data yet.
-    Weekend: shows OTC pairs only (unchanged).
+    """Build the pair selection keyboard.
+    Weekday: forex pairs only, ranked by VTE win rate.
+    Weekend: OTC pairs only.
+    Falls back to default ALL_PAIRS order if no VTE data.
     """
     rows = []
     row  = []
@@ -3970,10 +4209,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pair: return
         if is_spam(user_id): return
         inactivity_reset(user_id, chat)
+        # "Get More" button reuses same TF → treat as auto (Deriv picks best)
+        # Only "user chose from keyboard" sets _user_chose_tf=True in sel_ handler
+        # After signal is sent once, subsequent Get More = auto
+        _user_chose_tf = context.user_data.pop("_user_chose_tf", False)
         try: await q.message.delete()
         except: pass
         cm = await context.bot.send_message(
-            chat_id=chat, text="Creating a signal for {}".format(pair), parse_mode="Markdown"
+            chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown"
         )
         try:
             loop = asyncio.get_event_loop()
@@ -3984,7 +4227,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text="No clear signal available",
+                text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, chosen_tf))]
@@ -3995,10 +4238,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = sig["direction"]
         timeframe = chosen_tf
 
+        # ── Deriv micro-candle: only for AUTO (bot-chosen TF) ─
+        # If user chose TF themselves → respect their choice, skip Deriv
+        if not _user_chose_tf and chosen_tf in [1, 2, 3] and pair in DERIV_SYMBOLS:
+            try:
+                _best_tf, _best_str, _best_reason = await pick_best_tf_deriv(pair, direction)
+                logging.info("Deriv best_tf={} str={} — {}".format(_best_tf, _best_str, _best_reason))
+                timeframe = _best_tf
+            except Exception as _de:
+                logging.warning("Deriv pick_best_tf error: {}".format(_de))
+                timeframe = chosen_tf
+        else:
+            timeframe = chosen_tf  # User chose — respect it
+        # ─────────────────────────────────────────────────────
+
         save_user_signal_state(user_id, pair, direction, timeframe, 0)
         try: await cm.delete()
         except: pass
-        # Reuse getmore_ send flow by calling it directly
         context.user_data["_nonotc_sig"]   = sig
         context.user_data["_nonotc_dir"]   = direction
         context.user_data["_nonotc_tf"]    = timeframe
@@ -4007,7 +4263,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
         return
 
-    # ── OTC: "Sekunde" chosen — show seconds keyboard ───────────────────
+    # ── OTC: "Seconds" chosen — show seconds keyboard ──────────────────
     if data.startswith("otc_secs_"):
         idx_str = data[9:]
         pair = PAIR_INDEX.get(idx_str)
@@ -4477,6 +4733,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Non-OTC: Show TF selection keyboard ────────────────
+        context.user_data["_user_chose_tf"] = True  # user will pick TF manually
         _tfm = await context.bot.send_message(
             chat_id=chat,
             text="⚡ *{}*\n\nSelect signal duration:".format(pair),
@@ -5102,17 +5359,40 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "/pairstats":
-            stats = get_pair_stats_all()
-            if not stats:
-                await update.message.reply_text("📊 *PAIR STATS*\n\nNo data yet.", parse_mode="Markdown")
-                return
-            msg = "📊 *PAIR WIN/LOSS STATS*\n\n"
-            for r in stats[:30]:  # Show top 30
-                total = r["wins"] + r["losses"]
-                rate  = int(r["wins"] / max(total, 1) * 100)
-                bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
-                msg  += "{} *{}*\n  ✅ {} wins | ❌ {} losses | {}%\n\n".format(
-                    bar, r["pair"], r["wins"], r["losses"], rate)
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT pair, wins_today AS wins, losses_today AS losses,
+                                   ROUND(wins_today::numeric / NULLIF(wins_today+losses_today,0)*100,1) AS rate
+                            FROM pair_stats
+                            WHERE (wins_today + losses_today) >= 1
+                              AND DATE(updated_at) = CURRENT_DATE
+                            ORDER BY rate DESC NULLS LAST, wins_today DESC
+                            LIMIT 30
+                        """)
+                        today_stats = [dict(r) for r in cur.fetchall()]
+            except Exception as _e:
+                today_stats = []
+            if not today_stats:
+                stats = get_pair_stats_all()
+                if not stats:
+                    await update.message.reply_text("📊 *PAIR STATS*\n\nNo data yet.", parse_mode="Markdown")
+                    return
+                msg = "📊 *PAIR STATS (All-time)*\n\n"
+                for r in stats[:30]:
+                    total = r["wins"] + r["losses"]
+                    rate  = int(r["wins"] / max(total, 1) * 100)
+                    bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
+                    msg  += "{} *{}*\n  ✅ {} | ❌ {} | {}%\n\n".format(bar, r["pair"], r["wins"], r["losses"], rate)
+            else:
+                from datetime import datetime as _dt
+                msg = "📊 *PAIR STATS — Today ({})*\n\n".format(_dt.utcnow().strftime("%d %b %Y"))
+                for r in today_stats:
+                    total = (r["wins"] or 0) + (r["losses"] or 0)
+                    rate  = int((r["wins"] or 0) / max(total, 1) * 100)
+                    bar   = "🟢" * (rate // 20) + "🔴" * (5 - rate // 20)
+                    msg  += "{} *{}*\n  ✅ {} | ❌ {} | {}%\n\n".format(bar, r["pair"], r["wins"] or 0, r["losses"] or 0, rate)
             await update.message.reply_text(msg[:4000], parse_mode="Markdown")
             return
         if text.startswith("/addreverse "):
@@ -5157,7 +5437,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "🔴 *OTC Pairs: ZIMA (OFF)*\n\n"
                     "Users will see *non-OTC pairs only* now.\n"
-                    "OTC pairs zimefichwa kwenye keyboard.\n\n"
+                    "OTC pairs are hidden from the keyboard.\n\n"
                     "_Use /toggleotc again to enable OTC._",
                     parse_mode="Markdown"
                 )
@@ -5658,14 +5938,27 @@ async def _vt_check_results():
 
                     cur.execute("""
                         INSERT INTO pair_stats
-                            (pair, wins, losses, consecutive_losses, optimal_tf, avg_movement)
-                        VALUES (%s, %s, %s, 0, %s, %s)
+                            (pair, wins, losses, consecutive_losses, optimal_tf, avg_movement,
+                             wins_today, losses_today, updated_at)
+                        VALUES (%s, %s, %s, 0, %s, %s, %s, %s, NOW())
                         ON CONFLICT (pair) DO UPDATE SET
                             wins         = pair_stats.wins + EXCLUDED.wins,
                             losses       = pair_stats.losses + EXCLUDED.losses,
                             optimal_tf   = COALESCE(EXCLUDED.optimal_tf, pair_stats.optimal_tf),
-                            avg_movement = EXCLUDED.avg_movement
-                    """, (pair, total_wins, total_losses, best_tf, avg_mov))
+                            avg_movement = EXCLUDED.avg_movement,
+                            wins_today   = CASE
+                                WHEN DATE(pair_stats.updated_at) = CURRENT_DATE
+                                THEN pair_stats.wins_today + EXCLUDED.wins_today
+                                ELSE EXCLUDED.wins_today
+                            END,
+                            losses_today = CASE
+                                WHEN DATE(pair_stats.updated_at) = CURRENT_DATE
+                                THEN pair_stats.losses_today + EXCLUDED.losses_today
+                                ELSE EXCLUDED.losses_today
+                            END,
+                            updated_at   = NOW()
+                    """, (pair, total_wins, total_losses, best_tf, avg_mov,
+                          total_wins, total_losses))
 
                 conn.commit()
                 logging.info("VTE RESULT: {} W:{} L:{} | best_tf={}m | avg_move={:.4f}%".format(
@@ -5897,21 +6190,38 @@ def get_worst5_pairs():
 
 def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
-    Return top 5 pairs by win rate with minimum 5 virtual trades.
-    Used by bot_pick_pair to show user 5 choices.
+    Return top 5 pairs by win rate (today only) with minimum 3 virtual trades.
+    Only returns pairs that exist in ALL_PAIRS (can be shown as buttons).
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT pair, wins, losses,
-                           ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate
+                    SELECT pair, wins_today AS wins, losses_today AS losses,
+                           ROUND(wins_today::numeric / NULLIF(wins_today+losses_today,0) * 100, 1) AS win_rate
                     FROM pair_stats
-                    WHERE (wins + losses) >= 5
-                    ORDER BY win_rate DESC, wins DESC
-                    LIMIT 20
+                    WHERE (wins_today + losses_today) >= 3
+                      AND DATE(updated_at) = CURRENT_DATE
+                    ORDER BY win_rate DESC, wins_today DESC
+                    LIMIT 30
                 """)
                 rows = [dict(r) for r in cur.fetchall()]
+        # Fallback to all-time if no today data
+        if not rows:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair, wins, losses,
+                               ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate
+                        FROM pair_stats
+                        WHERE (wins + losses) >= 5
+                        ORDER BY win_rate DESC, wins DESC
+                        LIMIT 30
+                    """)
+                    rows = [dict(r) for r in cur.fetchall()]
+        # Filter to only pairs in ALL_PAIRS
+        valid = {p for p in ALL_PAIRS}
+        rows = [r for r in rows if r["pair"] in valid]
         if otc_only:
             rows = [r for r in rows if "OTC" in r["pair"]]
         elif non_otc_only:
@@ -5938,6 +6248,22 @@ def is_contrarian_pair(pair):
 
 
 # ============================================================
+async def _stats_reset_loop():
+    """Reset wins_today/losses_today every 30 minutes."""
+    while True:
+        await asyncio.sleep(1800)  # 30 minutes
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE pair_stats SET wins_today = 0, losses_today = 0"
+                    )
+                conn.commit()
+            logging.info("Pair stats reset (30 min cycle): OK")
+        except Exception as e:
+            logging.warning("Stats reset failed: {}".format(e))
+
+
 async def run_bot():
     PORT = int(os.environ.get("PORT", 8080))
     RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -5971,6 +6297,10 @@ async def run_bot():
     # ── Launch Virtual Trading Engine in background ────────────
     asyncio.create_task(virtual_trading_engine())
     print("Virtual trading engine started.")
+
+    # ── Launch stats reset loop (every 30 minutes) ─────────────
+    asyncio.create_task(_stats_reset_loop())
+    print("Stats reset loop started.")
 
     # Keepalive
     while True:
