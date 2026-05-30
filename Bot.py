@@ -50,7 +50,7 @@ CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
-SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (haibadiliki)
+SUPPORT_BOT = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
 
 def support_url():
@@ -257,12 +257,12 @@ def get_best_pair(otc_only=False):
         logging.warning("get_best_pair failed: {}".format(e))
         return None
 
-def auto_manage_reverse_pairs():
+def auto_manage_reverse_pairs():  # disabled — no longer used
     """
-    Bot ijiangalie yenyewe:
-    - Pair yenye win rate chini ya 40% (minimum 5 signals) → iongeze kwenye reverse_pairs
-    - Pair yenye win rate juu ya 60% (minimum 5 signals) → iondoe kutoka reverse_pairs (hata kama ilikuwepo)
-    Called automatically ndani ya generate_signal flow.
+    Auto-manage reverse pairs based on win rate:
+    - Pair with win rate below 40% (min 5 signals) → add to reverse_pairs
+    - Pair with win rate above 60% (min 5 signals) → remove from reverse_pairs
+    No longer called automatically.
     """
     try:
         with get_conn() as conn:
@@ -1778,7 +1778,7 @@ def _check_pip_movement(pair):
     Returns (avg_movement_pct, category) where category is:
       'HIGH'   — pair inasogea sana (>0.12%) → 1m ya kutosha
       'MEDIUM' — (0.06-0.12%) → 2m bora
-      'LOW'    — (<0.06%) → 3m, movement ndogo
+      'LOW'    — (<0.06%) → 3m, small movement
     Prefers VTE data from DB, falls back to Yahoo Finance.
     """
     # Try DB first (VTE learned data)
@@ -1913,7 +1913,7 @@ async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe
 
 # ============================================================
 # FINNHUB + YFINANCE MTF SIGNAL ENGINE
-# Inaitwa na GET SIGNAL handler — haibadilishi generate_signal
+# Called by GET SIGNAL handler — does not modify generate_signal
 # ============================================================
 FINNHUB_FOREX_SYMBOLS = {
     "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
@@ -2390,7 +2390,7 @@ def _force_signal_from_micro(pair, signal_type):
         except Exception as e:
             logging.warning("_force_signal_from_micro yahoo: {}".format(e))
 
-    # Finnhub 5m ya mwisho kama bado hakuna data
+    # Last Finnhub 5m candle as fallback if no other data
     if bull == 0 and bear == 0 and fh_sym:
         try:
             df = _mtf_fh_candles(fh_sym, "5", 50)
@@ -3022,8 +3022,24 @@ def pair_to_idx(pair):
 # KEYBOARDS
 # ============================================================
 def is_weekend():
-    """Jumatatu=0 ... Ijumaa=4, Jumamosi=5, Jumapili=6 (UTC)"""
-    return datetime.utcnow().weekday() >= 5
+    """
+    Returns True if:
+    - Saturday or Sunday (UTC), OR
+    - Weekday but within market-closed hours: 23:45 - 03:15 UTC
+    During these times, non-OTC forex pairs are unavailable on Pocket Option.
+    """
+    now = datetime.utcnow()
+    wd  = now.weekday()  # 0=Mon, 6=Sun
+    if wd >= 5:
+        return True
+    # Night closure: 23:45 to 03:15 EAT (Tanzania UTC+3)
+    # Converted to UTC: 20:45 to 00:15 UTC
+    h, m = now.hour, now.minute
+    total_mins = h * 60 + m
+    # 20:45 UTC = 1245 mins, 00:15 UTC = 15 mins
+    if total_mins >= 1245 or total_mins < 15:
+        return True
+    return False
 
 def pairs_keyboard():
     """
@@ -3365,6 +3381,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/addlifetime 5` — Generate 5 lifetime codes\n"
             "`/listlicences` — View all codes (used/unused)\n"
             "`/revoke 123456` — Remove user licence\n"
+            "`/resultson` — Enable WIN/LOSS result messages\n"
+            "`/resultsoff` — Disable result messages\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "👥 *USER MANAGEMENT*\n"
             "`/listusers` — View all users & stats\n"
@@ -3582,6 +3600,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data=="choose_pair":
         # Delete previous menu/signal messages
         await delete_last_signal(context.bot, chat, user_id)
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
         try: await q.message.delete()
         except: pass
 
@@ -3637,17 +3657,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        weekend      = is_weekend()
-        otc_on       = is_otc_enabled()
-        force_non_otc = not otc_on
+        weekend = is_weekend()
 
-        # Top 5 — worst forex performers (contrarian targets)
-        top5 = get_worst5_pairs()
+        # Top 5 — best performing pairs by VTE win rate
+        # Weekend → OTC pairs only, Weekday → non-OTC (forex) only
+        top5 = get_top5_pairs(otc_only=weekend, non_otc_only=not weekend)
+
+        # Fallback if not enough VTE data yet
         if len(top5) < 5:
-            forex_pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
-            random.shuffle(forex_pool)
+            if weekend:
+                pool = [p for p in ALL_PAIRS if "OTC" in p]
+            else:
+                pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
+            random.shuffle(pool)
             existing = {r["pair"] for r in top5}
-            for p in forex_pool:
+            for p in pool:
                 if p not in existing and len(top5) < 5:
                     top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                     existing.add(p)
@@ -3970,8 +3994,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         direction = sig["direction"]
         timeframe = chosen_tf
-        if is_contrarian_pair(pair):
-            direction = "SELL" if direction == "BUY" else "BUY"
+
         save_user_signal_state(user_id, pair, direction, timeframe, 0)
         try: await cm.delete()
         except: pass
@@ -4234,23 +4257,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(0.3)
 
-        # ── MTF PRE-CHECK (non-OTC only) ─────────────────────
-        # OTC pairs NEVER go through MTF — wanaendelea generate_signal moja kwa moja
         _is_non_otc_pair = "OTC" not in pair and pair in YAHOO_SYMBOLS
         _mtf_result = None
         if _is_non_otc_pair:
             try:
                 _mtf_result = run_mtf_signal_engine_with_fallback(pair)
-                logging.info("MTF getmore {}: {}".format(pair, _mtf_result.get("message","") if _mtf_result else "None"))
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
-        # If MTF says no signal for non-OTC → let generate_signal decide (don't block)
-        if _is_non_otc_pair and _mtf_result and _mtf_result.get("signal_type") is None:
-            pass  # Fall through to generate_signal below
-        # ─────────────────────────────────────────────────────
-
-        sig       = generate_signal(pair)
+        try:
+            sig = generate_signal(pair)
+        except Exception as _sig_e:
+            logging.warning("generate_signal failed in getmore {}: {}".format(pair, _sig_e))
+            try: await cm.delete()
+            except: pass
+            _nsm = await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                ])
+            )
+            save_last_bot_msg(user_id, _nsm.message_id)
+            return
         direction = sig["direction"]
         strength  = sig["strength"]
 
@@ -4312,8 +4342,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
@@ -4326,8 +4355,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
@@ -4335,11 +4363,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         new_flip_count = 0  # Always fresh signal — reset flip count
 
-        # Contrarian flip: worst-3 VTE pairs get signal flipped
         gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-        if gm_is_non_otc and is_contrarian_pair(pair):
-            direction = "SELL" if direction == "BUY" else "BUY"
-            logging.info("CONTRARIAN FLIP getmore: {} → {}".format(pair, direction))
 
         save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
 
