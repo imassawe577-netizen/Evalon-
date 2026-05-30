@@ -3295,44 +3295,32 @@ def pairs_keyboard():
     otc_on  = is_otc_enabled()
 
     if weekend:
-        # Weekend — show OTC pairs only
-        for i, pair in enumerate(ALL_PAIRS):
-            if "OTC" not in pair:
+        # Weekend — OTC pairs only, max 90 pairs (Telegram limit is 100 buttons)
+        otc_pairs = [p for p in ALL_PAIRS if "OTC" in p][:90]
+        for pair in otc_pairs:
+            i = pair_to_idx(pair)
+            if i is None:
                 continue
             row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
             if len(row) == 3:
                 rows.append(row)
                 row = []
     else:
-        # Weekday — forex only, ranked by VTE (worst → best)
-        if not otc_on:
-            ranked = get_ranked_forex_pairs()
-            display_pairs = ranked["all"]
-            contrarian_set = set(ranked["contrarian"])
-        else:
-            # OTC enabled — show all pairs
-            display_pairs = [p for p in ALL_PAIRS if "OTC" not in p]
-            contrarian_set = set()
-
+        # Weekday — forex pairs only (no OTC, no crypto, no indices)
+        # Ranked by VTE win rate if data available
+        ranked = get_ranked_forex_pairs()
+        display_pairs = ranked["all"] if ranked and ranked.get("all") else [
+            p for p in ALL_PAIRS
+            if "OTC" not in p and "/" in p and "BTC" not in p
+        ]
         for pair in display_pairs:
             i = pair_to_idx(pair)
             if i is None:
                 continue
-            label = pair
-            row.append(InlineKeyboardButton(label, callback_data="sel_{}".format(i)))
+            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
             if len(row) == 3:
                 rows.append(row)
                 row = []
-
-        # Also show OTC pairs if enabled
-        if otc_on:
-            for i, pair in enumerate(ALL_PAIRS):
-                if "OTC" not in pair:
-                    continue
-                row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
 
     if row:
         rows.append(row)
