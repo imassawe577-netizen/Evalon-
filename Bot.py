@@ -2489,6 +2489,7 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
     return _force_signal_from_micro(pair, st)
 
 
+def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
     yahoo_available = True
@@ -2944,7 +2945,7 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
     record_signal(pair, direction)
     return {
         "direction": direction, "pair": pair, "timeframe": timeframe,
-        "strength": abs(b - s), "indicators_agree": indicators_agree,
+        "strength": strength, "indicators_agree": indicators_agree,
         "trend_1h": trend_1h, "vwap_data": vwap_data,
         "confluence": confluence, "mtf": mtf, "flat": (timeframe == 0),
         "patterns": detected_patterns,
@@ -3765,7 +3766,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         is_non_otc = False  # pair is OTC
         entry_price = None
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.3)
         trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
@@ -3783,7 +3784,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -3798,7 +3798,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -4008,7 +4007,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.3)
 
         sig       = generate_signal(pair)
         direction = sig["direction"]
@@ -4025,7 +4024,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             return
@@ -4163,7 +4162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.3)
 
         # ── MTF PRE-CHECK (non-OTC only) ─────────────────────
         # OTC pairs NEVER go through MTF — wanaendelea generate_signal moja kwa moja
@@ -4219,7 +4218,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=msg,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             return
@@ -4244,7 +4243,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             return
@@ -4257,7 +4256,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             return
@@ -4428,7 +4427,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entry_price = _fetch_current_price(pair)
         signal_capture_time = datetime.utcnow()
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
 
         # --- Trend validation ---
         trend = get_trend_direction(pair)
@@ -4447,7 +4446,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                     ])
                 )
                 return
@@ -4470,7 +4469,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                     ])
                 )
                 return
