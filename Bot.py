@@ -589,20 +589,25 @@ def inactivity_clear(user_id):
 def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
 
-# Track last signal message per user (for deletion on next signal)
+# Track last signal + last bot message per user (for deletion on next action)
 LAST_SIGNAL_MSG = {}  # {user_id: message_id}
+LAST_BOT_MSG    = {}  # {user_id: message_id} — menus, no-signal, etc.
 
 async def delete_last_signal(bot, chat_id, user_id):
-    """Delete previous signal message if exists."""
-    msg_id = LAST_SIGNAL_MSG.pop(user_id, None)
-    if msg_id:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass
+    """Delete previous signal AND last bot message if exists."""
+    for store in [LAST_SIGNAL_MSG, LAST_BOT_MSG]:
+        msg_id = store.pop(user_id, None)
+        if msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
 
 def save_last_signal_msg(user_id, msg_id):
     LAST_SIGNAL_MSG[user_id] = msg_id
+
+def save_last_bot_msg(user_id, msg_id):
+    LAST_BOT_MSG[user_id] = msg_id
 
 # ============================================================
 # ANTI-SPAM
@@ -3669,29 +3674,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             needed = 3 - refs
             ref_status = "⏳ Invite {} more to get bonus signals!".format(needed)
+        kb_licensed = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
+            [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+        ])
+        kb_free = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
+            [InlineKeyboardButton("💎 Upgrade", callback_data="pay_info")],
+            [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
+        ])
         await q.edit_message_text(
             "📊 *YOUR STATS*\n\n"
             "🔑 Status: {}\n"
             "⏳ Expiry: {}\n"
-            "🆓 Free signals: {}/{}\n"
+            "🆓 Free signals used: {}/{}\n"
             "👥 Referrals: {}\n"
             "🎁 Bonus signals: {}\n"
             "{}\n\n"
-            "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
                 lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
-                ref_status, ref_link,
-                "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
+                ref_status,
+                "_Thank you for being a subscriber!_" if licensed else "_Upgrade to get unlimited signals!_"
             ),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
-                [InlineKeyboardButton("💎 Upgrade", callback_data="pay_info")],
-                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
-            ]) if not licensed else InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
-                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
-            ])
+            reply_markup=kb_licensed if licensed else kb_free
         )
         return
 
@@ -3722,15 +3728,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "help_inline":
         await q.edit_message_text(
             "ℹ️ *EVALON MASTER PRO — Help*\n\n"
-            "⚡ *Get Signal* — Chagua pair na upate signal\n"
-            "🤖 *Bot Pick Pair* — Bot inakuchagulia pair bora\n"
-            "📊 *My Stats* — Angalia matokeo yako\n"
-            "💎 *Upgrade* — Nunua licence ya monthly au lifetime\n\n"
-            "📌 *Jinsi ya kutumia:*\n"
-            "1. Bonyeza EVALON MENU\n"
-            "2. Chagua Get Signal au Bot Pick Pair\n"
-            "3. Subiri signal — ingia trade wakati signal inaonekana\n\n"
-            "📞 Support: @{}".format(SUPPORT_BOT),
+            "⚡ *Get Signal* — Select a pair and get a BUY/SELL signal\n"
+            "🤖 *Bot Pick Pair* — Bot picks the best pair for you\n"
+            "📊 *My Stats* — View your account status\n"
+            "💎 *Upgrade* — Purchase a monthly or lifetime licence\n\n"
+            "📌 *How to use:*\n"
+            "1. Tap EVALON MENU\n"
+            "2. Select Get Signal or Bot Pick Pair\n"
+            "3. Wait for the signal — enter the trade when it appears",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚡ Get Signal", callback_data="choose_pair")],
@@ -3754,7 +3759,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚡ *{}*\n\n"
                 "Choose signal type:\n\n"
                 "⏱ *Seconds* — 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
-                "📊 *Normal* — minute-based signal (standard)"
+                "📊 *Normal* — minute-based signal"
             ).format(pair),
             parse_mode="Markdown",
             reply_markup=otc_mode_keyboard(pair)
@@ -3783,7 +3788,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not is_candle_safe_zone():
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -3793,7 +3798,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         is_non_otc = False  # pair is OTC
         entry_price = None
         await asyncio.sleep(0.3)
@@ -3808,7 +3813,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -3816,13 +3821,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
             if trend is not None:
                 direction = trend
             elif sig.get("indicators_agree", 7) < 4:
                 try: await cm.delete()
                 except: pass
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -3830,6 +3836,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
         elif check["action"] == "flip":
             direction  = check["direction"]
@@ -3925,7 +3932,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.warning("nonotctf signal failed {}: {}".format(pair, e))
             try: await cm.delete()
             except: pass
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="No clear signal available",
                 parse_mode="Markdown",
@@ -3933,6 +3940,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, chosen_tf))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
         direction = sig["direction"]
         timeframe = chosen_tf
@@ -4024,7 +4032,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         inactivity_reset(user_id, chat)
 
         if not is_candle_safe_zone():
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4033,12 +4041,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                           callback_data="otctf_{}_{}".format(idx_str, chosen_secs))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
         try: await q.message.delete()
         except: pass
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(0.3)
 
         sig       = generate_signal(pair)
@@ -4051,7 +4060,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif sig.get("indicators_agree", 7) < 4:
             try: await cm.delete()
             except: pass
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4059,6 +4068,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
         # timeframe in DB: chosen_secs (store as-is; signal_keyboard uses pair only)
@@ -4184,7 +4194,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_user_signal_state(user_id, pair)
 
         if not is_candle_safe_zone():
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4192,9 +4202,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(0.3)
 
         # ── MTF PRE-CHECK (non-OTC only) ─────────────────────
@@ -4270,7 +4281,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
             elif "flip" in reason:
                 extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4279,11 +4290,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
         elif sig.get("indicators_agree", 7) < 4:
             try: await cm.delete()
             except: pass
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4292,6 +4304,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
         new_flip_count = 0  # Always fresh signal — reset flip count
@@ -4399,26 +4412,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── OTC: Show mode selection (seconds OR normal minutes) ───
         if "OTC" in pair:
-            await context.bot.send_message(
+            _otcm = await context.bot.send_message(
                 chat_id=chat,
                 text=(
                     "⚡ *{}*\n\n"
                     "Choose signal type:\n\n"
                     "⏱ *Seconds* — 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
-                    "📊 *Normal* — minute-based signal (standard)"
+                    "📊 *Normal* — minute-based signal"
                 ).format(pair),
                 parse_mode="Markdown",
                 reply_markup=otc_mode_keyboard(pair)
             )
+            save_last_bot_msg(user_id, _otcm.message_id)
             return
 
         # ── Non-OTC: Show TF selection keyboard ────────────────
-        await context.bot.send_message(
+        _tfm = await context.bot.send_message(
             chat_id=chat,
-            text="⚡ *{}*\n\nChagua muda wa signal:".format(pair),
+            text="⚡ *{}*\n\nSelect signal duration:".format(pair),
             parse_mode="Markdown",
             reply_markup=nonotc_tf_keyboard(pair)
         )
+        save_last_bot_msg(user_id, _tfm.message_id)
         return
 
         # --- Check user signal state ---
@@ -4452,7 +4467,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- Candle safe zone check ---
         # Block if we are in the first 10 seconds (new candle) or last 10 seconds (candle closing)
         if not is_candle_safe_zone():
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
@@ -4460,9 +4475,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
+        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
 
         # --- Capture entry price IMMEDIATELY (before any processing delay) ---
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
@@ -4484,7 +4500,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.warning("generate_signal error {}: {}".format(pair, e))
                 try: await cm.delete()
                 except: pass
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -4493,6 +4509,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
@@ -4508,7 +4525,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
                 elif "flip" in reason:
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -4516,6 +4533,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
             # Override with dominant trend if available
             if trend is not None:
@@ -4530,7 +4548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
                 elif "flip" in reason:
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -4538,11 +4556,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
             elif not is_non_otc and sig.get("indicators_agree", 7) < 4:
                 try: await cm.delete()
                 except: pass
-                await context.bot.send_message(
+                _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
@@ -4550,6 +4569,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
                     ])
                 )
+                save_last_bot_msg(user_id, _nsm.message_id)
                 return
 
         elif check["action"] == "flip":
@@ -4649,7 +4669,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
             "1. Bonyeza EVALON MENU\n"
             "2. Chagua Get Signal au Bot Pick Pair\n"
             "3. Subiri signal — ingia trade wakati signal inaonekana\n\n"
-            "📞 Support: @{}".format(SUPPORT_BOT),
+            "",
             parse_mode="Markdown",
         )
         return
@@ -4689,6 +4709,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
                     [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
         weekend      = is_weekend()
@@ -4781,7 +4802,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
             "👥 Referrals: {}\n"
             "🎁 Bonus signals: {}\n"
             "{}\n\n"
-            "🔗 *Your Referral Link:*\n`{}`\n\n"
+            ""
             "{}".format(
                 lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
@@ -5140,7 +5161,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⚡ Get Signal",        callback_data="choose_pair")],
                 [InlineKeyboardButton("🤖 Bot Pick Pair",     callback_data="bot_pick_pair")],
                 [InlineKeyboardButton("📊 My Stats",          callback_data="my_stats")],
-                [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
+            ] + ([] if lic else [[InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")]]) + [
                 [InlineKeyboardButton("ℹ️ Help",              callback_data="help_inline")],
             ])
         )
