@@ -589,6 +589,21 @@ def inactivity_clear(user_id):
 def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
 
+# Track last signal message per user (for deletion on next signal)
+LAST_SIGNAL_MSG = {}  # {user_id: message_id}
+
+async def delete_last_signal(bot, chat_id, user_id):
+    """Delete previous signal message if exists."""
+    msg_id = LAST_SIGNAL_MSG.pop(user_id, None)
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+
+def save_last_signal_msg(user_id, msg_id):
+    LAST_SIGNAL_MSG[user_id] = msg_id
+
 # ============================================================
 # ANTI-SPAM
 # ============================================================
@@ -1868,29 +1883,18 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 _otc_flip_cache: dict = {}
 
 async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
-    """Send a non-OTC signal with user-chosen or bot-chosen timeframe."""
-    arrow   = "📈" if direction == "BUY" else "📉"
-    color   = "🟢" if direction == "BUY" else "🔴"
-    conf    = sig.get("confluence", {})
-    badge   = conf.get("badge", "")
-    agree   = sig.get("indicators_agree", 0)
-    trend   = sig.get("trend_1h")
-    trend_t = "📈 {}".format(trend) if trend else "—"
-    caption = "{} *{}* {} *{}*\n⏱ *{}m*\n📊 Signal strength: {}\n1H Trend: {}\n{}".format(
-        color, pair, arrow, direction, timeframe, agree, trend_t, badge)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, timeframe))]
-    ])
-    buy_img  = context.bot_data.get("buy_image")
-    sell_img = context.bot_data.get("sell_image")
-    img = buy_img if direction == "BUY" else sell_img
+    """Send a non-OTC signal with user-chosen timeframe."""
+    ib     = direction == "BUY"
+    arrow  = "Up 🟢" if ib else "Down 🔴"
+    strength = sig.get("strength", 400)
+    caption = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+    kb = nonotc_signal_keyboard(pair, timeframe)
+    img = get_buy_image() if ib else get_sell_image()
     try:
-        if img:
-            await context.bot.send_photo(chat_id=chat, photo=img, caption=caption,
-                                         parse_mode="Markdown", reply_markup=kb)
-        else:
-            await context.bot.send_message(chat_id=chat, text=caption,
-                                           parse_mode="Markdown", reply_markup=kb)
+        await delete_last_signal(context.bot, chat, user_id)
+        sent = await context.bot.send_photo(chat_id=chat, photo=img, caption=caption,
+                                            parse_mode="Markdown", reply_markup=kb)
+        save_last_signal_msg(user_id, sent.message_id)
     except Exception as e:
         logging.warning("_send_nonotc_signal failed: {}".format(e))
 
@@ -2814,7 +2818,7 @@ def generate_signal(pair):
         # OTC: always pick a random timeframe (1m-5m).
         # Each call picks independently — no fixed pattern.
         # This mimics human decision-making and keeps broker off-guard.
-        timeframe = random.choice([1, 1, 2, 2, 3, 3, 4, 5])
+        timeframe = random.choice([1, 1, 2, 2, 3, 3])
     elif vte_tf is not None:
         timeframe = vte_tf
     else:
@@ -2823,15 +2827,15 @@ def generate_signal(pair):
             if indicators_agree >= 10:   timeframe = 1
             elif indicators_agree >= 7:  timeframe = 2
             elif indicators_agree >= 5:  timeframe = 3
-            else:                        timeframe = 5
+            else:                        timeframe = 3
         elif movement_cat == "MEDIUM":
             if indicators_agree >= 12:   timeframe = 1
             elif indicators_agree >= 9:  timeframe = 2
             elif indicators_agree >= 6:  timeframe = 3
-            else:                        timeframe = 5
+            else:                        timeframe = 3
         else:   # LOW movement
             if indicators_agree >= 11:   timeframe = 3
-            else:                        timeframe = 5
+            else:                        timeframe = 3
 
     # ── NON-OTC: Weak confluence → flip direction opposite to 1H ──
     if not is_otc and indicators_agree < 6 and vte_tf is None:
@@ -3057,6 +3061,12 @@ def signal_keyboard(pair):
         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
     ])
 
+def nonotc_signal_keyboard(pair, chosen_tf):
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Get More ({}m)".format(chosen_tf), callback_data="nonotctf_{}_{}".format(idx, chosen_tf))],
+    ])
+
 def otc_mode_keyboard(pair):
     """Mode selection for OTC pair: Seconds or Normal (minutes)."""
     idx = pair_to_idx(pair)
@@ -3092,7 +3102,7 @@ def nonotc_mode_keyboard(pair):
     ])
 
 def nonotc_tf_keyboard(pair):
-    """Manual TF selection for non-OTC pairs."""
+    """Manual TF selection for non-OTC pairs: 1m 2m 3m 4m 5m 10m 15m 30m."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
         [
@@ -3103,13 +3113,13 @@ def nonotc_tf_keyboard(pair):
         [
             InlineKeyboardButton("4m",  callback_data="nonotctf_{}_4" .format(idx)),
             InlineKeyboardButton("5m",  callback_data="nonotctf_{}_5" .format(idx)),
-            InlineKeyboardButton("7m",  callback_data="nonotctf_{}_7" .format(idx)),
+            InlineKeyboardButton("10m", callback_data="nonotctf_{}_10".format(idx)),
         ],
         [
-            InlineKeyboardButton("10m", callback_data="nonotctf_{}_10".format(idx)),
             InlineKeyboardButton("15m", callback_data="nonotctf_{}_15".format(idx)),
+            InlineKeyboardButton("30m", callback_data="nonotctf_{}_30".format(idx)),
         ],
-        [InlineKeyboardButton("Back", callback_data="nonotc_back_{}".format(idx))],
+        [InlineKeyboardButton("🔙 Back", callback_data="nonotc_back_{}".format(idx))],
     ])
 
 def expired_signal_keyboard():
@@ -3669,7 +3679,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
@@ -3706,6 +3716,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "🔑 *Enter your licence code:*\n\nMonthly format: `EVAL-M-XXXX-XXXX-XXXX`\nLifetime format: `EVAL-L-XXXX-XXXX-XXXX`\n\nType your code and send it:",
             parse_mode="Markdown"
+        )
+        return
+
+    if data == "help_inline":
+        await q.edit_message_text(
+            "ℹ️ *EVALON MASTER PRO — Help*\n\n"
+            "⚡ *Get Signal* — Chagua pair na upate signal\n"
+            "🤖 *Bot Pick Pair* — Bot inakuchagulia pair bora\n"
+            "📊 *My Stats* — Angalia matokeo yako\n"
+            "💎 *Upgrade* — Nunua licence ya monthly au lifetime\n\n"
+            "📌 *Jinsi ya kutumia:*\n"
+            "1. Bonyeza EVALON MENU\n"
+            "2. Chagua Get Signal au Bot Pick Pair\n"
+            "3. Subiri signal — ingia trade wakati signal inaonekana\n\n"
+            "📞 Support: @{}".format(SUPPORT_BOT),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Get Signal", callback_data="choose_pair")],
+                [InlineKeyboardButton("💬 Contact Support", url=support_url())],
+            ])
         )
         return
 
@@ -3823,8 +3853,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
+        await delete_last_signal(context.bot, chat, user_id)
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+        save_last_signal_msg(user_id, sent_msg.message_id)
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
 
         async def _inact_otcn(uid, cid):
@@ -4038,6 +4070,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arrow = "Up 🟢" if ib else "Down 🔴"
         try: await cm.delete()
         except: pass
+        await delete_last_signal(context.bot, chat, user_id)
 
         cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}".format(pair, arrow, chosen_secs, strength)
         sent_msg = await context.bot.send_photo(
@@ -4048,9 +4081,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
                                       callback_data="otctf_{}_{}".format(idx_str, chosen_secs))],
-                [InlineKeyboardButton("📊 Change Pair", callback_data="choose_pair")],
             ])
         )
+        save_last_signal_msg(user_id, sent_msg.message_id)
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
 
         async def _inact_otcs(uid, cid):
@@ -4283,8 +4316,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
+        await delete_last_signal(context.bot, chat, user_id)
         cap = _mtf_cap if _mtf_cap else "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+        save_last_signal_msg(user_id, sent_msg.message_id)
 
         if gm_is_non_otc and gm_entry_price is not None:
             asyncio.create_task(
@@ -4376,6 +4411,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=otc_mode_keyboard(pair)
             )
             return
+
+        # ── Non-OTC: Show TF selection keyboard ────────────────
+        await context.bot.send_message(
+            chat_id=chat,
+            text="⚡ *{}*\n\nChagua muda wa signal:".format(pair),
+            parse_mode="Markdown",
+            reply_markup=nonotc_tf_keyboard(pair)
+        )
+        return
 
         # --- Check user signal state ---
         check = check_signal_request(user_id, pair)
@@ -4543,8 +4587,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
+        await delete_last_signal(context.bot, chat, user_id)
         cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+        save_last_signal_msg(user_id, sent_msg.message_id)
 
         # --- Result tracker: non-OTC only (have real price data) ---
         if is_non_otc and entry_price is not None:
@@ -4737,7 +4783,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
             "{}\n\n"
             "🔗 *Your Referral Link:*\n`{}`\n\n"
             "{}".format(
-                status, expiry_txt, free_used, free_allowed, refs, bonus,
+                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
                 ref_status, ref_link,
                 "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
             ),
