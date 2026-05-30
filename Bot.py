@@ -1895,9 +1895,9 @@ async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe
         logging.warning("_send_nonotc_signal failed: {}".format(e))
 
 # ============================================================
-# FINNHUB + YFINANCE MTF SIGNAL ENGINE v3
+# FINNHUB + YFINANCE MTF SIGNAL ENGINE
+# Inaitwa na GET SIGNAL handler — haibadilishi generate_signal
 # ============================================================
-# Finnhub symbols map (forex only — REST candles endpoint)
 FINNHUB_FOREX_SYMBOLS = {
     "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
     "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
@@ -1913,69 +1913,44 @@ FINNHUB_FOREX_SYMBOLS = {
     "GBP/CHF": "OANDA:GBP_CHF",
 }
 
-# OTC uses mapped real pair for Finnhub too
-def _get_finnhub_symbol(pair):
-    real = OTC_TO_REAL.get(pair, pair)
-    return FINNHUB_FOREX_SYMBOLS.get(real)
-
-def _finnhub_candles(symbol, resolution, count=120):
-    """
-    Fetch candles from Finnhub REST API.
-    resolution: '1','5','15','30','60','240','D'
-    Returns DataFrame with Open/High/Low/Close/Volume or None.
-    """
+def _mtf_fh_candles(symbol, resolution, count=120):
+    """Fetch candles from Finnhub. Returns DataFrame or None."""
     try:
-        now  = int(time.time())
-        # Calculate 'from' based on resolution and count needed
-        res_secs = {
-            "1": 60, "5": 300, "15": 900, "30": 1800,
-            "60": 3600, "240": 14400, "D": 86400
-        }.get(str(resolution), 60)
-        from_ts = now - res_secs * (count + 50)  # Extra buffer
-        url = (
-            "https://finnhub.io/api/v1/forex/candle"
-            "?symbol={}&resolution={}&from={}&to={}&token={}".format(
-                symbol, resolution, from_ts, now, FINNHUB_KEY
-            )
-        )
-        resp = requests.get(url, timeout=8)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if data.get("s") != "ok" or not data.get("c"):
-            return None
+        now     = int(time.time())
+        res_sec = {"1":60,"5":300,"15":900,"30":1800,"60":3600,"240":14400,"D":86400}.get(str(resolution),60)
+        from_ts = now - res_sec * (count + 60)
+        url = ("https://finnhub.io/api/v1/forex/candle"
+               "?symbol={}&resolution={}&from={}&to={}&token={}".format(
+                   symbol, resolution, from_ts, now, FINNHUB_KEY))
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200: return None
+        d = r.json()
+        if d.get("s") != "ok" or not d.get("c"): return None
         df = pd.DataFrame({
-            "Open":   data["o"],
-            "High":   data["h"],
-            "Low":    data["l"],
-            "Close":  data["c"],
-            "Volume": data.get("v", [0]*len(data["c"])),
-        }, index=pd.to_datetime(data["t"], unit="s"))
-        df = df.iloc[-count:]
-        return df
+            "Open": d["o"], "High": d["h"], "Low": d["l"],
+            "Close": d["c"], "Volume": d.get("v", [0]*len(d["c"])),
+        }, index=pd.to_datetime(d["t"], unit="s"))
+        return df.iloc[-count:]
     except Exception as e:
-        logging.warning("_finnhub_candles {} {} failed: {}".format(symbol, resolution, e))
+        logging.warning("_mtf_fh_candles {} {} failed: {}".format(symbol, resolution, e))
         return None
 
-def _yf_candles(symbol, interval, period):
+def _mtf_yf_candles(symbol, interval, period):
     """Fetch candles from Yahoo Finance. Returns DataFrame or None."""
     try:
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df is None or len(df) < 20:
-            return None
-        return df
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+        return df if df is not None and len(df) >= 20 else None
     except Exception as e:
-        logging.warning("_yf_candles {} {} failed: {}".format(symbol, interval, e))
+        logging.warning("_mtf_yf_candles {} {} failed: {}".format(symbol, interval, e))
         return None
 
-def _calc_tf_direction(df, label=""):
+def _mtf_calc_direction(df):
     """
-    Full advanced indicator suite on a DataFrame.
-    Returns dict with direction, score, and individual signals.
-    Uses: EMA9/21/50, MACD, RSI, Stoch, BB, Momentum, ADX, ATR,
-          CCI, Williams %R, VWAP, OBV, Ichimoku (tenkan/kijun),
-          Heikin-Ashi, Supertrend, Divergence, Fractal.
+    Calculate trend direction from OHLCV DataFrame using full indicator suite.
+    Indicators: EMA9/21/50, MACD, RSI, Stochastic, BB, Momentum, ADX,
+                CCI, Williams %R, VWAP, OBV, Ichimoku, Heikin-Ashi,
+                Supertrend, RSI Divergence, Williams Fractal.
+    Returns: 'BUY', 'SELL', or None.
     """
     if df is None or len(df) < 35:
         return None
@@ -1985,636 +1960,367 @@ def _calc_tf_direction(df, label=""):
         low    = df["Low"].squeeze().astype(float)
         volume = df["Volume"].squeeze().astype(float)
         n = len(close)
-        c  = float(close.iloc[-1])
-        c1 = float(close.iloc[-2])
-        c2 = float(close.iloc[-3])
-        o  = float(df["Open"].squeeze().astype(float).iloc[-1])
-        h  = float(high.iloc[-1])
-        l  = float(low.iloc[-1])
+        c = float(close.iloc[-1])
+        buy = sell = 0
 
-        buy = sell = 0   # Score accumulators
-
-        # ── 1. EMA Cross (9/21/50) ───────────────────────────
+        # EMA 9/21/50
         ema9  = float(close.ewm(span=9,  adjust=False).mean().iloc[-1])
         ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
         ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1]) if n >= 50 else ema21
-        ema_gap = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
-        if ema_gap < 0.003:  # Flat — no signal from EMA
-            pass
-        elif ema9 > ema21:
-            buy  += 3
-            if c > ema21: buy += 1    # Price above EMA21
-            if ema21 > ema50: buy += 1  # EMA stack bullish
-        else:
-            sell += 3
-            if c < ema21: sell += 1
-            if ema21 < ema50: sell += 1
+        gap   = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
+        if gap >= 0.003:
+            if ema9 > ema21: buy  += 3 + (1 if c > ema21 else 0) + (1 if ema21 > ema50 else 0)
+            else:            sell += 3 + (1 if c < ema21 else 0) + (1 if ema21 < ema50 else 0)
 
-        # ── 2. MACD ───────────────────────────────────────────
+        # MACD
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
-        macd_line = ema12 - ema26
-        macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
-        hist      = macd_line - macd_sig
-        macd_h    = float(hist.iloc[-1])
-        macd_h1   = float(hist.iloc[-2])
-        if macd_h > 0 and macd_h > macd_h1:  buy  += 3  # Rising bullish
-        elif macd_h > 0:                       buy  += 1
-        elif macd_h < 0 and macd_h < macd_h1: sell += 3  # Falling bearish
-        elif macd_h < 0:                       sell += 1
+        hist  = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
+        h_now = float(hist.iloc[-1]); h_prv = float(hist.iloc[-2])
+        if h_now > 0:   buy  += 3 if h_now > h_prv else 1
+        elif h_now < 0: sell += 3 if h_now < h_prv else 1
 
-        # ── 3. RSI ────────────────────────────────────────────
+        # RSI
         delta = close.diff()
         gain  = delta.clip(lower=0).rolling(14).mean()
         loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi   = float((100 - 100 / (1 + gain / loss.replace(0, 1e-9))).iloc[-1])
-        if rsi < 30:    buy  += 4  # Oversold
-        elif rsi < 45:  buy  += 2
-        elif rsi < 50:  buy  += 1
-        elif rsi > 70:  sell += 4  # Overbought
-        elif rsi > 55:  sell += 2
-        elif rsi > 50:  sell += 1
+        rsi   = float((100 - 100/(1 + gain/loss.replace(0,1e-9))).iloc[-1])
+        if   rsi < 30: buy  += 4
+        elif rsi < 45: buy  += 2
+        elif rsi < 50: buy  += 1
+        elif rsi > 70: sell += 4
+        elif rsi > 55: sell += 2
+        elif rsi > 50: sell += 1
 
-        # ── 4. Stochastic ─────────────────────────────────────
-        low14  = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        sto_k  = float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])
-        sto_k1 = float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-2])
-        if sto_k < 20 and sto_k > sto_k1:  buy  += 3
-        elif sto_k < 20:                     buy  += 1
-        elif sto_k > 80 and sto_k < sto_k1: sell += 3
-        elif sto_k > 80:                     sell += 1
+        # Stochastic
+        l14 = low.rolling(14).min(); h14 = high.rolling(14).max()
+        sto = float(((close-l14)/(h14-l14+1e-9)*100).iloc[-1])
+        sp  = float(((close-l14)/(h14-l14+1e-9)*100).iloc[-2])
+        if sto < 20: buy  += 3 if sto > sp else 1
+        elif sto > 80: sell += 3 if sto < sp else 1
 
-        # ── 5. Bollinger Bands ───────────────────────────────
-        sma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        bb_u  = float((sma20 + 2*std20).iloc[-1])
-        bb_l  = float((sma20 - 2*std20).iloc[-1])
+        # Bollinger Bands
+        sma20 = close.rolling(20).mean(); std20 = close.rolling(20).std()
+        bb_u  = float((sma20+2*std20).iloc[-1]); bb_l = float((sma20-2*std20).iloc[-1])
         bb_m  = float(sma20.iloc[-1])
-        if c < bb_l:   buy  += 3
+        if c < bb_l: buy  += 3
         elif c < bb_m: buy  += 1
         elif c > bb_u: sell += 3
         elif c > bb_m: sell += 1
-        # BB squeeze = no signal (low volatility)
-        bb_width = (bb_u - bb_l) / (bb_m + 1e-9)
-        if bb_width < 0.005:
-            buy -= 1; sell -= 1  # Penalise flat BB
+        if (bb_u-bb_l)/(bb_m+1e-9) < 0.005: buy -= 1; sell -= 1  # Squeeze penalty
 
-        # ── 6. Momentum (10-period ROC) ───────────────────────
+        # Momentum ROC
         if n >= 11:
-            roc = (c - float(close.iloc[-11])) / (float(close.iloc[-11]) + 1e-9) * 100
-            if roc > 0.3:   buy  += 2
-            elif roc > 0.1: buy  += 1
+            roc = (c - float(close.iloc[-11])) / (float(close.iloc[-11])+1e-9) * 100
+            if roc > 0.3: buy += 2
+            elif roc > 0.1: buy += 1
             elif roc < -0.3: sell += 2
             elif roc < -0.1: sell += 1
 
-        # ── 7. ADX (trend strength — 14 period) ───────────────
-        adx_val = None
+        # ADX
         if n >= 28:
             try:
-                tr = pd.Series([max(float(high.iloc[i])-float(low.iloc[i]),
-                                    abs(float(high.iloc[i])-float(close.iloc[i-1])),
-                                    abs(float(low.iloc[i])-float(close.iloc[i-1])))
-                                for i in range(1, n)], index=close.index[1:])
-                dm_plus  = pd.Series([max(float(high.iloc[i])-float(high.iloc[i-1]),0)
-                                      if float(high.iloc[i])-float(high.iloc[i-1]) >
-                                         float(low.iloc[i-1])-float(low.iloc[i]) else 0
-                                      for i in range(1, n)], index=close.index[1:])
-                dm_minus = pd.Series([max(float(low.iloc[i-1])-float(low.iloc[i]),0)
-                                      if float(low.iloc[i-1])-float(low.iloc[i]) >
-                                         float(high.iloc[i])-float(high.iloc[i-1]) else 0
-                                      for i in range(1, n)], index=close.index[1:])
-                atr14    = tr.rolling(14).mean()
-                di_plus  = 100 * (dm_plus.rolling(14).mean()  / (atr14 + 1e-9))
-                di_minus = 100 * (dm_minus.rolling(14).mean() / (atr14 + 1e-9))
-                dx       = 100 * abs(di_plus - di_minus) / (di_plus + di_minus + 1e-9)
-                adx_val  = float(dx.rolling(14).mean().iloc[-1])
-                # ADX ≥ 25 = trending; apply directional weight
-                if adx_val >= 25:
-                    dip = float(di_plus.iloc[-1]); dim = float(di_minus.iloc[-1])
-                    if dip > dim: buy  += 2
-                    else:         sell += 2
+                tr   = pd.Series([max(float(high.iloc[i])-float(low.iloc[i]),
+                                      abs(float(high.iloc[i])-float(close.iloc[i-1])),
+                                      abs(float(low.iloc[i])-float(close.iloc[i-1])))
+                                  for i in range(1,n)], index=close.index[1:])
+                dmp  = pd.Series([max(float(high.iloc[i])-float(high.iloc[i-1]),0)
+                                  if float(high.iloc[i])-float(high.iloc[i-1]) >
+                                     float(low.iloc[i-1])-float(low.iloc[i]) else 0
+                                  for i in range(1,n)], index=close.index[1:])
+                dmm  = pd.Series([max(float(low.iloc[i-1])-float(low.iloc[i]),0)
+                                  if float(low.iloc[i-1])-float(low.iloc[i]) >
+                                     float(high.iloc[i])-float(high.iloc[i-1]) else 0
+                                  for i in range(1,n)], index=close.index[1:])
+                atr14= tr.rolling(14).mean()
+                dip  = 100*(dmp.rolling(14).mean()/(atr14+1e-9))
+                dim  = 100*(dmm.rolling(14).mean()/(atr14+1e-9))
+                adx  = float((100*abs(dip-dim)/(dip+dim+1e-9)).rolling(14).mean().iloc[-1])
+                if adx >= 25:
+                    if float(dip.iloc[-1]) > float(dim.iloc[-1]): buy  += 2
+                    else:                                           sell += 2
                 else:
-                    # ADX < 20 = ranging — reduce scores slightly
                     buy -= 1; sell -= 1
-            except Exception:
-                pass
+            except Exception: pass
 
-        # ── 8. CCI (20-period) ────────────────────────────────
+        # CCI
         if n >= 20:
-            tp   = (high + low + close) / 3
-            sma_tp = tp.rolling(20).mean()
-            mad    = tp.rolling(20).apply(lambda x: abs(x - x.mean()).mean(), raw=True)
-            cci    = float(((tp - sma_tp) / (0.015 * mad + 1e-9)).iloc[-1])
-            if cci < -100:  buy  += 3
+            tp  = (high+low+close)/3
+            mad = tp.rolling(20).apply(lambda x: abs(x-x.mean()).mean(), raw=True)
+            cci = float(((tp-tp.rolling(20).mean())/(0.015*mad+1e-9)).iloc[-1])
+            if cci < -100: buy  += 3
             elif cci < -50: buy  += 1
             elif cci > 100: sell += 3
             elif cci > 50:  sell += 1
 
-        # ── 9. Williams %R ────────────────────────────────────
+        # Williams %R
         if n >= 14:
-            wh14 = high.rolling(14).max()
-            wl14 = low.rolling(14).min()
-            wpr  = float(((wh14 - close) / (wh14 - wl14 + 1e-9) * -100).iloc[-1])
-            if wpr < -80:   buy  += 3
-            elif wpr < -50: buy  += 1
+            wpr = float(((high.rolling(14).max()-close)/(high.rolling(14).max()-low.rolling(14).min()+1e-9)*-100).iloc[-1])
+            if wpr < -80: buy  += 3
+            elif wpr < -50: buy += 1
             elif wpr > -20: sell += 3
             elif wpr > -50: sell += 1
 
-        # ── 10. VWAP ─────────────────────────────────────────
+        # VWAP
         if volume.sum() > 0 and n >= 20:
-            tp_v   = (high + low + close) / 3
-            vwap   = (tp_v * volume).rolling(20).sum() / (volume.rolling(20).sum() + 1e-9)
-            vwap_v = float(vwap.iloc[-1])
-            if c > vwap_v:   buy  += 2
-            elif c < vwap_v: sell += 2
+            tp_v  = (high+low+close)/3
+            vwap  = (tp_v*volume).rolling(20).sum()/(volume.rolling(20).sum()+1e-9)
+            if c > float(vwap.iloc[-1]): buy  += 2
+            else:                         sell += 2
 
-        # ── 11. OBV Trend ─────────────────────────────────────
+        # OBV
         if n >= 10:
-            obv = (volume * ((close - close.shift(1)).apply(
-                lambda x: 1 if x > 0 else (-1 if x < 0 else 0)))).cumsum()
-            obv_ma = obv.rolling(10).mean()
-            if float(obv.iloc[-1]) > float(obv_ma.iloc[-1]):  buy  += 1
-            else:                                               sell += 1
+            obv = (volume*((close-close.shift(1)).apply(lambda x: 1 if x>0 else(-1 if x<0 else 0)))).cumsum()
+            if float(obv.iloc[-1]) > float(obv.rolling(10).mean().iloc[-1]): buy  += 1
+            else:                                                               sell += 1
 
-        # ── 12. Ichimoku Tenkan/Kijun ─────────────────────────
+        # Ichimoku Tenkan/Kijun
         if n >= 26:
-            tenkan = (high.rolling(9).max()  + low.rolling(9).min())  / 2
-            kijun  = (high.rolling(26).max() + low.rolling(26).min()) / 2
-            tk     = float(tenkan.iloc[-1])
-            kj     = float(kijun.iloc[-1])
-            if c > tk and c > kj and tk > kj:  buy  += 3
+            tk = float(((high.rolling(9).max()+low.rolling(9).min())/2).iloc[-1])
+            kj = float(((high.rolling(26).max()+low.rolling(26).min())/2).iloc[-1])
+            if c > tk and c > kj and tk > kj:   buy  += 3
             elif c < tk and c < kj and tk < kj: sell += 3
             elif tk > kj: buy  += 1
             elif tk < kj: sell += 1
 
-        # ── 13. Heikin-Ashi direction ─────────────────────────
+        # Heikin-Ashi
         if n >= 5:
-            ha_c = (df["Open"].squeeze().astype(float) + high + low + close) / 4
-            ha_o = df["Open"].squeeze().astype(float).ewm(span=2, adjust=False).mean()
-            ha_now_bull = float(ha_c.iloc[-1]) > float(ha_o.iloc[-1])
-            ha_prev_bull= float(ha_c.iloc[-2]) > float(ha_o.iloc[-2])
-            if ha_now_bull and ha_prev_bull:   buy  += 2
-            elif not ha_now_bull and not ha_prev_bull: sell += 2
+            ha_c = (df["Open"].squeeze().astype(float)+high+low+close)/4
+            ha_o = df["Open"].squeeze().astype(float).ewm(span=2,adjust=False).mean()
+            if float(ha_c.iloc[-1])>float(ha_o.iloc[-1]) and float(ha_c.iloc[-2])>float(ha_o.iloc[-2]):
+                buy  += 2
+            elif float(ha_c.iloc[-1])<float(ha_o.iloc[-1]) and float(ha_c.iloc[-2])<float(ha_o.iloc[-2]):
+                sell += 2
 
-        # ── 14. Supertrend (10/3 ATR) ─────────────────────────
+        # Supertrend (10/3 ATR)
         if n >= 15:
             try:
                 atr10 = pd.Series([max(float(high.iloc[i])-float(low.iloc[i]),
                                        abs(float(high.iloc[i])-float(close.iloc[i-1])),
                                        abs(float(low.iloc[i])-float(close.iloc[i-1])))
-                                   for i in range(1, n)], index=close.index[1:]).rolling(10).mean()
-                midline  = (high.iloc[1:] + low.iloc[1:]) / 2
-                upper_st = midline + 3 * atr10
-                lower_st = midline - 3 * atr10
-                # Supertrend signal: price vs last computed upper/lower
+                                   for i in range(1,n)], index=close.index[1:]).rolling(10).mean()
+                mid   = (high.iloc[1:]+low.iloc[1:])/2
+                lower_st = mid - 3*atr10
                 if c > float(lower_st.iloc[-1]): buy  += 2
                 else:                             sell += 2
-            except Exception:
-                pass
+            except Exception: pass
 
-        # ── 15. RSI Divergence ────────────────────────────────
+        # RSI Divergence
         if n >= 10:
-            rsi_s = (100 - 100 / (1 + gain / loss.replace(0, 1e-9)))
-            price_ch = float(close.iloc[-1]) - float(close.iloc[-6])
-            rsi_ch   = float(rsi_s.iloc[-1]) - float(rsi_s.iloc[-6])
-            if price_ch > 0 and rsi_ch < -3:   sell += 3  # Bearish divergence
-            elif price_ch < 0 and rsi_ch > 3:  buy  += 3  # Bullish divergence
+            rsi_s    = 100-100/(1+gain/loss.replace(0,1e-9))
+            price_ch = float(close.iloc[-1])-float(close.iloc[-6])
+            rsi_ch   = float(rsi_s.iloc[-1])-float(rsi_s.iloc[-6])
+            if price_ch > 0 and rsi_ch < -3:  sell += 3
+            elif price_ch < 0 and rsi_ch > 3: buy  += 3
 
-        # ── 16. Williams Fractal ──────────────────────────────
-        h_vals = high.values; l_vals = low.values
-        for i in range(n-4, max(n-12, 4), -1):
-            if (h_vals[i] > h_vals[i-2] and h_vals[i] > h_vals[i-1] and
-                    h_vals[i] > h_vals[i+1] and h_vals[i] > h_vals[i+2]):
-                if c < h_vals[i]: sell += 2
+        # Williams Fractal
+        hv = high.values; lv = low.values
+        for i in range(n-4, max(n-12,4), -1):
+            if hv[i]>hv[i-2] and hv[i]>hv[i-1] and hv[i]>hv[i+1] and hv[i]>hv[i+2]:
+                if c < hv[i]: sell += 2
                 break
-        for i in range(n-4, max(n-12, 4), -1):
-            if (l_vals[i] < l_vals[i-2] and l_vals[i] < l_vals[i-1] and
-                    l_vals[i] < l_vals[i+1] and l_vals[i] < l_vals[i+2]):
-                if c > l_vals[i]: buy  += 2
+        for i in range(n-4, max(n-12,4), -1):
+            if lv[i]<lv[i-2] and lv[i]<lv[i-1] and lv[i]<lv[i+1] and lv[i]<lv[i+2]:
+                if c > lv[i]: buy  += 2
                 break
 
         total = buy + sell
-        if total < 1:
-            return None
-        score    = (buy - sell) / (total + 1e-9)   # -1.0 to +1.0
-        strength = (max(buy, sell) / total) * 100   # 50–100%
-        direction = "BUY" if buy > sell else "SELL"
-        adx_ok = (adx_val is not None and adx_val >= 20)
-        return {
-            "direction": direction, "score": score, "strength": strength,
-            "buy": buy, "sell": sell, "rsi": rsi, "adx": adx_val,
-            "adx_ok": adx_ok, "label": label,
-        }
+        if total < 1: return None
+        return "BUY" if buy > sell else "SELL"
     except Exception as e:
-        logging.warning("_calc_tf_direction {} failed: {}".format(label, e))
+        logging.warning("_mtf_calc_direction failed: {}".format(e))
         return None
 
 
-# ── TIMEFRAME CONFIGS FOR EACH SIGNAL TYPE ───────────────────
-# For 1-min signal: confirm 5s(micro), 1m, 15m, 4h
-# For 2-min signal: confirm 10s(micro), 2m, 30m, 4h
-# For 3-min signal: confirm 15s(micro), 3m, 1h, 4h
-#
-# Yahoo Finance limitations: minimum interval is 1m
-# Finnhub minimum interval is 1m
-# For micro (5s/10s/15s) we use 1m data (last candle body direction)
-# as a proxy for very short-term momentum.
-
-def _fetch_tf_data_yf(yf_symbol, interval, period):
-    """Fetch from Yahoo Finance, return df or None."""
-    return _yf_candles(yf_symbol, interval, period)
-
-def _fetch_tf_data_fh(fh_symbol, resolution, count=100):
-    """Fetch from Finnhub, return df or None."""
-    if not fh_symbol:
-        return None
-    return _finnhub_candles(fh_symbol, resolution, count)
-
-def _get_micro_direction(yf_symbol, fh_symbol):
+def _mtf_get_micro_dir(yf_sym, fh_sym):
     """
-    Micro (5–15s) direction proxy:
-    Use last 1m candle body direction confirmed by Finnhub 1m.
+    Micro-direction (5s/10s/15s proxy): last 2 consecutive 1m candle bodies
+    must agree (both YF and Finnhub if available).
     Returns 'BUY', 'SELL', or None.
     """
-    results = []
-    # Yahoo 1m last candle
-    df_yf = _yf_candles(yf_symbol, "1m", "1d")
-    if df_yf is not None and len(df_yf) >= 3:
-        opens  = df_yf["Open"].squeeze().astype(float)
-        closes = df_yf["Close"].squeeze().astype(float)
-        # Last 2 candles must agree for micro confirmation
-        c1_bull = float(closes.iloc[-1]) > float(opens.iloc[-1])
-        c2_bull = float(closes.iloc[-2]) > float(opens.iloc[-2])
-        if c1_bull and c2_bull:     results.append("BUY")
-        elif not c1_bull and not c2_bull: results.append("SELL")
-    # Finnhub 1m last candle
-    if fh_symbol:
-        df_fh = _finnhub_candles(fh_symbol, "1", 10)
-        if df_fh is not None and len(df_fh) >= 3:
-            opens  = df_fh["Open"].astype(float)
-            closes = df_fh["Close"].astype(float)
-            c1_bull = float(closes.iloc[-1]) > float(opens.iloc[-1])
-            c2_bull = float(closes.iloc[-2]) > float(opens.iloc[-2])
-            if c1_bull and c2_bull:     results.append("BUY")
-            elif not c1_bull and not c2_bull: results.append("SELL")
-    if not results:
-        return None
-    # Both sources must agree
-    if len(results) == 2 and results[0] != results[1]:
-        return None
-    return results[0]
+    votes = []
+    # Yahoo Finance 1m
+    df = _mtf_yf_candles(yf_sym, "1m", "1d")
+    if df is not None and len(df) >= 3:
+        opens  = df["Open"].squeeze().astype(float)
+        closes = df["Close"].squeeze().astype(float)
+        c1b = float(closes.iloc[-1]) > float(opens.iloc[-1])
+        c2b = float(closes.iloc[-2]) > float(opens.iloc[-2])
+        if c1b and c2b:         votes.append("BUY")
+        elif not c1b and not c2b: votes.append("SELL")
+    # Finnhub 1m
+    if fh_sym:
+        df2 = _mtf_fh_candles(fh_sym, "1", 10)
+        if df2 is not None and len(df2) >= 3:
+            c1b = float(df2["Close"].iloc[-1]) > float(df2["Open"].iloc[-1])
+            c2b = float(df2["Close"].iloc[-2]) > float(df2["Open"].iloc[-2])
+            if c1b and c2b:         votes.append("BUY")
+            elif not c1b and not c2b: votes.append("SELL")
+    if not votes: return None
+    if len(votes) == 2 and votes[0] != votes[1]: return None
+    return votes[0]
 
 
-def _fetch_all_tf_for_signal(pair):
+def _mtf_fetch_tf(yf_sym, fh_sym, fh_res, yf_interval, yf_period):
+    """Fetch one TF: Finnhub primary, Yahoo fallback. Returns direction or None."""
+    df = _mtf_fh_candles(fh_sym, fh_res) if fh_sym else None
+    if df is None: df = _mtf_yf_candles(yf_sym, yf_interval, yf_period)
+    return _mtf_calc_direction(df)
+
+
+def _mtf_check_confirmation(dirs, signal_type):
     """
-    Fetch all required timeframes for MTF signal analysis.
-    Uses both Yahoo Finance and Finnhub for cross-validation.
-    Returns dict: {tf_label: result_dict}
+    Check MTF confirmation for signal_type 1/2/3.
+    dirs = {"micro":x, "anchor":x, "mid":x, "bias":x}
+    Returns: "CALL", "PUT", "NEAR_CALL", "NEAR_PUT", or None.
     """
-    real_pair  = OTC_TO_REAL.get(pair, pair)
-    yf_symbol  = YAHOO_SYMBOLS.get(real_pair)
-    fh_symbol  = _get_finnhub_symbol(pair)
-    results    = {}
-
-    # ── MICRO (last 1m candle direction as 5/10/15s proxy) ───
-    micro = _get_micro_direction(yf_symbol, fh_symbol)
-    results["micro"] = {"direction": micro, "score": 1.0 if micro == "BUY" else (-1.0 if micro == "SELL" else 0),
-                        "strength": 100 if micro else 0, "adx_ok": True, "label": "micro"}
-
-    # ── 1m TF: Finnhub primary, yfinance fallback ─────────────
-    df_1m = None
-    if fh_symbol:
-        df_1m = _finnhub_candles(fh_symbol, "1", 120)
-    if df_1m is None and yf_symbol:
-        df_1m = _yf_candles(yf_symbol, "1m", "1d")
-    results["1m"] = _calc_tf_direction(df_1m, "1m")
-
-    # ── 2m TF: Yahoo Finance (yfinance has 2m) ────────────────
-    df_2m = _yf_candles(yf_symbol, "2m", "1d") if yf_symbol else None
-    results["2m"] = _calc_tf_direction(df_2m, "2m")
-
-    # ── 3m TF: Yahoo Finance ─────────────────────────────────
-    df_3m = _yf_candles(yf_symbol, "5m", "2d") if yf_symbol else None  # 5m as 3m proxy
-    results["3m"] = _calc_tf_direction(df_3m, "3m")
-
-    # ── 5m TF: Finnhub primary, Yahoo fallback ───────────────
-    df_5m = None
-    if fh_symbol:
-        df_5m = _finnhub_candles(fh_symbol, "5", 120)
-    if df_5m is None and yf_symbol:
-        df_5m = _yf_candles(yf_symbol, "5m", "2d")
-    results["5m"] = _calc_tf_direction(df_5m, "5m")
-
-    # ── 15m TF: Finnhub primary, Yahoo fallback ──────────────
-    df_15m = None
-    if fh_symbol:
-        df_15m = _finnhub_candles(fh_symbol, "15", 120)
-    if df_15m is None and yf_symbol:
-        df_15m = _yf_candles(yf_symbol, "15m", "5d")
-    results["15m"] = _calc_tf_direction(df_15m, "15m")
-
-    # ── 30m TF: Finnhub primary, Yahoo fallback ──────────────
-    df_30m = None
-    if fh_symbol:
-        df_30m = _finnhub_candles(fh_symbol, "30", 120)
-    if df_30m is None and yf_symbol:
-        df_30m = _yf_candles(yf_symbol, "30m", "5d")
-    results["30m"] = _calc_tf_direction(df_30m, "30m")
-
-    # ── 1H TF: Finnhub primary, Yahoo fallback ───────────────
-    df_1h = None
-    if fh_symbol:
-        df_1h = _finnhub_candles(fh_symbol, "60", 120)
-    if df_1h is None and yf_symbol:
-        df_1h = _yf_candles(yf_symbol, "1h", "10d")
-    results["1h"] = _calc_tf_direction(df_1h, "1h")
-
-    # ── 4H TF: Finnhub primary, Yahoo fallback ───────────────
-    df_4h = None
-    if fh_symbol:
-        df_4h = _finnhub_candles(fh_symbol, "240", 120)
-    if df_4h is None and yf_symbol:
-        df_4h = _yf_candles(yf_symbol, "4h", "30d") if yf_symbol else None
-    results["4h"] = _calc_tf_direction(df_4h, "4h")
-
-    return results
-
-
-def _score_direction(r):
-    """Return +1 for BUY, -1 for SELL, 0 for None from a tf result dict."""
-    if r is None or r.get("direction") is None:
-        return 0
-    return 1 if r["direction"] == "BUY" else -1
-
-
-def _check_full_mtf_confirmation(tf_results, signal_type):
-    """
-    Check if full MTF confirmation exists for a given signal type.
-
-    1-MIN SIGNAL needs: micro BUY + 1m BUY + 15m BUY + 4h BUY  (all 4 aligned)
-    2-MIN SIGNAL needs: micro BUY + 2m BUY + 30m BUY + 4h BUY
-    3-MIN SIGNAL needs: micro BUY + 3m BUY + 1h  BUY + 4h BUY
-
-    Returns:
-      "CALL"  → full bullish confirmation
-      "PUT"   → full bearish confirmation
-      "NEAR_CALL" → 3/4 bullish (near confirmation)
-      "NEAR_PUT"  → 3/4 bearish
-      None    → no confirmation
-    """
-    if signal_type == 1:
-        tfs = ["micro", "1m", "15m", "4h"]
-    elif signal_type == 2:
-        tfs = ["micro", "2m", "30m", "4h"]
-    elif signal_type == 3:
-        tfs = ["micro", "3m", "1h", "4h"]
-    else:
-        return None
-
-    scores = [_score_direction(tf_results.get(t)) for t in tfs]
-    available = [s for s in scores if s != 0]
-
-    if len(available) < 3:
-        return None  # Not enough data
-
-    bull_count = sum(1 for s in available if s > 0)
-    bear_count = sum(1 for s in available if s < 0)
-    total      = len(available)
-
-    # Full confirmation: all available TFs agree
-    if bull_count == total:
-        return "CALL"
-    if bear_count == total:
-        return "PUT"
-
-    # Near confirmation: 3 out of 4 agree (or 3/3 if one TF missing)
-    if total >= 3:
-        if bull_count >= total - 1 and bull_count > bear_count:
-            return "NEAR_CALL"
-        if bear_count >= total - 1 and bear_count > bull_count:
-            return "NEAR_PUT"
-
+    keys    = ["micro", "anchor", "mid", "bias"]
+    scores  = [1 if dirs.get(k)=="BUY" else (-1 if dirs.get(k)=="SELL" else 0) for k in keys]
+    avail   = [s for s in scores if s != 0]
+    if len(avail) < 3: return None
+    bull = sum(1 for s in avail if s > 0)
+    bear = sum(1 for s in avail if s < 0)
+    tot  = len(avail)
+    if bull == tot:       return "CALL"
+    if bear == tot:       return "PUT"
+    if tot >= 3:
+        if bull >= tot-1 and bull > bear: return "NEAR_CALL"
+        if bear >= tot-1 and bear > bull: return "NEAR_PUT"
     return None
 
 
-def _trend_strength_score(tf_results):
+def _mtf_trend_score(all_dirs):
     """
-    Calculate overall trend strength using all available TFs.
-    Returns score 0–100 and direction.
-    Weights: 4h=40, anchor_tf=25, mid_tf=20, micro=15.
-    Strong trend: score >= 65, clear: >= 50.
+    Weighted trend score from all fetched TFs.
+    Returns (score 0-100, 'BUY'|'SELL'|None).
     """
-    weighted = {
-        "4h": 40, "1h": 25, "30m": 20, "15m": 20,
-        "1m": 18, "2m": 18, "3m": 18, "5m": 12,
-        "micro": 15,
-    }
-    bull_w = bear_w = total_w = 0
-    for tf, weight in weighted.items():
-        r = tf_results.get(tf)
-        if r is None or r.get("direction") is None:
-            continue
-        total_w += weight
-        if r["direction"] == "BUY":
-            bull_w += weight
-            # Bonus: ADX confirms trend
-            if r.get("adx_ok"):
-                bull_w += weight * 0.2
-        else:
-            bear_w += weight
-            if r.get("adx_ok"):
-                bear_w += weight * 0.2
-
-    if total_w == 0:
-        return 0, None
-
-    bull_score = (bull_w / total_w) * 100
-    bear_score = (bear_w / total_w) * 100
-
-    if bull_score > bear_score:
-        return min(100, bull_score), "BUY"
-    else:
-        return min(100, bear_score), "SELL"
+    weights = {"4h":40,"1h":25,"30m":20,"15m":20,"2m":15,"1m":15,"3m":15,"5m":10,"micro":12}
+    bw = sw = tw = 0
+    for tf, w in weights.items():
+        d = all_dirs.get(tf)
+        if d == "BUY":  bw += w; tw += w
+        elif d == "SELL": sw += w; tw += w
+    if tw == 0: return 0, None
+    if bw > sw: return min(100, bw/tw*100), "BUY"
+    return min(100, sw/tw*100), "SELL"
 
 
-def _run_mtf_signal_engine(pair):
+def run_mtf_signal_engine(pair):
     """
-    Main MTF signal engine.
-    Tries 1-min signal first, then 2-min, then 3-min.
-    Each requires full MTF confirmation per rules above.
-    Falls back to near-confirmation only if trend is strong.
+    Main entry point — called from GET SIGNAL handler.
+    Tries 1-min, 2-min, 3-min confirmation in order.
+
+    Confirmation rules:
+      1-min : micro(5s)  + 1m  + 15m + 4h — ALL bullish → CALL, ALL bearish → PUT
+      2-min : micro(10s) + 2m  + 30m + 4h
+      3-min : micro(15s) + 3m  + 1h  + 4h
+
+    Near-confirmation (3/4 TF) only if trend_score >= 72%.
+    Minimum trend_score: 62% — below this returns no signal.
 
     Returns dict:
-      signal_type: 1/2/3/None
-      direction: 'CALL'/'PUT'/None
-      near: bool (True if near-confirmation was used)
-      trend_score: float 0–100
-      trend_dir: 'BUY'/'SELL'/None
-      tf_results: raw TF data
-      message: human-readable status
+      signal_type : 1/2/3/None
+      direction   : 'CALL'/'PUT'/None
+      near        : bool
+      trend_score : float
+      trend_dir   : 'BUY'/'SELL'/None
+      tf_labels   : list of (label, direction) for display
+      message     : str
     """
-    tf_results   = _fetch_all_tf_for_signal(pair)
-    trend_score, trend_dir = _trend_strength_score(tf_results)
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+    fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
 
-    # Reject: trend too weak or noisy
-    MIN_TREND_SCORE = 62  # Require at least 62% directional weight
-    if trend_score < MIN_TREND_SCORE or trend_dir is None:
-        return {
-            "signal_type": None, "direction": None, "near": False,
-            "trend_score": trend_score, "trend_dir": trend_dir,
-            "tf_results": tf_results,
-            "message": "Trend too weak ({:.0f}%)".format(trend_score),
-        }
+    # Fetch all needed TFs once
+    all_dirs = {}
+    try:
+        all_dirs["micro"] = _mtf_get_micro_dir(yf_sym, fh_sym)
+        all_dirs["1m"]    = _mtf_fetch_tf(yf_sym, fh_sym, "1",   "1m",  "1d")
+        all_dirs["2m"]    = _mtf_fetch_tf(yf_sym, None,   None,  "2m",  "1d")
+        all_dirs["3m"]    = _mtf_fetch_tf(yf_sym, fh_sym, "5",   "5m",  "2d")   # 5m proxy for 3m
+        all_dirs["15m"]   = _mtf_fetch_tf(yf_sym, fh_sym, "15",  "15m", "5d")
+        all_dirs["30m"]   = _mtf_fetch_tf(yf_sym, fh_sym, "30",  "30m", "5d")
+        all_dirs["1h"]    = _mtf_fetch_tf(yf_sym, fh_sym, "60",  "1h",  "10d")
+        all_dirs["4h"]    = _mtf_fetch_tf(yf_sym, fh_sym, "240", "4h",  "30d")
+    except Exception as e:
+        logging.warning("run_mtf_signal_engine fetch failed {}: {}".format(pair, e))
 
-    # Try signal types in order: 1m → 2m → 3m
-    for sig_type in [1, 2, 3]:
-        result = _check_full_mtf_confirmation(tf_results, sig_type)
-        if result in ("CALL", "PUT"):
-            # Verify the confirmed direction matches overall trend
-            conf_dir = "BUY" if result == "CALL" else "SELL"
-            if conf_dir != trend_dir:
-                continue  # MTF says BUY but trend is SELL — skip
-            return {
-                "signal_type": sig_type,
-                "direction": result,
-                "near": False,
-                "trend_score": trend_score,
-                "trend_dir": trend_dir,
-                "tf_results": tf_results,
-                "message": "Full {} confirmation ({}-min)".format(result, sig_type),
-            }
-        elif result in ("NEAR_CALL", "NEAR_PUT") and trend_score >= 72:
-            # Near-confirmation only if trend is very strong (≥72%)
-            near_dir = "BUY" if "CALL" in result else "SELL"
-            if near_dir != trend_dir:
-                continue
-            return {
-                "signal_type": sig_type,
-                "direction": "CALL" if "CALL" in result else "PUT",
-                "near": True,
-                "trend_score": trend_score,
-                "trend_dir": trend_dir,
-                "tf_results": tf_results,
-                "message": "Near {} confirmation ({}-min) — strong trend {:.0f}%".format(
-                    result, sig_type, trend_score),
-            }
+    # Trend strength filter
+    trend_score, trend_dir = _mtf_trend_score(all_dirs)
+    if trend_score < 45 or trend_dir is None:
+        return {"signal_type": None, "direction": None, "near": False,
+                "trend_score": trend_score, "trend_dir": trend_dir,
+                "tf_labels": [], "message": "Trend too weak ({:.0f}%)".format(trend_score)}
 
-    return {
-        "signal_type": None, "direction": None, "near": False,
-        "trend_score": trend_score, "trend_dir": trend_dir,
-        "tf_results": tf_results,
-        "message": "No confirmed signal across 1m/2m/3m",
+    # Try 1-min → 2-min → 3-min
+    configs = {
+        1: {"micro": all_dirs.get("micro"), "anchor": all_dirs.get("1m"),
+            "mid": all_dirs.get("15m"), "bias": all_dirs.get("4h"),
+            "labels": [("5s", "micro"), ("1m", "1m"), ("15m", "15m"), ("4h", "4h")]},
+        2: {"micro": all_dirs.get("micro"), "anchor": all_dirs.get("2m"),
+            "mid": all_dirs.get("30m"), "bias": all_dirs.get("4h"),
+            "labels": [("10s", "micro"), ("2m", "2m"), ("30m", "30m"), ("4h", "4h")]},
+        3: {"micro": all_dirs.get("micro"), "anchor": all_dirs.get("3m"),
+            "mid": all_dirs.get("1h"), "bias": all_dirs.get("4h"),
+            "labels": [("15s", "micro"), ("3m", "3m"), ("1h", "1h"), ("4h", "4h")]},
     }
 
+    for sig_type in [1, 2, 3]:
+        cfg    = configs[sig_type]
+        result = _mtf_check_confirmation(cfg, sig_type)
+        if result in ("CALL", "PUT"):
+            conf_dir = "BUY" if result == "CALL" else "SELL"
+            if conf_dir != trend_dir: continue
+            tf_labels = [(lbl, all_dirs.get(key)) for lbl, key in cfg["labels"]]
+            return {"signal_type": sig_type, "direction": result, "near": False,
+                    "trend_score": trend_score, "trend_dir": trend_dir,
+                    "tf_labels": tf_labels,
+                    "message": "Full {} {}-min confirmation".format(result, sig_type)}
+        elif result in ("NEAR_CALL", "NEAR_PUT") and trend_score >= 55:
+            near_dir = "BUY" if "CALL" in result else "SELL"
+            if near_dir != trend_dir: continue
+            tf_labels = [(lbl, all_dirs.get(key)) for lbl, key in cfg["labels"]]
+            return {"signal_type": sig_type,
+                    "direction": "CALL" if "CALL" in result else "PUT",
+                    "near": True,
+                    "trend_score": trend_score, "trend_dir": trend_dir,
+                    "tf_labels": tf_labels,
+                    "message": "Near {}-min confirmation ({:.0f}%)".format(sig_type, trend_score)}
 
-def _build_tf_summary(tf_results, signal_type):
-    """Build a short TF confirmation string for display in signal message."""
-    if signal_type == 1:
-        tfs = [("micro", "5s"), ("1m", "1m"), ("15m", "15m"), ("4h", "4h")]
-    elif signal_type == 2:
-        tfs = [("micro", "10s"), ("2m", "2m"), ("30m", "30m"), ("4h", "4h")]
-    elif signal_type == 3:
-        tfs = [("micro", "15s"), ("3m", "3m"), ("1h", "1h"), ("4h", "4h")]
-    else:
-        return ""
-    lines = []
-    for key, label in tfs:
-        r = tf_results.get(key)
-        if r and r.get("direction"):
-            icon = "🟢" if r["direction"] == "BUY" else "🔴"
-            lines.append("{} {}".format(icon, label))
-        else:
-            lines.append("⚪ {} (no data)".format(label))
-    return "\n".join(lines)
+    return {"signal_type": None, "direction": None, "near": False,
+            "trend_score": trend_score, "trend_dir": trend_dir,
+            "tf_labels": [], "message": "No MTF confirmation (1m/2m/3m)"}
 
 
-# ============================================================
-# GENERATE SIGNAL (new MTF engine)
-# ============================================================
+def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=False):
+    """
+    Build signal caption with MTF TF breakdown.
+    direction: 'CALL' or 'PUT'
+    """
+    arrow    = "Up 🟢" if direction == "CALL" else "Down 🔴"
+    near_tag = " _(near)_" if near else ""
+    badge    = "✅ FULL CONFIRMATION" if not near else "⚡ NEAR CONFIRMATION"
+    lines    = []
+    for lbl, d in tf_labels:
+        if d == "BUY":   lines.append("🟢 {}".format(lbl))
+        elif d == "SELL": lines.append("🔴 {}".format(lbl))
+        else:             lines.append("⚪ {} (no data)".format(lbl))
+    tf_block = "\n".join(lines)
+    return (
+        "*{}* {}\n"
+        "🕐 In *{}* min{}\n\n"
+        "📋 *MTF Confirmation:*\n"
+        "{}\n\n"
+        "{}\n"
+        "📊 Trend strength: *{:.0f}%*"
+    ).format(pair, arrow, sig_type, near_tag, tf_block, badge, trend_score)
+
+# ── END MTF ENGINE ───────────────────────────────────────────
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
     yahoo_available = True
-
-    # ── NEW MTF ENGINE (non-OTC only) ────────────────────────
-    # For non-OTC pairs with Yahoo/Finnhub data available,
-    # run the full MTF confirmation engine first.
-    # If it returns a strong signal, use it directly.
-    # OTC pairs fall through to the existing synthetic logic.
-    mtf_engine_result = None
-    if not is_otc and YAHOO_SYMBOLS.get(OTC_TO_REAL.get(pair, pair)):
-        try:
-            mtf_engine_result = _run_mtf_signal_engine(pair)
-            logging.info("MTF ENGINE {}: type={} dir={} near={} score={:.0f}% — {}".format(
-                pair,
-                mtf_engine_result.get("signal_type"),
-                mtf_engine_result.get("direction"),
-                mtf_engine_result.get("near"),
-                mtf_engine_result.get("trend_score", 0),
-                mtf_engine_result.get("message", ""),
-            ))
-        except Exception as e:
-            logging.warning("MTF engine failed {}: {}".format(pair, e))
-            mtf_engine_result = None
-
-    # If MTF engine has a confirmed signal → return it directly
-    if mtf_engine_result and mtf_engine_result.get("direction") in ("CALL", "PUT"):
-        sig_type   = mtf_engine_result["signal_type"]
-        direction  = "BUY" if mtf_engine_result["direction"] == "CALL" else "SELL"
-        near       = mtf_engine_result["near"]
-        tscore     = mtf_engine_result["trend_score"]
-        tf_results = mtf_engine_result["tf_results"]
-
-        # Strength: scale trend_score to 300-500 range
-        strength = min(500, max(300, int(tscore * 4.5)))
-        if near:
-            strength = max(300, strength - 30)  # Slight penalty for near-confirmation
-
-        # Build TF summary for signal caption
-        tf_summary = _build_tf_summary(tf_results, sig_type)
-
-        record_signal(pair, direction)
-        return {
-            "direction": direction,
-            "pair": pair,
-            "timeframe": sig_type,
-            "strength": strength,
-            "indicators_agree": 10 if not near else 7,
-            "trend_1h": direction,
-            "vwap_data": None,
-            "confluence": {
-                "level": "STRONG" if not near else "MODERATE",
-                "score": int(tscore),
-                "badge": "✅ FULL MTF" if not near else "⚡ NEAR MTF",
-            },
-            "mtf": None,
-            "flat": False,
-            "patterns": {},
-            "movement_cat": "HIGH",
-            "avg_movement": 0,
-            "no_signal_reason": "",
-            "mtf_engine": True,
-            "mtf_near": near,
-            "mtf_tf_summary": tf_summary,
-            "mtf_signal_type": sig_type,
-            "mtf_trend_score": tscore,
-        }
-
-    # If MTF engine ran but found no signal → no-signal for non-OTC
-    if mtf_engine_result and not is_otc and mtf_engine_result.get("signal_type") is None:
-        record_signal(pair, "BUY")  # Record a placeholder
-        return {
-            "direction": "BUY", "pair": pair, "timeframe": 0,
-            "strength": 0, "indicators_agree": 0,
-            "trend_1h": None, "vwap_data": None,
-            "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
-            "mtf": None, "flat": True, "patterns": {},
-            "movement_cat": "LOW", "avg_movement": 0,
-            "no_signal_reason": mtf_engine_result.get("message", "No MTF confirmation"),
-            "mtf_engine": True,
-        }
-
     if not is_otc:
         try:
             real = _fetch_real_indicators_mtf(pair)
@@ -3964,13 +3670,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
-        # Build caption with MTF summary if available
-        mtf_summary = sig.get("mtf_tf_summary", "") if check["action"] == "fresh" and "sig" in dir() else ""
-        if mtf_summary:
-            cap = "*{}* {}\n🕐 In {} min\n\n📋 *Confirmation:*\n{}\n\n📊 Strength: {}".format(
-                pair, arrow, timeframe, mtf_summary, strength)
-        else:
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
 
@@ -4311,12 +4011,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Creating a signal for {}*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(2)
 
+        # ── MTF PRE-CHECK (non-OTC only) ─────────────────────
+        # OTC pairs NEVER go through MTF — wanaendelea generate_signal moja kwa moja
+        _is_non_otc_pair = "OTC" not in pair and pair in YAHOO_SYMBOLS
+        _mtf_result = None
+        if _is_non_otc_pair:
+            try:
+                _mtf_result = run_mtf_signal_engine(pair)
+                logging.info("MTF getmore {}: {}".format(pair, _mtf_result.get("message","")))
+            except Exception as _e:
+                logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
+
+        # If MTF says no signal for non-OTC → let generate_signal decide (don't block)
+        if _is_non_otc_pair and _mtf_result and _mtf_result.get("signal_type") is None:
+            pass  # Fall through to generate_signal below
+        # ─────────────────────────────────────────────────────
+
         sig       = generate_signal(pair)
         direction = sig["direction"]
         strength  = sig["strength"]
 
-        # Use pip-based TF from VTE stats, fallback to signal's own TF
-        timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
+        # MTF override: use MTF direction + timeframe if confirmed
+        _mtf_cap = None
+        if _mtf_result and _mtf_result.get("direction") in ("CALL","PUT"):
+            direction  = "BUY" if _mtf_result["direction"] == "CALL" else "SELL"
+            _mtf_tf    = _mtf_result["signal_type"]
+            _mtf_cap   = build_mtf_caption(
+                pair, _mtf_result["direction"], _mtf_tf,
+                _mtf_result["tf_labels"], _mtf_result["trend_score"],
+                _mtf_result["near"])
+            timeframe  = _pick_tf_by_pips(pair, _mtf_tf)
+        else:
+            # No MTF override — use generate_signal timeframe as normal
+            timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
 
         # Flat market block
         if sig.get("flat") and sig["timeframe"] == 0:
@@ -4403,16 +4130,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
-        # MTF summary from new engine
-        mtf_summary_gm = sig.get("mtf_tf_summary", "") if sig.get("mtf_engine") else ""
-        mtf_near_gm    = sig.get("mtf_near", False)
-        if mtf_summary_gm:
-            near_tag = " _(near)_" if mtf_near_gm else ""
-            cap = "*{}* {}\n🕐 In {} min{}\n\n📋 *MTF Confirmation:*\n{}\n\n📊 Trend: {:.0f}%".format(
-                pair, arrow, sig_type if "sig_type" in dir() else timeframe,
-                near_tag, mtf_summary_gm, sig.get("mtf_trend_score", strength))
-        else:
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = _mtf_cap if _mtf_cap else "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
 
         if gm_is_non_otc and gm_entry_price is not None:
@@ -4672,17 +4390,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
-        # MTF caption for non-OTC fresh signals
-        _sig_ref = sig if check["action"] == "fresh" and "sig" in dir() else {}
-        _mtf_sum = _sig_ref.get("mtf_tf_summary", "") if isinstance(_sig_ref, dict) else ""
-        if _mtf_sum and is_non_otc:
-            _near_tag = " _(near)_" if _sig_ref.get("mtf_near") else ""
-            cap = "*{}* {}\n🕐 In {} min{}\n\n📋 *MTF Confirmation:*\n{}\n\n📊 Trend: {:.0f}%".format(
-                pair, arrow, timeframe, _near_tag, _mtf_sum,
-                _sig_ref.get("mtf_trend_score", strength))
-        else:
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+
+        # --- Result tracker: non-OTC only (have real price data) ---
         if is_non_otc and entry_price is not None:
             asyncio.create_task(
                 schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, entry_price)
