@@ -2317,7 +2317,178 @@ def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=Fa
 
 # ── END MTF ENGINE ───────────────────────────────────────────
 
-def generate_signal(pair):
+def _force_signal_from_micro(pair, signal_type):
+    """
+    Fallback ya mwisho — angalia candles 100 za nyuma za micro timeframe.
+
+    Micro TF per signal type:
+      signal_type 1 = 5s  proxy → Finnhub/Yahoo 1m candles 100
+      signal_type 2 = 10s proxy → Finnhub/Yahoo 1m candles 100
+      signal_type 3 = 15s proxy → Finnhub/Yahoo 1m candles 100
+
+    Mantiki:
+      - Hesabu candles 100 za mwisho
+      - close > open = kijani (bullish win)
+      - close < open = nyekundu (bearish win)
+      - Yenye win nyingi inaonyesha mwelekeo wa kweli wa soko
+      - Kijani nyingi → BUY, Nyekundu nyingi → SELL
+      - Daima inatoa signal — haishindwi kamwe
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+    fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
+
+    micro_label = {1: "5s", 2: "10s", 3: "15s"}.get(signal_type, "5s")
+    COUNT  = 100
+    bull = bear = 0
+    source = "none"
+
+    # Finnhub 1m primary
+    if fh_sym:
+        try:
+            df = _mtf_fh_candles(fh_sym, "1", COUNT + 20)
+            if df is not None and len(df) >= 10:
+                df = df.iloc[-COUNT:]
+                opens  = df["Open"].astype(float)
+                closes = df["Close"].astype(float)
+                for o, c in zip(opens, closes):
+                    if c > o:   bull += 1
+                    elif c < o: bear += 1
+                source = "finnhub_1m"
+        except Exception as e:
+            logging.warning("_force_signal_from_micro finnhub: {}".format(e))
+
+    # Yahoo 1m fallback
+    if bull == 0 and bear == 0 and yf_sym:
+        try:
+            df = _mtf_yf_candles(yf_sym, "1m", "2d")
+            if df is not None and len(df) >= 10:
+                df = df.iloc[-COUNT:]
+                opens  = df["Open"].squeeze().astype(float)
+                closes = df["Close"].squeeze().astype(float)
+                for o, c in zip(opens, closes):
+                    if c > o:   bull += 1
+                    elif c < o: bear += 1
+                source = "yahoo_1m"
+        except Exception as e:
+            logging.warning("_force_signal_from_micro yahoo: {}".format(e))
+
+    # Finnhub 5m ya mwisho kama bado hakuna data
+    if bull == 0 and bear == 0 and fh_sym:
+        try:
+            df = _mtf_fh_candles(fh_sym, "5", 50)
+            if df is not None and len(df) >= 5:
+                opens  = df["Open"].astype(float)
+                closes = df["Close"].astype(float)
+                for o, c in zip(opens, closes):
+                    if c > o:   bull += 1
+                    elif c < o: bear += 1
+                source = "finnhub_5m"
+        except Exception: pass
+
+    total      = bull + bear
+    bull_pct   = (bull / total * 100) if total > 0 else 50.0
+    bear_pct   = (bear / total * 100) if total > 0 else 50.0
+    direction  = "BUY" if bull >= bear else "SELL"
+    trend_score = bull_pct if direction == "BUY" else bear_pct
+
+    logging.info("MICRO HISTORY {}: {} candles | green={:.0f}% red={:.0f}% → {} [{}]".format(
+        pair, total, bull_pct, bear_pct, direction, source))
+
+    return {
+        "signal_type": signal_type,
+        "direction":   "CALL" if direction == "BUY" else "PUT",
+        "near":        True,
+        "trend_score": max(50.0, trend_score),
+        "trend_dir":   direction,
+        "tf_labels":   [(micro_label, direction)],
+        "message":     "Micro history {}: green={:.0f}% red={:.0f}% → {} [{}]".format(
+                        micro_label, bull_pct, bear_pct, direction, source),
+        "forced":      True,
+    }
+
+def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
+    """
+    Full MTF engine with guaranteed signal fallback.
+    Order ya jaribu:
+      1. Full confirmation (4/4)
+      2. Near confirmation (3/4) — trend >= 55%
+      3. 2/4 confirmation — trend >= 45%
+      4. 1/4 (micro direction tu)
+      5. Micro history fallback — DAIMA inatoa signal
+
+    signal_type: 1/2/3 au None (jaribu zote)
+    """
+    # For OTC — skip MTF entirely, return None so generate_signal runs
+    if "OTC" in pair:
+        return None
+
+    result = run_mtf_signal_engine(pair)
+
+    # Got full or near confirmation — done
+    if result and result.get("direction") in ("CALL", "PUT"):
+        return result
+
+    # 2/4 attempt — lower bar further
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+    fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
+    all_dirs  = result.get("tf_labels", []) if result else []
+
+    # Try each signal type with 2/4 rule
+    types_to_try = [signal_type] if signal_type else [1, 2, 3]
+    for st in types_to_try:
+        try:
+            # Rebuild all_dirs dict from result
+            ad = {}
+            if result and result.get("tf_labels"):
+                for lbl, d in result["tf_labels"]:
+                    ad[lbl] = d
+            # Also try fetching fresh
+            if not ad:
+                ad["micro"] = _mtf_get_micro_dir(yf_sym, fh_sym)
+                ad["1m"]  = _mtf_fetch_tf(yf_sym, fh_sym, "1",  "1m",  "1d")
+                ad["2m"]  = _mtf_fetch_tf(yf_sym, None,   None, "2m",  "1d")
+                ad["3m"]  = _mtf_fetch_tf(yf_sym, fh_sym, "5",  "5m",  "2d")
+                ad["15m"] = _mtf_fetch_tf(yf_sym, fh_sym, "15", "15m", "5d")
+                ad["30m"] = _mtf_fetch_tf(yf_sym, fh_sym, "30", "30m", "5d")
+                ad["1h"]  = _mtf_fetch_tf(yf_sym, fh_sym, "60", "1h",  "10d")
+                ad["4h"]  = _mtf_fetch_tf(yf_sym, fh_sym, "240","4h",  "30d")
+
+            cfg = {
+                1: [("micro","micro"),("1m","1m"),("15m","15m"),("4h","4h")],
+                2: [("micro","micro"),("2m","2m"),("30m","30m"),("4h","4h")],
+                3: [("micro","micro"),("3m","3m"),("1h","1h"),  ("4h","4h")],
+            }[st]
+
+            scores = [1 if ad.get(k)=="BUY" else(-1 if ad.get(k)=="SELL" else 0) for _,k in cfg]
+            avail  = [s for s in scores if s != 0]
+            bull   = sum(1 for s in avail if s > 0)
+            bear   = sum(1 for s in avail if s < 0)
+
+            if len(avail) >= 2 and (bull >= 2 or bear >= 2):
+                direction = "BUY" if bull >= bear else "SELL"
+                ts, td = _mtf_trend_score(ad)
+                if td == direction or ts < 30:
+                    tf_labels = [(lbl, ad.get(k)) for lbl,k in cfg]
+                    return {
+                        "signal_type": st,
+                        "direction":  "CALL" if direction=="BUY" else "PUT",
+                        "near":       True,
+                        "trend_score": max(40.0, ts),
+                        "trend_dir":  direction,
+                        "tf_labels":  tf_labels,
+                        "message":    "2/4 confirmation {}-min".format(st),
+                        "forced":     False,
+                    }
+        except Exception as e:
+            logging.warning("2/4 attempt st={} failed: {}".format(st, e))
+
+    # Last resort: micro history fallback — ALWAYS returns a signal
+    st = types_to_try[0] if types_to_try else 1
+    return _force_signal_from_micro(pair, st)
+
+
     is_otc = "OTC" in pair
     real   = None
     yahoo_available = True
@@ -3122,20 +3293,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_channel_and_proceed(update, context):
         return
 
-    # ── Persistent Reply Keyboard — ALWAYS sent first ─────────
-    # This ensures keyboard appears/reappears at bottom of screen
+    # ── 1 Button keyboard ─────────────────────────────────────
     reply_kb = ReplyKeyboardMarkup(
-        [
-            ["⚡ Get Signal",     "🤖 Bot Pick Pair"],
-            ["📊 My Stats",       "💎 Upgrade"],
-            ["🔄 Restart",        "ℹ️ Help"],
-        ],
+        [["🏆 EVALON MENU"]],
         resize_keyboard=True,
-        is_persistent=True,   # Keep keyboard visible always
+        is_persistent=True,
         one_time_keyboard=False,
     )
 
-    # Send welcome with reply keyboard attached — keyboard appears immediately
     await update.message.reply_text(
         "╔══════════════════════╗\n"
         "     ⚡ EVALON MASTER PRO\n"
@@ -3144,20 +3309,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *100+ Trading Pairs*\n"
         "🧠 *AI-Powered Signal Analysis*\n\n"
         "⚠️ _Evalon Bot is AI-powered and may make mistakes. Trade responsibly._\n\n"
-        "Choose an option below to get started:",
+        "Tap *EVALON MENU* below to get started:",
         parse_mode="Markdown",
         reply_markup=reply_kb,
-    )
-
-    # ── Inline menu below welcome ──────────────────────────────
-    await update.message.reply_text(
-        "🚀 *Quick Actions:*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤖 Bot Pick Best Pair", callback_data="bot_pick_pair")],
-            [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
-            [InlineKeyboardButton("💎 Upgrade / Licence",  callback_data="pay_info")],
-        ])
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3629,7 +3783,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -3644,7 +3798,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -3871,7 +4025,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="🟡 *No clear signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                 ])
             )
             return
@@ -4017,8 +4171,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mtf_result = None
         if _is_non_otc_pair:
             try:
-                _mtf_result = run_mtf_signal_engine(pair)
-                logging.info("MTF getmore {}: {}".format(pair, _mtf_result.get("message","")))
+                _mtf_result = run_mtf_signal_engine_with_fallback(pair)
+                logging.info("MTF getmore {}: {}".format(pair, _mtf_result.get("message","") if _mtf_result else "None"))
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
@@ -4065,7 +4219,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=msg,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                 ])
             )
             return
@@ -4090,7 +4244,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                 ])
             )
             return
@@ -4103,7 +4257,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-                    [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                 ])
             )
             return
@@ -4293,7 +4447,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -4316,7 +4470,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="🟡 *No clear signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📊 Choose Another Pair", callback_data="choose_pair")]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx if "idx" in dir() else "0"))]
                     ])
                 )
                 return
@@ -4437,6 +4591,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """Directly handle reply keyboard button presses — no middleman button needed."""
     user_id = update.effective_user.id
+
+    if data == "help_inline":
+        await query.answer()
+        await query.message.reply_text(
+            "ℹ️ *EVALON MASTER PRO — Help*\n\n"
+            "⚡ *Get Signal* — Chagua pair na upate signal\n"
+            "🤖 *Bot Pick Pair* — Bot inakuchagulia pair bora\n"
+            "📊 *My Stats* — Angalia matokeo yako\n"
+            "💎 *Upgrade* — Nunua licence ya monthly au lifetime\n\n"
+            "📌 *Jinsi ya kutumia:*\n"
+            "1. Bonyeza EVALON MENU\n"
+            "2. Chagua Get Signal au Bot Pick Pair\n"
+            "3. Subiri signal — ingia trade wakati signal inaonekana\n\n"
+            "📞 Support: @{}".format(SUPPORT_BOT),
+            parse_mode="Markdown",
+        )
+        return
 
     if data == "choose_pair":
         weekend = is_weekend()
@@ -4910,23 +5081,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("/start", "🔄 Restart"):
         await start(update, context)
         return
-    if text == "🔄 Restart":
-        await start(update, context)
-        return
-    if text == "⚡ Get Signal":
-        await query_wrapper(update, context, "choose_pair")
-        return
-    if text == "🤖 Bot Pick Pair":
-        await query_wrapper(update, context, "bot_pick_pair")
-        return
-    if text == "💎 Upgrade":
-        await query_wrapper(update, context, "pay_info")
-        return
-    if text == "📊 My Stats":
-        await query_wrapper(update, context, "my_stats")
-        return
-    if text == "ℹ️ Help":
-        await help_command(update, context)
+    if text == "🏆 EVALON MENU":
+        # Show full inline menu
+        user  = get_user(user_id)
+        lic   = is_licensed(user_id)
+        plan  = user.get("licence_type", "").capitalize() if lic else "Free"
+        await update.message.reply_text(
+            "⚡ *EVALON MASTER PRO*\n\n"
+            "👤 Plan: *{}*\n\n"
+            "Choose an option:".format(plan),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Get Signal",        callback_data="choose_pair")],
+                [InlineKeyboardButton("🤖 Bot Pick Pair",     callback_data="bot_pick_pair")],
+                [InlineKeyboardButton("📊 My Stats",          callback_data="my_stats")],
+                [InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")],
+                [InlineKeyboardButton("ℹ️ Help",              callback_data="help_inline")],
+            ])
+        )
         return
 
     # Admin: block/unblock/list blocked users
