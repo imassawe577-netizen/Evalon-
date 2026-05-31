@@ -4810,7 +4810,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
 
-        buttons.append([InlineKeyboardButton("🔙 Back to Pairs", callback_data="choose_pair")])
         kb = InlineKeyboardMarkup(buttons)
 
         await q.edit_message_text(
@@ -5819,22 +5818,18 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         otc_on       = is_otc_enabled()
         force_non_otc = not otc_on
 
-        # Get top 5 from virtual trading engine stats
-        if force_non_otc:
+        # Get top 5 — weekend=OTC only, weekday=Forex only
+        if force_non_otc or not weekend:
             top5 = get_top5_pairs(non_otc_only=True)
-        elif weekend:
-            top5 = get_top5_pairs(otc_only=True)
         else:
-            top5 = get_top5_pairs()
+            top5 = get_top5_pairs(otc_only=True)
 
-        # Fallback: if not enough virtual data yet, pick random
+        # Fallback
         if len(top5) < 3:
-            if force_non_otc:
-                pool = [p for p in ALL_PAIRS if "OTC" not in p]
-            elif weekend:
-                pool = [p for p in ALL_PAIRS if "OTC" in p]
+            if not weekend:
+                pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
             else:
-                pool = list(ALL_PAIRS)
+                pool = [p for p in ALL_PAIRS if "OTC" in p]
             random.shuffle(pool)
             existing = {r["pair"] for r in top5}
             for p in pool:
@@ -5858,7 +5853,6 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
                 continue
             buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
 
-        buttons.append([InlineKeyboardButton("🔙 Back to Pairs", callback_data="choose_pair")])
         kb = InlineKeyboardMarkup(buttons)
 
         await update.message.reply_text(
