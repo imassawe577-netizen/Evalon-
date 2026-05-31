@@ -4798,7 +4798,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
 
-        buttons.append([InlineKeyboardButton("📋 Choose Myself", callback_data="choose_pair")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Pairs", callback_data="choose_pair")])
         kb = InlineKeyboardMarkup(buttons)
 
         await q.edit_message_text(
@@ -5888,7 +5888,7 @@ async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data
                 continue
             buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
 
-        buttons.append([InlineKeyboardButton("📋 Choose Myself", callback_data="choose_pair")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Pairs", callback_data="choose_pair")])
         kb = InlineKeyboardMarkup(buttons)
 
         await update.message.reply_text(
@@ -6447,22 +6447,66 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
     if text == "🏆 EVALON MENU":
-        # Show full inline menu
         user  = get_user(user_id)
         lic   = is_licensed(user_id)
         plan  = user.get("licence_type", "").capitalize() if lic else "Free"
+
+        # Build pairs keyboard with option buttons at the bottom
+        _MAX_BUTTONS = 95
+        weekend = is_weekend()
+        all_p = [p for p in ALL_PAIRS if ("OTC" in p) or ("OTC" not in p and "/" in p and "BTC" not in p)]
+        if weekend:
+            all_p = [p for p in ALL_PAIRS if "OTC" in p]
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair,
+                               ROUND(wins::numeric / NULLIF(wins+losses,0)*100,1) AS win_rate,
+                               (wins+losses) AS total,
+                               COALESCE(consecutive_wins,0) AS consecutive_wins
+                        FROM pair_stats WHERE pair = ANY(%s)
+                    """, (all_p,))
+                    _wr = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0), int(r["consecutive_wins"] or 0))
+                           for r in cur.fetchall()}
+        except Exception:
+            _wr = {}
+
+        def _sk(p):
+            wr, total, cw = _wr.get(p, (0,0,0))
+            return (-(cw >= 3), -wr, -total)
+
+        known   = sorted([p for p in all_p if p in _wr and _wr[p][1] >= 3], key=_sk)
+        unknown = [p for p in all_p if p not in known]
+        pairs   = (known + unknown)[:_MAX_BUTTONS]
+
+        rows = []
+        row  = []
+        # Session header
+        sess_line = _session_header_text()
+        if sess_line:
+            rows.append([InlineKeyboardButton(sess_line, callback_data="noop")])
+        # Pairs 3 per row
+        for pair in pairs:
+            i = pair_to_idx(pair)
+            if i is None: continue
+            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+            if len(row) == 3:
+                rows.append(row); row = []
+        if row: rows.append(row)
+        # Option buttons at the bottom
+        rows.append([InlineKeyboardButton("🤖 Bot Pick Pair", callback_data="bot_pick_pair")])
+        rows.append([InlineKeyboardButton("📊 My Stats",      callback_data="my_stats")])
+        if not lic:
+            rows.append([InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")])
+        rows.append([InlineKeyboardButton("ℹ️ Help",          callback_data="help_inline")])
+
         await update.message.reply_text(
             "⚡ *EVALON MASTER PRO*\n\n"
             "👤 Plan: *{}*\n\n"
-            "Choose an option:".format(plan),
+            "📊 Select your trading pair:".format(plan),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚡ Get Signal",        callback_data="choose_pair")],
-                [InlineKeyboardButton("🤖 Bot Pick Pair",     callback_data="bot_pick_pair")],
-                [InlineKeyboardButton("📊 My Stats",          callback_data="my_stats")],
-            ] + ([] if lic else [[InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")]]) + [
-                [InlineKeyboardButton("ℹ️ Help",              callback_data="help_inline")],
-            ])
+            reply_markup=InlineKeyboardMarkup(rows)
         )
         return
 
