@@ -1336,10 +1336,10 @@ def _fetch_1h_trend(pair):
 
 def _confirm_1h_direction(pair, direction):
     """
-    Smart check: kama signal ya chini (1m/2m) ni SELL,
-    Check if recent 1H candles are trending down
-    Returns True kama 1H inathibitisha direction, False kama inapingana.
-    Hii ni accuracy layer ya ziada — kama 1H haina data, rudi True (proceed).
+    Smart check: if short-TF signal (1m/2m) is SELL,
+    verify recent 1H candles are trending down.
+    Returns True if 1H confirms direction, False if it opposes.
+    Extra accuracy layer — if no 1H data, return True (proceed).
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     symbol = YAHOO_SYMBOLS.get(real_pair)
@@ -2086,8 +2086,8 @@ def _check_pip_movement(pair):
     """
     Check average pip movement for this pair.
     Returns (avg_movement_pct, category) where category is:
-      'HIGH'   — pair inasogea sana (>0.12%) → 1m ya kutosha
-      'MEDIUM' — (0.06-0.12%) → 2m bora
+      'HIGH'   — pair moves a lot (>0.12%) → 1m is sufficient
+      'MEDIUM' — (0.06-0.12%) → 2m recommended
       'LOW'    — (<0.06%) → 3m, small movement
     Prefers VTE data from DB, falls back to Yahoo Finance.
     """
@@ -2136,6 +2136,52 @@ def _check_pip_movement(pair):
 # ============================================================
 _ATR_DEAD_THRESHOLD = 0.015  # % — below this = dead market, no signal
 _FORCE_PAIRS = set()  # Admin-forced pairs — bypass flat/dead market filter
+
+# ── ADMIN FILTER TOGGLES ─────────────────────────────────────
+# Admin anaweza kuzima/kuwasha filters hizi kwa /filteroff na /filteron
+_FILTER_FLAGS = {
+    "news":        True,   # News time block
+    "dead":        True,   # Dead market / ATR filter
+    "conflict":    True,   # 1H vs short-TF conflict filter
+    "stability":   True,   # Signal stability / flip filter
+    "confluence":  True,   # Min confluence filter (indicators_agree)
+    "h1confirm":   True,   # 1H candle confirmation gate
+    "micro_trend": True,   # Micro-candle trend filter (5s/10s/15s green-red ratio)
+}
+
+def is_filter_on(name):
+    """Returns True if filter is ON (active)."""
+    return _FILTER_FLAGS.get(name, True)
+
+def set_filter(name, state: bool):
+    """Washa (True) au zima (False) filter."""
+    if name in _FILTER_FLAGS:
+        _FILTER_FLAGS[name] = state
+        return True
+    return False
+
+def get_filters_status():
+    """Rudisha status ya filters zote kwa admin."""
+    lines = []
+    icons = {"news": "📰", "dead": "💀", "conflict": "⚔️",
+             "stability": "📉", "confluence": "🔀", "h1confirm": "1️⃣",
+             "micro_trend": "🕯"}
+    descs = {
+        "news":        "News time block",
+        "dead":        "Dead market (ATR) filter",
+        "conflict":    "1H vs short-TF conflict",
+        "stability":   "Signal stability filter",
+        "confluence":  "Min confluence gate",
+        "h1confirm":   "1H candle confirmation",
+        "micro_trend": "Micro-candle trend (5s/10s/15s)",
+    }
+    for name, state in _FILTER_FLAGS.items():
+        icon = icons.get(name, "🔧")
+        desc = descs.get(name, name)
+        status = "✅ ON" if state else "🔴 OFF"
+        lines.append("{} *{}* — {} `[{}]`".format(icon, desc, status, name))
+    return "\n".join(lines)
+# ─────────────────────────────────────────────────────────────
 
 
 def is_force_pair(pair):
@@ -2815,20 +2861,20 @@ def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=Fa
 
 def _force_signal_from_micro(pair, signal_type):
     """
-    Fallback ya mwisho — angalia candles 100 za nyuma za micro timeframe.
+    Last-resort fallback — scan last 100 micro-timeframe candles.
 
     Micro TF per signal type:
       signal_type 1 = 5s  proxy → Finnhub/Yahoo 1m candles 100
       signal_type 2 = 10s proxy → Finnhub/Yahoo 1m candles 100
       signal_type 3 = 15s proxy → Finnhub/Yahoo 1m candles 100
 
-    Mantiki:
-      - Hesabu candles 100 za mwisho
-      - close > open = kijani (bullish win)
-      - close < open = nyekundu (bearish win)
-      - Yenye win nyingi inaonyesha mwelekeo wa kweli wa soko
-      - Kijani nyingi → BUY, Nyekundu nyingi → SELL
-      - Daima inatoa signal — haishindwi kamwe
+    Logic:
+      - Count last 100 candles
+      - close > open = green (bullish)
+      - close < open = red (bearish)
+      - Majority direction shows true market trend
+      - More green → BUY, more red → SELL
+      - Always returns a signal — never fails
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     yf_sym    = YAHOO_SYMBOLS.get(real_pair)
@@ -2906,14 +2952,14 @@ def _force_signal_from_micro(pair, signal_type):
 def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
     """
     Full MTF engine with guaranteed signal fallback.
-    Order ya jaribu:
+    Attempt order:
       1. Full confirmation (4/4)
       2. Near confirmation (3/4) — trend >= 55%
       3. 2/4 confirmation — trend >= 45%
-      4. 1/4 (micro direction tu)
-      5. Micro history fallback — DAIMA inatoa signal
+      4. 1/4 (micro direction only)
+      5. Micro history fallback — always returns a signal
 
-    signal_type: 1/2/3 au None (jaribu zote)
+    signal_type: 1/2/3 or None (try all)
     """
     # For OTC — skip MTF entirely, return None so generate_signal runs
     if "OTC" in pair:
@@ -3431,13 +3477,151 @@ if _NN_AVAILABLE:
 # ── END NN MODULE ─────────────────────────────────────────────
 
 
+def _micro_candle_trend_score(pair):
+    """
+    Analyze micro-candle green/red ratio for 5s, 10s, 15s timeframes.
+    Uses last 20 x 1m candles from Yahoo/Finnhub as proxy.
+
+    Rules:
+      1m signal → check 5s proxy (last 20 x 1m candles, split into ~5s buckets)
+      2m signal → check 10s proxy
+      3m signal → check 15s proxy
+
+    For each TF, count green (close > open) vs red (close < open).
+    A TF "supports" BUY if green% >= 60%, supports SELL if red% >= 60%.
+
+    Returns dict:
+      {
+        "1": {"direction": "BUY"/"SELL"/"FLAT", "green_pct": float, "red_pct": float, "support": float},
+        "2": {...},
+        "3": {...},
+        "best_tf": 1/2/3,          # TF with strongest support for direction
+        "best_dir": "BUY"/"SELL",
+        "best_support": float,
+      }
+    Or None if no data available.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+    fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
+
+    # Fetch 1m candles — primary source
+    opens_arr  = []
+    closes_arr = []
+
+    # Try Finnhub first
+    if fh_sym:
+        try:
+            df = _mtf_fh_candles(fh_sym, "1", 60)
+            if df is not None and len(df) >= 15:
+                opens_arr  = df["Open"].astype(float).tolist()
+                closes_arr = df["Close"].astype(float).tolist()
+        except Exception:
+            pass
+
+    # Yahoo fallback
+    if not opens_arr and yf_sym:
+        try:
+            import yfinance as yf
+            df = yf.download(yf_sym, period="1d", interval="1m",
+                             progress=False, auto_adjust=True)
+            if df is not None and len(df) >= 15:
+                opens_arr  = df["Open"].squeeze().astype(float).tolist()
+                closes_arr = df["Close"].squeeze().astype(float).tolist()
+        except Exception:
+            pass
+
+    if not opens_arr or len(opens_arr) < 10:
+        return None
+
+    # Use last 60 candles max
+    opens_arr  = opens_arr[-60:]
+    closes_arr = closes_arr[-60:]
+    total_c    = len(opens_arr)
+
+    results = {}
+
+    # Each signal_type maps to a bucket_size (proxy for seconds interval)
+    # 5s  → bucket of 1 candle  (finest granularity from 1m data)
+    # 10s → bucket of 2 candles
+    # 15s → bucket of 3 candles
+    bucket_map = {1: 1, 2: 2, 3: 3}  # signal_type → candles per bucket
+
+    for sig_type, bucket in bucket_map.items():
+        green = red = 0
+        # Build buckets: each bucket = N consecutive 1m candles merged
+        i = 0
+        while i + bucket <= total_c:
+            o = opens_arr[i]
+            c = closes_arr[i + bucket - 1]  # close of last candle in bucket
+            if c > o:
+                green += 1
+            elif c < o:
+                red += 1
+            i += bucket
+
+        total_b = green + red
+        if total_b == 0:
+            results[str(sig_type)] = {"direction": "FLAT", "green_pct": 50.0,
+                                       "red_pct": 50.0, "support": 0.0}
+            continue
+
+        green_pct = green / total_b * 100
+        red_pct   = red   / total_b * 100
+
+        if green_pct >= 60:
+            direction = "BUY"
+            support   = green_pct
+        elif red_pct >= 60:
+            direction = "SELL"
+            support   = red_pct
+        else:
+            direction = "FLAT"
+            support   = max(green_pct, red_pct)
+
+        results[str(sig_type)] = {
+            "direction": direction,
+            "green_pct": round(green_pct, 1),
+            "red_pct":   round(red_pct, 1),
+            "support":   round(support, 1),
+        }
+
+    if not results:
+        return None
+
+    # Find best TF: highest support score that has a clear direction (not FLAT)
+    best_tf      = None
+    best_support = 0.0
+    best_dir     = None
+
+    for sig_type in [1, 2, 3]:
+        r = results.get(str(sig_type))
+        if r and r["direction"] != "FLAT" and r["support"] > best_support:
+            best_support = r["support"]
+            best_tf      = sig_type
+            best_dir     = r["direction"]
+
+    results["best_tf"]      = best_tf
+    results["best_dir"]     = best_dir
+    results["best_support"] = best_support
+
+    logging.info("MICRO TREND {}: 1m={} 2m={} 3m={} → best={}m({}) support={:.1f}%".format(
+        pair,
+        results.get("1", {}).get("direction", "?"),
+        results.get("2", {}).get("direction", "?"),
+        results.get("3", {}).get("direction", "?"),
+        best_tf, best_dir, best_support
+    ))
+    return results
+
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
     yahoo_available = True
 
     # News filter — block non-OTC signals during high-impact events
-    if not is_otc:
+    if not is_otc and is_filter_on("news"):
         _near_news, _news_name = is_news_time()
         if _near_news:
             logging.info("NEWS FILTER: blocking signal for {} — {}".format(pair, _news_name))
@@ -3519,12 +3703,12 @@ def generate_signal(pair):
 
     # ── D: VOLATILITY (ATR) CHECK — dead market filter ────────
     atr_pct, is_dead_market = 0.05, False
-    if not is_otc and not is_force_pair(pair):
+    if not is_otc and not is_force_pair(pair) and is_filter_on("dead"):
         try:
             atr_pct, is_dead_market = _check_volatility(pair)
         except Exception as _e:
             logging.warning("volatility check failed {}: {}".format(pair, _e))
-    if is_dead_market:
+    if is_dead_market and is_filter_on("dead"):
         logging.info("DEAD MARKET FILTER: {} ATR={:.4f}% < {:.3f}%".format(
             pair, atr_pct, _ATR_DEAD_THRESHOLD))
         return {
@@ -3767,8 +3951,8 @@ def generate_signal(pair):
             direction = "BUY" if b > s else "SELL"
 
     # ── MINIMUM CONFLUENCE ───────────────────────────────────
-    min_confluence = 6 if not is_otc else 5   # Non-OTC requires stronger evidence
-    if indicators_agree < min_confluence:
+    min_confluence = 4 if not is_otc else 3   # Lowered: was 6/5 — less blocking
+    if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
         for buy_c, sell_c in checks:
@@ -3841,13 +4025,61 @@ def generate_signal(pair):
         else:
             timeframe = 3
 
+    # ── MICRO-CANDLE TREND FILTER ─────────────────────────────
+    # For each TF: 1m checks 5s trend, 2m checks 10s trend, 3m checks 15s trend.
+    # Rules:
+    #   BUY  signal: micro trend for chosen TF must show green >= 60%
+    #   SELL signal: micro trend for chosen TF must show red  >= 60%
+    # If chosen TF does not support direction, try next TF.
+    # Final TF chosen = one with strongest support matching signal direction.
+    # If no TF supports direction → keep timeframe from above (no block).
+    if is_filter_on("micro_trend") and not is_otc:
+        try:
+            _micro = _micro_candle_trend_score(pair)
+            if _micro is not None:
+                # Check if current timeframe supports the direction
+                _tf_scores = {}
+                for _st in [1, 2, 3]:
+                    _r = _micro.get(str(_st))
+                    if _r and _r["direction"] == direction:
+                        _tf_scores[_st] = _r["support"]
+
+                if _tf_scores:
+                    # Pick TF with highest support matching signal direction
+                    best_micro_tf = max(_tf_scores, key=_tf_scores.get)
+                    best_micro_support = _tf_scores[best_micro_tf]
+                    # Only override if support is meaningful (>= 60%)
+                    if best_micro_support >= 60.0:
+                        timeframe = best_micro_tf
+                        logging.info("MICRO TREND TF override {}: {}m (support={:.1f}% {})".format(
+                            pair, timeframe, best_micro_support, direction))
+                    # If chosen TF from above doesn't support direction — try to find one that does
+                    elif timeframe not in _tf_scores:
+                        # Current TF doesn't support — pick best available or keep current
+                        if _tf_scores:
+                            timeframe = max(_tf_scores, key=_tf_scores.get)
+                            logging.info("MICRO TREND TF adjust {}: {}m (no support on chosen TF)".format(
+                                pair, timeframe))
+                else:
+                    # No TF supports direction — micro trend is flat or opposing
+                    # Check if micro best_dir aligns with trend_1h — if so flip to micro
+                    if _micro.get("best_dir") == trend_1h and _micro.get("best_dir") is not None:
+                        direction = _micro["best_dir"]
+                        timeframe = _micro["best_tf"] or timeframe
+                        logging.info("MICRO TREND direction override {}: {} tf={}m".format(
+                            pair, direction, timeframe))
+                    # Otherwise keep existing direction/timeframe — no block
+        except Exception as _me:
+            logging.warning("micro_candle_trend_score failed {}: {}".format(pair, _me))
+    # ─────────────────────────────────────────────────────────
+
     # ── NON-OTC: Weak confluence → flip direction opposite to 1H ──
-    if not is_otc and indicators_agree < 6 and vte_tf is None:
+    if not is_otc and is_filter_on("confluence") and indicators_agree < 4 and vte_tf is None:
         if trend_1h is not None:
             direction = "SELL" if trend_1h == "BUY" else "BUY"
-            timeframe = timeframe if timeframe > 0 else 2
+            timeframe = timeframe if timeframe > 0 else 3  # Never block — use 3m
         elif not yahoo_available:
-            timeframe = 0  # True no-signal: no data available
+            timeframe = 3  # No data — use 3m instead of blocking
 
     # ── OTC: Random flip/follow logic ────────────────────────
     # Each signal independently decides: follow the market or go against it.
@@ -3866,7 +4098,7 @@ def generate_signal(pair):
 
     # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
     # OTC always forces a signal — no blocking on 1H confirmation.
-    if not is_otc and timeframe <= 2:
+    if not is_otc and is_filter_on("h1confirm") and timeframe <= 2:
         h1_confirmed = _confirm_1h_direction(pair, direction)
         if not h1_confirmed:
             if timeframe == 1:
@@ -3876,7 +4108,7 @@ def generate_signal(pair):
                 timeframe = 3
                 h1_confirmed = _confirm_1h_direction(pair, direction)
             if not h1_confirmed:
-                timeframe = 0
+                timeframe = 3  # Bump to 3m instead of blocking (timeframe=0)
 
     # ── SESSION-AWARE CONTRARIAN OVERRIDE ────────────────────
     session = _get_session()
@@ -3905,7 +4137,7 @@ def generate_signal(pair):
 
     # ── 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) ────────
     # If 1H trend is clear but 5m+15m real data strongly disagrees → no signal
-    if not is_otc and trend_1h is not None and real is not None:
+    if not is_otc and trend_1h is not None and real is not None and is_filter_on("conflict"):
         tv = real.get("tf_buy_votes", 0)
         sv = real.get("tf_sell_votes", 0)
         tf_total = real.get("tf_count", 1)
@@ -3930,7 +4162,7 @@ def generate_signal(pair):
 
     # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
     # OTC always produces a signal — stability filter does not apply.
-    if not is_otc and not _check_signal_stability(pair, direction, window_minutes=5):
+    if not is_otc and is_filter_on("stability") and not _check_signal_stability(pair, direction, window_minutes=5):
         timeframe = 0
         record_signal(pair, direction)
         return {
@@ -4516,6 +4748,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/toggleotc` — Enable or disable OTC pairs\n"
             "• OTC OFF → show non-OTC pairs only\n"
             "• OTC ON  → all pairs visible (default)\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🎛 *SIGNAL FILTERS*\n"
+            "`/filterstatus` — Angalia hali ya filters zote\n"
+            "`/filteroff news` — Zima news block filter\n"
+            "`/filteroff dead` — Zima dead market filter\n"
+            "`/filteroff conflict` — Zima 1H vs short-TF filter\n"
+            "`/filteroff stability` — Zima signal stability filter\n"
+            "`/filteroff confluence` — Zima min confluence filter\n"
+            "`/filteroff h1confirm` — Zima 1H candle gate\n"
+            "`/filteroff micro_trend` — Zima micro-candle trend filter\n"
+            "`/filteroff all` — Zima FILTERS ZOTE\n"
+            "`/filteron [name|all]` — Washa filter/filters\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔓 *FORCE PAIR*\n"
             "`/forcepair EURUSD OTC` — bypass flat filter for pair\n"
@@ -5362,12 +5606,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mtf_result = None
         if _is_non_otc_pair:
             try:
-                _mtf_result = run_mtf_signal_engine_with_fallback(pair)
+                _mtf_result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, run_mtf_signal_engine_with_fallback, pair
+                    ),
+                    timeout=18.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning("MTF timeout for {} — skipping MTF".format(pair))
+                _mtf_result = None
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
         try:
-            sig = generate_signal(pair)
+            sig = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, generate_signal, pair),
+                timeout=25.0
+            )
+        except asyncio.TimeoutError:
+            logging.warning("generate_signal timeout in getmore for {}".format(pair))
+            try: await cm.delete()
+            except: pass
+            _nsm = await context.bot.send_message(
+                chat_id=chat,
+                text="🟡 *No clear signal available*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                ])
+            )
+            save_last_bot_msg(user_id, _nsm.message_id)
+            return
         except Exception as _sig_e:
             logging.warning("generate_signal failed in getmore {}: {}".format(pair, _sig_e))
             try: await cm.delete()
@@ -5409,17 +5678,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sig.get("flat") and sig["timeframe"] == 0:
             try: await cm.delete()
             except: pass
-            is_gm_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-            reason = sig.get("no_signal_reason", "")
-            if is_gm_non_otc:
-                extra = ""
-                if "conflict" in reason:
-                    extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
-                elif "flip" in reason:
-                    extra = "\n\n_Market direction changed too quickly — waiting for stability._"
-                msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
-            else:
-                msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
+            msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
@@ -5435,15 +5694,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
         if trend_dir is not None:
             direction = trend_dir
-        elif gm_is_non_otc_check and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
+        elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 4):
             try: await cm.delete()
             except: pass
             reason = sig.get("no_signal_reason", "")
-            extra = ""
-            if "conflict" in reason:
-                extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
-            elif "flip" in reason:
-                extra = "\n\n_Market direction changed too quickly — waiting for stability._"
             _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
@@ -5454,7 +5708,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             save_last_bot_msg(user_id, _nsm.message_id)
             return
-        elif sig.get("indicators_agree", 7) < 4:
+        elif is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
             try: await cm.delete()
             except: pass
             _nsm = await context.bot.send_message(
@@ -6419,6 +6673,81 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             return
+
+        # ── FILTER CONTROL COMMANDS ──────────────────────────
+        if text == "/filterstatus":
+            await update.message.reply_text(
+                "🎛 *SIGNAL FILTERS STATUS*\n\n"
+                "{}\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Zima: `/filteroff news` au `/filteroff all`\n"
+                "Washa: `/filteron news` au `/filteron all`".format(get_filters_status()),
+                parse_mode="Markdown"
+            )
+            return
+
+        if text.startswith("/filteroff"):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if not arg:
+                await update.message.reply_text(
+                    "Usage: `/filteroff [name|all]`\n\n"
+                    "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
+                    "Au: `/filteroff all` — zima zote",
+                    parse_mode="Markdown"
+                )
+                return
+            if arg == "all":
+                for k in _FILTER_FLAGS:
+                    _FILTER_FLAGS[k] = False
+                await update.message.reply_text(
+                    "🔴 *All filters disabled*\n\nBot will always produce a signal without blocking.",
+                    parse_mode="Markdown"
+                )
+            elif arg in _FILTER_FLAGS:
+                _FILTER_FLAGS[arg] = False
+                await update.message.reply_text(
+                    "🔴 *Filter zimwa:* `{}`\n\n{}".format(arg, get_filters_status()),
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Filter haijulikani: `{}`\n\nNames sahihi: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
+                    parse_mode="Markdown"
+                )
+            return
+
+        if text.startswith("/filteron"):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if not arg:
+                await update.message.reply_text(
+                    "Usage: `/filteron [name|all]`\n\n"
+                    "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
+                    "Au: `/filteron all` — washa zote",
+                    parse_mode="Markdown"
+                )
+                return
+            if arg == "all":
+                for k in _FILTER_FLAGS:
+                    _FILTER_FLAGS[k] = True
+                await update.message.reply_text(
+                    "✅ *Filters ZOTE zimewashwa*\n\n{}".format(get_filters_status()),
+                    parse_mode="Markdown"
+                )
+            elif arg in _FILTER_FLAGS:
+                _FILTER_FLAGS[arg] = True
+                await update.message.reply_text(
+                    "✅ *Filter washa:* `{}`\n\n{}".format(arg, get_filters_status()),
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Filter haijulikani: `{}`\n\nNames sahihi: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
+                    parse_mode="Markdown"
+                )
+            return
+        # ─────────────────────────────────────────────────────
 
     # /refer command — user yeyote
     if update.message.text and update.message.text.strip() == "/refer":
