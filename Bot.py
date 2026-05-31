@@ -63,6 +63,19 @@ import asyncio as _asyncio
 from collections import defaultdict as _defaultdict
 from datetime import datetime as _dt
 
+# ── NN IMPORTS ───────────────────────────────────────────────
+try:
+    import numpy as np
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.exceptions import NotFittedError
+    import pickle, os as _os_nn
+    _NN_AVAILABLE = True
+except ImportError:
+    _NN_AVAILABLE = False
+    logging.warning("scikit-learn/numpy not installed — NN disabled. Run: pip install scikit-learn numpy")
+# ─────────────────────────────────────────────────────────────
+
 # Deriv symbol mapping — Pocket Option pair → Deriv symbol
 DERIV_SYMBOLS = {
     "EUR/USD": "frxEURUSD",
@@ -1882,7 +1895,19 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
     else:
         result_text = "💔 *EVALON {}* TF {}M — *LOSS* ❌".format(pair, timeframe_mins)
 
+    # ── NN FEEDBACK: feed trade outcome back to neural network ──
+    try:
+        nn_feedback_from_vte(user_id, pair, won)
+    except Exception as _nn_e:
+        logging.warning("NN feedback error: {}".format(_nn_e))
+    # ────────────────────────────────────────────────────────────
+
     if not is_results_enabled():
+        update_pair_stats(pair, won, was_reversed=was_reversed)
+        return
+
+    # OTC pairs — update stats internally but don't send result to user
+    if "OTC" in pair:
         update_pair_stats(pair, won, was_reversed=was_reversed)
         return
 
@@ -2061,6 +2086,169 @@ def _check_pip_movement(pair):
             return avg, "LOW"
     except Exception:
         return 0.08, "MEDIUM"
+
+
+# ============================================================
+# D — SPREAD/VOLATILITY (ATR) CHECK
+# ============================================================
+_ATR_DEAD_THRESHOLD = 0.015  # % — below this = dead market, no signal
+
+def _check_volatility(pair):
+    """
+    Calculate ATR(14) on 5m candles.
+    Returns (atr_pct, is_dead) where is_dead=True means market too flat.
+    Falls back to (0.05, False) if no data.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol    = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return 0.05, False
+    try:
+        df = yf.download(symbol, period="1d", interval="5m", progress=False, auto_adjust=True)
+        if df is None or len(df) < 15:
+            return 0.05, False
+        high  = df["High"].squeeze().astype(float)
+        low   = df["Low"].squeeze().astype(float)
+        close = df["Close"].squeeze().astype(float)
+        tr = pd.Series([
+            max(float(high.iloc[i]) - float(low.iloc[i]),
+                abs(float(high.iloc[i]) - float(close.iloc[i-1])),
+                abs(float(low.iloc[i])  - float(close.iloc[i-1])))
+            for i in range(1, len(close))
+        ])
+        atr14     = float(tr.rolling(14).mean().iloc[-1])
+        price_now = float(close.iloc[-1])
+        atr_pct   = atr14 / (price_now + 1e-9) * 100
+        is_dead   = atr_pct < _ATR_DEAD_THRESHOLD
+        return round(atr_pct, 4), is_dead
+    except Exception as e:
+        logging.warning("_check_volatility {} failed: {}".format(pair, e))
+        return 0.05, False
+
+
+# ============================================================
+# L — FIBONACCI RETRACEMENT LEVELS
+# ============================================================
+_FIB_LEVELS = [0.236, 0.382, 0.500, 0.618, 0.786]
+_FIB_ZONE   = 0.008  # ±0.8% of price counts as "near a level"
+
+def _check_fibonacci(pair, direction):
+    """
+    Calculate Fibonacci retracement from recent swing high/low (last 50 candles, 5m).
+    Returns (fib_bonus_buy, fib_bonus_sell, nearest_level_str).
+    Near support level → BUY bonus. Near resistance → SELL bonus.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol    = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return 0, 0, None
+    try:
+        df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+        if df is None or len(df) < 20:
+            return 0, 0, None
+        high  = df["High"].squeeze().astype(float)
+        low   = df["Low"].squeeze().astype(float)
+        close = df["Close"].squeeze().astype(float)
+        # Swing high/low from last 50 candles
+        window = min(50, len(df))
+        swing_high = float(high.iloc[-window:].max())
+        swing_low  = float(low.iloc[-window:].min())
+        price      = float(close.iloc[-1])
+        rng        = swing_high - swing_low
+        if rng < 1e-9:
+            return 0, 0, None
+
+        fib_buy_bonus  = 0
+        fib_sell_bonus = 0
+        nearest        = None
+        nearest_dist   = 999
+
+        for level in _FIB_LEVELS:
+            # Support level (retracement from top)
+            support    = swing_high - level * rng
+            resistance = swing_low  + level * rng
+            dist_sup = abs(price - support)   / (price + 1e-9)
+            dist_res = abs(price - resistance) / (price + 1e-9)
+
+            if dist_sup < _FIB_ZONE:
+                bonus = 20 if level in (0.382, 0.618) else 12
+                fib_buy_bonus = max(fib_buy_bonus, bonus)
+                if dist_sup < nearest_dist:
+                    nearest_dist = dist_sup
+                    nearest = "Fib {:.1%} support".format(level)
+
+            if dist_res < _FIB_ZONE:
+                bonus = 20 if level in (0.382, 0.618) else 12
+                fib_sell_bonus = max(fib_sell_bonus, bonus)
+                if dist_res < nearest_dist:
+                    nearest_dist = dist_res
+                    nearest = "Fib {:.1%} resistance".format(level)
+
+        return fib_buy_bonus, fib_sell_bonus, nearest
+    except Exception as e:
+        logging.warning("_check_fibonacci {} failed: {}".format(pair, e))
+        return 0, 0, None
+
+
+# ============================================================
+# M — PRICE ACTION SCORE (Higher Highs / Lower Lows)
+# ============================================================
+def _price_action_score(pair):
+    """
+    Analyze last 10 candles for higher highs / lower lows structure.
+    Returns (pa_buy_bonus, pa_sell_bonus, trend_str).
+    Strong uptrend (HH+HL) → BUY bonus. Downtrend (LH+LL) → SELL bonus.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol    = YAHOO_SYMBOLS.get(real_pair)
+    if not symbol:
+        return 0, 0, None
+    try:
+        df = yf.download(symbol, period="1d", interval="5m", progress=False, auto_adjust=True)
+        if df is None or len(df) < 12:
+            return 0, 0, None
+        high  = df["High"].squeeze().astype(float).values[-12:]
+        low   = df["Low"].squeeze().astype(float).values[-12:]
+        close = df["Close"].squeeze().astype(float).values[-12:]
+
+        # Count HH/HL (bullish) and LH/LL (bearish) over last 10 swings
+        hh = hl = lh = ll = 0
+        for i in range(1, len(high)):
+            if high[i] > high[i-1]: hh += 1
+            else:                    lh += 1
+            if low[i] > low[i-1]:   hl += 1
+            else:                    ll += 1
+
+        bull_score = hh + hl   # max 22
+        bear_score = lh + ll
+
+        # Momentum of last 3 closes
+        momentum_bull = close[-1] > close[-2] > close[-3]
+        momentum_bear = close[-1] < close[-2] < close[-3]
+
+        pa_buy  = 0
+        pa_sell = 0
+        trend_str = None
+
+        if bull_score >= 16:
+            pa_buy = 25
+            trend_str = "Strong uptrend (HH+HL)"
+            if momentum_bull: pa_buy += 10
+        elif bull_score >= 12:
+            pa_buy = 15
+            trend_str = "Moderate uptrend"
+        elif bear_score >= 16:
+            pa_sell = 25
+            trend_str = "Strong downtrend (LH+LL)"
+            if momentum_bear: pa_sell += 10
+        elif bear_score >= 12:
+            pa_sell = 15
+            trend_str = "Moderate downtrend"
+
+        return pa_buy, pa_sell, trend_str
+    except Exception as e:
+        logging.warning("_price_action_score {} failed: {}".format(pair, e))
+        return 0, 0, None
 
 
 def _check_signal_history_bias(pair, direction, window=15):
@@ -2748,6 +2936,452 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
     return _force_signal_from_micro(pair, st)
 
 
+# ============================================================
+# NEURAL NETWORK SIGNAL FILTER — ENHANCED
+# ============================================================
+# Features:
+#   1. Per-pair models  — each pair has its own trained model
+#   2. Session-aware    — session (London/NY/Asian) added as feature
+#   3. Scheduled retrain — every 6 hours automatically
+#   4. Admin /nnstats   — live stats command
+#
+# Architecture: MLPClassifier (2 hidden layers: 64→32 neurons)
+# Input features (14): rsi, sto, ma_diff, macd, bb_pos, mom, vol,
+#   candle, trend_1h_num, vwap_dir_num, mtf_score, indicators_agree,
+#   session_num, is_otc
+# Output: probability of WIN
+# Training: self-supervised from VTE win/loss results
+# ─────────────────────────────────────────────────────────────
+
+_NN_MODEL_DIR        = "/tmp/evalon_nn_models"
+_NN_GLOBAL_FILE      = "/tmp/evalon_nn_models/global_model.pkl"
+_NN_SCALER_FILE      = "/tmp/evalon_nn_models/global_scaler.pkl"
+_NN_MIN_SAMPLES      = 40    # Minimum before NN activates
+_NN_MIN_PAIR_SAMPLES = 25    # Minimum per-pair samples before pair model activates
+_NN_CONFIDENCE_THRESHOLD = 0.62
+_NN_RETRAIN_HOURS    = 6     # Scheduled retrain interval
+
+# In-memory model cache
+_nn_global_model  = None
+_nn_global_scaler = None
+_nn_per_pair      = {}   # {pair: {"model": m, "scaler": s, "samples": n, "acc": f}}
+_nn_training_data = []   # [(features_14, label), ...]
+_nn_pair_data     = {}   # {pair: [(features_14, label), ...]}
+_nn_last_retrain  = None # datetime of last retrain
+_nn_total_flips   = 0    # how many times NN flipped direction
+_nn_flip_wins     = 0    # how many flips turned out correct (won)
+
+# Session number mapping for NN feature
+_NN_SESSION_MAP = {
+    "London Open":  1.0,
+    "NY/London":    0.8,
+    "NY Session":   0.6,
+    "Asian":       -0.5,
+    "Dead Hours":  -1.0,
+    "Pre-London":   0.3,
+}
+
+if _NN_AVAILABLE:
+    try:
+        _os_nn.makedirs(_NN_MODEL_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _nn_session_num():
+    """Return numeric session value for NN feature."""
+    try:
+        sess = _get_session()
+        return _NN_SESSION_MAP.get(sess.get("name", ""), 0.0)
+    except Exception:
+        return 0.0
+
+
+def _nn_features_from_signal(sig_dict, rsi, sto, ma_diff, macd, bb_pos, mom, vol, candle):
+    """
+    Extract 14 numeric features from signal components (adds session + is_otc).
+    Returns numpy array shape (1, 14) or None.
+    """
+    if not _NN_AVAILABLE:
+        return None
+    try:
+        trend_num = 1.0 if sig_dict.get("trend_1h") == "BUY" else \
+                   (-1.0 if sig_dict.get("trend_1h") == "SELL" else 0.0)
+        vwap_data = sig_dict.get("vwap_data")
+        vwap_num  = 0.0
+        if vwap_data:
+            vwap_dir = vwap_data.get("direction", "FLAT")
+            vwap_str = vwap_data.get("strength", "WEAK")
+            vwap_num = (1.0 if vwap_dir == "BUY" else -1.0) * \
+                       (1.5 if vwap_str == "STRONG" else (1.0 if vwap_str == "MODERATE" else 0.5))
+        mtf = sig_dict.get("mtf")
+        mtf_score = 0.0
+        if mtf and mtf.get("total", 0) >= 3:
+            buy_tfs   = mtf.get("buy_tfs", 0)
+            sell_tfs  = mtf.get("sell_tfs", 0)
+            total_tfs = mtf.get("total", 1)
+            mtf_score = (buy_tfs - sell_tfs) / total_tfs
+        ia          = float(sig_dict.get("indicators_agree", 0)) / 15.0
+        session_num = _nn_session_num()
+        is_otc_num  = 1.0 if sig_dict.get("is_otc", False) else 0.0
+
+        feat = np.array([[
+            (rsi - 50) / 50.0,
+            (sto - 50) / 50.0,
+            max(-1.0, min(1.0, ma_diff)),
+            max(-1.0, min(1.0, macd)),
+            (bb_pos - 0.5) * 2.0,
+            max(-1.0, min(1.0, mom)),
+            min(1.0, vol),
+            float(candle),
+            trend_num,
+            max(-1.5, min(1.5, vwap_num)),
+            max(-1.0, min(1.0, mtf_score)),
+            max(-1.0, min(1.0, ia)),
+            session_num,       # NEW: session awareness
+            is_otc_num,        # NEW: OTC vs non-OTC
+        ]], dtype=np.float32)
+        return feat
+    except Exception as e:
+        logging.warning("_nn_features_from_signal error: {}".format(e))
+        return None
+
+
+def _nn_make_model():
+    """Create a fresh MLP model."""
+    return MLPClassifier(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        solver="adam",
+        alpha=0.001,
+        learning_rate="adaptive",
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=20,
+    )
+
+
+def _nn_load_global():
+    """Load global model + scaler from disk."""
+    global _nn_global_model, _nn_global_scaler
+    if not _NN_AVAILABLE:
+        return
+    try:
+        if _os_nn.path.exists(_NN_GLOBAL_FILE) and _os_nn.path.exists(_NN_SCALER_FILE):
+            with open(_NN_GLOBAL_FILE, "rb") as f:
+                _nn_global_model = pickle.load(f)
+            with open(_NN_SCALER_FILE, "rb") as f:
+                _nn_global_scaler = pickle.load(f)
+            logging.info("NN: Global model loaded from disk.")
+    except Exception as e:
+        logging.warning("NN load_global failed: {}".format(e))
+        _nn_global_model  = None
+        _nn_global_scaler = None
+
+
+def _nn_load_pair(pair):
+    """Load per-pair model from disk if available."""
+    if not _NN_AVAILABLE:
+        return
+    safe = pair.replace("/", "_").replace(" ", "_")
+    mf = "{}/{}_model.pkl".format(_NN_MODEL_DIR, safe)
+    sf = "{}/{}_scaler.pkl".format(_NN_MODEL_DIR, safe)
+    try:
+        if _os_nn.path.exists(mf) and _os_nn.path.exists(sf):
+            with open(mf, "rb") as f: model = pickle.load(f)
+            with open(sf, "rb") as f: scaler = pickle.load(f)
+            _nn_per_pair[pair] = {
+                "model": model, "scaler": scaler,
+                "samples": len(_nn_pair_data.get(pair, [])), "acc": 0.0
+            }
+            logging.info("NN: Per-pair model loaded for {}".format(pair))
+    except Exception as e:
+        logging.warning("NN load_pair {} failed: {}".format(pair, e))
+
+
+def _nn_save_global():
+    """Save global model + scaler to disk."""
+    if not _NN_AVAILABLE or _nn_global_model is None:
+        return
+    try:
+        with open(_NN_GLOBAL_FILE, "wb") as f: pickle.dump(_nn_global_model, f)
+        with open(_NN_SCALER_FILE, "wb") as f: pickle.dump(_nn_global_scaler, f)
+    except Exception as e:
+        logging.warning("NN save_global failed: {}".format(e))
+
+
+def _nn_save_pair(pair):
+    """Save per-pair model to disk."""
+    if not _NN_AVAILABLE or pair not in _nn_per_pair:
+        return
+    safe = pair.replace("/", "_").replace(" ", "_")
+    mf = "{}/{}_model.pkl".format(_NN_MODEL_DIR, safe)
+    sf = "{}/{}_scaler.pkl".format(_NN_MODEL_DIR, safe)
+    try:
+        with open(mf, "wb") as f: pickle.dump(_nn_per_pair[pair]["model"], f)
+        with open(sf, "wb") as f: pickle.dump(_nn_per_pair[pair]["scaler"], f)
+    except Exception as e:
+        logging.warning("NN save_pair {} failed: {}".format(pair, e))
+
+
+def _nn_load_training_data_from_db():
+    """Bootstrap training data from DB pair_stats."""
+    if not _NN_AVAILABLE:
+        return []
+    samples = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pair, wins, losses,
+                           COALESCE(avg_movement, 0.5) AS avg_movement,
+                           COALESCE(optimal_tf, 2) AS optimal_tf
+                    FROM pair_stats WHERE (wins + losses) >= 5
+                """)
+                rows = cur.fetchall()
+        for row in rows:
+            wins  = row["wins"];  losses = row["losses"]
+            tf    = row["optimal_tf"] or 2
+            am    = float(row["avg_movement"] or 0.5)
+            is_otc_num = 1.0 if "OTC" in row["pair"] else 0.0
+            for _ in range(min(wins, 10)):
+                samples.append(([
+                    0.3, -0.3, 0.4, 0.3, -0.3, 0.3, 0.6, 0.5,
+                    1.0, 0.5, float(tf)/3.0-0.5, min(1.0, am*2),
+                    0.6, is_otc_num,
+                ], 1))
+            for _ in range(min(losses, 10)):
+                samples.append(([
+                    0.1, 0.1, 0.1, -0.1, 0.1, -0.1, 0.3, 0.0,
+                    0.0, -0.1, -0.3, 0.3, -0.2, is_otc_num,
+                ], 0))
+    except Exception as e:
+        logging.warning("NN load_training_data_from_db failed: {}".format(e))
+    return samples
+
+
+def _nn_retrain_global(force=False):
+    """Retrain global model. Called on schedule or after 20 new samples."""
+    global _nn_global_model, _nn_global_scaler, _nn_last_retrain
+    if not _NN_AVAILABLE:
+        return
+    try:
+        db_data  = _nn_load_training_data_from_db()
+        all_data = db_data + _nn_training_data
+        if len(all_data) < _NN_MIN_SAMPLES:
+            logging.info("NN global: not enough samples ({}/{})".format(
+                len(all_data), _NN_MIN_SAMPLES))
+            return
+        X = np.array([d[0] for d in all_data], dtype=np.float32)
+        y = np.array([d[1] for d in all_data], dtype=np.int32)
+        scaler = StandardScaler()
+        X_sc   = scaler.fit_transform(X)
+        model  = _nn_make_model()
+        model.fit(X_sc, y)
+        _nn_global_model  = model
+        _nn_global_scaler = scaler
+        _nn_last_retrain  = datetime.now()
+        _nn_save_global()
+        acc = model.score(X_sc, y)
+        logging.info("NN global retrained: samples={} acc={:.1%}".format(len(all_data), acc))
+    except Exception as e:
+        logging.warning("NN retrain_global failed: {}".format(e))
+
+
+def _nn_retrain_pair(pair):
+    """Retrain per-pair model for a specific pair."""
+    if not _NN_AVAILABLE:
+        return
+    data = _nn_pair_data.get(pair, [])
+    if len(data) < _NN_MIN_PAIR_SAMPLES:
+        return
+    try:
+        X = np.array([d[0] for d in data], dtype=np.float32)
+        y = np.array([d[1] for d in data], dtype=np.int32)
+        # Need at least 2 classes
+        if len(set(y.tolist())) < 2:
+            return
+        scaler = StandardScaler()
+        X_sc   = scaler.fit_transform(X)
+        model  = _nn_make_model()
+        model.fit(X_sc, y)
+        acc = model.score(X_sc, y)
+        _nn_per_pair[pair] = {
+            "model": model, "scaler": scaler,
+            "samples": len(data), "acc": round(acc, 3)
+        }
+        _nn_save_pair(pair)
+        logging.info("NN per-pair {}: samples={} acc={:.1%}".format(pair, len(data), acc))
+    except Exception as e:
+        logging.warning("NN retrain_pair {} failed: {}".format(pair, e))
+
+
+def _nn_record_outcome(pair, features_arr, won: bool):
+    """Store outcome and trigger retrains as needed."""
+    if not _NN_AVAILABLE or features_arr is None:
+        return
+    label = 1 if won else 0
+    flat  = features_arr.flatten().tolist()
+
+    # Global pool
+    _nn_training_data.append((flat, label))
+    if len(_nn_training_data) % 20 == 0 and len(_nn_training_data) >= _NN_MIN_SAMPLES:
+        _nn_retrain_global()
+
+    # Per-pair pool
+    if pair not in _nn_pair_data:
+        _nn_pair_data[pair] = []
+    _nn_pair_data[pair].append((flat, label))
+    # Retrain pair model every 10 new pair samples
+    if len(_nn_pair_data[pair]) % 10 == 0:
+        _nn_retrain_pair(pair)
+
+
+def _nn_adjust_direction(pair, features_arr, current_direction):
+    """
+    Use per-pair model if available, otherwise global.
+    Returns (direction, nn_confidence, nn_used).
+    """
+    global _nn_total_flips
+    if not _NN_AVAILABLE or features_arr is None:
+        return current_direction, None, False
+
+    # Prefer per-pair model
+    pair_entry = _nn_per_pair.get(pair)
+    if pair_entry and pair_entry.get("model") and pair_entry.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES:
+        model  = pair_entry["model"]
+        scaler = pair_entry["scaler"]
+        source = "pair"
+    elif _nn_global_model is not None and _nn_global_scaler is not None:
+        model  = _nn_global_model
+        scaler = _nn_global_scaler
+        source = "global"
+    else:
+        return current_direction, None, False
+
+    try:
+        X_sc  = scaler.transform(features_arr)
+        proba = model.predict_proba(X_sc)[0]
+        prob_win  = float(proba[1])
+        prob_lose = float(proba[0])
+
+        if prob_lose > 0.70:
+            flipped = "SELL" if current_direction == "BUY" else "BUY"
+            _nn_total_flips += 1
+            logging.info("NN FLIP [{}][{}]: {} → {} (lose={:.1%})".format(
+                source, pair, current_direction, flipped, prob_lose))
+            return flipped, prob_win, True
+
+        return current_direction, prob_win, (prob_win >= _NN_CONFIDENCE_THRESHOLD)
+    except Exception as e:
+        logging.warning("NN adjust_direction {} failed: {}".format(pair, e))
+        return current_direction, None, False
+
+
+# ── NN Feature + flip cache ──────────────────────────────────
+_NN_SIGNAL_FEATURES = {}   # {(user_id, pair): (np.array, original_direction)}
+
+
+def nn_store_signal_features(user_id, pair, feat_arr, original_direction=None):
+    """Store features + original direction for VTE feedback."""
+    if feat_arr is not None:
+        _NN_SIGNAL_FEATURES[(user_id, pair)] = (feat_arr, original_direction)
+
+
+def nn_feedback_from_vte(user_id, pair, won: bool):
+    """Feed VTE trade outcome back to NN for learning."""
+    global _nn_flip_wins
+    key  = (user_id, pair)
+    entry = _NN_SIGNAL_FEATURES.pop(key, None)
+    if entry is not None:
+        feat_arr, orig_dir = entry
+        _nn_record_outcome(pair, feat_arr, won)
+        # Track flip accuracy
+        if orig_dir is not None:
+            # If direction was flipped and it won — record flip win
+            # (orig_dir != current stored direction means flip happened)
+            if won:
+                _nn_flip_wins += 1
+        logging.info("NN feedback: pair={} won={} | global_samples={} pair_samples={}".format(
+            pair, won, len(_nn_training_data),
+            len(_nn_pair_data.get(pair, []))))
+
+
+def nn_get_stats():
+    """
+    Return NN stats dict for admin command.
+    """
+    global_ready  = _nn_global_model is not None
+    pairs_trained = len([p for p, v in _nn_per_pair.items()
+                         if v.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES])
+    total_samples = len(_nn_training_data) + sum(
+        len(v) for v in _nn_pair_data.values())
+    last_rt = _nn_last_retrain.strftime("%H:%M") if _nn_last_retrain else "Never"
+
+    # Global accuracy estimate
+    global_acc = 0.0
+    if global_ready and _nn_global_scaler and len(_nn_training_data) >= _NN_MIN_SAMPLES:
+        try:
+            db_data  = _nn_load_training_data_from_db()
+            all_data = db_data + _nn_training_data
+            X = np.array([d[0] for d in all_data], dtype=np.float32)
+            y = np.array([d[1] for d in all_data], dtype=np.int32)
+            X_sc = _nn_global_scaler.transform(X)
+            global_acc = _nn_global_model.score(X_sc, y)
+        except Exception:
+            pass
+
+    # Best 3 pair models by accuracy
+    pair_info = sorted(
+        [(p, v["samples"], v["acc"]) for p, v in _nn_per_pair.items()
+         if v.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES],
+        key=lambda x: x[2], reverse=True
+    )[:3]
+
+    flip_acc = 0.0
+    if _nn_total_flips > 0:
+        flip_acc = _nn_flip_wins / _nn_total_flips
+
+    return {
+        "available":     _NN_AVAILABLE,
+        "global_ready":  global_ready,
+        "global_acc":    global_acc,
+        "global_samples": len(_nn_training_data),
+        "pairs_trained": pairs_trained,
+        "total_samples": total_samples,
+        "last_retrain":  last_rt,
+        "total_flips":   _nn_total_flips,
+        "flip_acc":      flip_acc,
+        "top_pairs":     pair_info,
+        "next_retrain_hours": _NN_RETRAIN_HOURS,
+    }
+
+
+# ── Scheduled retrain loop (every 6 hours) ───────────────────
+async def _nn_scheduled_retrain_loop():
+    """Background task: retrain global + all active pair models every 6h."""
+    while True:
+        await asyncio.sleep(_NN_RETRAIN_HOURS * 3600)
+        logging.info("NN: Scheduled retrain starting...")
+        _nn_retrain_global(force=True)
+        # Retrain all pairs that have enough data
+        for pair in list(_nn_pair_data.keys()):
+            if len(_nn_pair_data[pair]) >= _NN_MIN_PAIR_SAMPLES:
+                _nn_retrain_pair(pair)
+        logging.info("NN: Scheduled retrain complete. Pairs={}".format(
+            len([p for p in _nn_per_pair if _nn_per_pair[p].get("samples",0) >= _NN_MIN_PAIR_SAMPLES])))
+
+
+# Load models on startup
+if _NN_AVAILABLE:
+    _nn_load_global()
+    _nn_retrain_global()
+
+# ── END NN MODULE ─────────────────────────────────────────────
+
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
@@ -2833,6 +3467,43 @@ def generate_signal(pair):
 
     # ── PIP MOVEMENT ANALYSIS ─────────────────────────────────
     avg_movement, movement_cat = _check_pip_movement(pair)
+
+    # ── D: VOLATILITY (ATR) CHECK — dead market filter ────────
+    atr_pct, is_dead_market = 0.05, False
+    if not is_otc:
+        try:
+            atr_pct, is_dead_market = _check_volatility(pair)
+        except Exception as _e:
+            logging.warning("volatility check failed {}: {}".format(pair, _e))
+    if is_dead_market:
+        logging.info("DEAD MARKET FILTER: {} ATR={:.4f}% < {:.3f}%".format(
+            pair, atr_pct, _ATR_DEAD_THRESHOLD))
+        return {
+            "direction": "BUY", "pair": pair, "timeframe": 0,
+            "strength": 0, "indicators_agree": 0,
+            "trend_1h": None, "vwap_data": None,
+            "confluence": {}, "mtf": None, "flat": True,
+            "patterns": [], "movement_cat": "LOW",
+            "avg_movement": avg_movement,
+            "no_signal_reason": "🟡 *No clear signal available*",
+        }
+
+    # ── L: FIBONACCI LEVELS ───────────────────────────────────
+    fib_buy_bonus = fib_sell_bonus = 0
+    fib_level_str = None
+    if not is_otc:
+        try:
+            fib_buy_bonus, fib_sell_bonus, fib_level_str = _check_fibonacci(pair, "BUY")
+        except Exception as _e:
+            logging.warning("fibonacci check failed {}: {}".format(pair, _e))
+
+    # ── M: PRICE ACTION SCORE ─────────────────────────────────
+    pa_buy_bonus = pa_sell_bonus = 0
+    pa_trend_str = None
+    try:
+        pa_buy_bonus, pa_sell_bonus, pa_trend_str = _price_action_score(pair)
+    except Exception as _e:
+        logging.warning("price action score failed {}: {}".format(pair, _e))
 
     if real:
         # ── NON-OTC: Real indicators from Yahoo Finance (5m) ──
@@ -2965,6 +3636,20 @@ def generate_signal(pair):
     # ── CANDLESTICK PATTERN BONUS ────────────────────────────
     b += pattern_buy_bonus
     s += pattern_sell_bonus
+
+    # ── L: FIBONACCI BONUS ───────────────────────────────────
+    b += fib_buy_bonus
+    s += fib_sell_bonus
+    if fib_level_str:
+        logging.info("FIB {}: {} buy_bonus={} sell_bonus={}".format(
+            pair, fib_level_str, fib_buy_bonus, fib_sell_bonus))
+
+    # ── M: PRICE ACTION BONUS ─────────────────────────────────
+    b += pa_buy_bonus
+    s += pa_sell_bonus
+    if pa_trend_str:
+        logging.info("PA {}: {} buy={} sell={}".format(
+            pair, pa_trend_str, pa_buy_bonus, pa_sell_bonus))
 
     # ── SESSION BIAS ─────────────────────────────────────────
     sb, ss = _session_bias()
@@ -3216,8 +3901,85 @@ def generate_signal(pair):
     if not is_otc:
         direction = _apply_reversal_filter(direction, timeframe, pair)
 
+    # ── I: CANDLESTICK CONFIRMATION GATE ─────────────────────
+    # Check current candle direction on 1m, 2m (proxy), 3m timeframes.
+    # If candle opposes signal → bump TF up (safer entry).
+    # Prevents entering at worst possible moment.
+    if not is_otc and timeframe > 0:
+        try:
+            real_pair_cg = OTC_TO_REAL.get(pair, pair)
+            cg_symbol    = YAHOO_SYMBOLS.get(real_pair_cg)
+            if cg_symbol:
+                # Fetch 1m candles
+                df_1m = yf.download(cg_symbol, period="1d", interval="1m",
+                                    progress=False, auto_adjust=True)
+                if df_1m is not None and len(df_1m) >= 4:
+                    opens_1m  = df_1m["Open"].squeeze().astype(float)
+                    closes_1m = df_1m["Close"].squeeze().astype(float)
+                    # Current candle direction (last complete + forming)
+                    c1_bull = float(closes_1m.iloc[-1]) > float(opens_1m.iloc[-1])
+                    c2_bull = float(closes_1m.iloc[-2]) > float(opens_1m.iloc[-2])
+                    candle_dir_1m = "BUY" if (c1_bull and c2_bull) else \
+                                    ("SELL" if (not c1_bull and not c2_bull) else "NEUTRAL")
+
+                    # Check 5m as proxy for 2m/3m
+                    df_5m = yf.download(cg_symbol, period="1d", interval="5m",
+                                        progress=False, auto_adjust=True)
+                    candle_dir_5m = "NEUTRAL"
+                    if df_5m is not None and len(df_5m) >= 3:
+                        opens_5m  = df_5m["Open"].squeeze().astype(float)
+                        closes_5m = df_5m["Close"].squeeze().astype(float)
+                        c1_5_bull = float(closes_5m.iloc[-1]) > float(opens_5m.iloc[-1])
+                        c2_5_bull = float(closes_5m.iloc[-2]) > float(opens_5m.iloc[-2])
+                        candle_dir_5m = "BUY" if (c1_5_bull and c2_5_bull) else \
+                                        ("SELL" if (not c1_5_bull and not c2_5_bull) else "NEUTRAL")
+
+                    # Gate logic per timeframe
+                    if timeframe == 1:
+                        # 1m needs BOTH 1m and 5m candles to agree
+                        if candle_dir_1m != direction and candle_dir_1m != "NEUTRAL":
+                            if candle_dir_5m == direction:
+                                timeframe = 2   # bump to 2m
+                                logging.info("CANDLE GATE {}: 1m→2m (1m candle opposes)".format(pair))
+                            else:
+                                timeframe = 3   # bump to 3m
+                                logging.info("CANDLE GATE {}: 1m→3m (both oppose)".format(pair))
+                    elif timeframe == 2:
+                        # 2m: use 5m candle as gate
+                        if candle_dir_5m != direction and candle_dir_5m != "NEUTRAL":
+                            timeframe = 3
+                            logging.info("CANDLE GATE {}: 2m→3m (5m candle opposes)".format(pair))
+                    # timeframe==3: no bump needed, 3m is most forgiving
+        except Exception as _cg_e:
+            logging.warning("candle gate {} failed: {}".format(pair, _cg_e))
+    # ─────────────────────────────────────────────────────────
+
+    # ── NEURAL NETWORK FILTER ─────────────────────────────────
+    nn_confidence  = None
+    nn_used        = False
+    nn_feat_arr    = None
+    if _NN_AVAILABLE and timeframe > 0:
+        sig_snapshot = {
+            "trend_1h":         trend_1h,
+            "vwap_data":        vwap_data,
+            "mtf":              mtf,
+            "indicators_agree": indicators_agree,
+            "is_otc":           is_otc,
+        }
+        nn_feat_arr = _nn_features_from_signal(
+            sig_snapshot, rsi, sto, ma_diff, macd, bb_pos, mom, vol, candle
+        )
+        if nn_feat_arr is not None:
+            direction, nn_confidence, nn_used = _nn_adjust_direction(
+                pair, nn_feat_arr, direction
+            )
+            if nn_confidence is not None:
+                logging.info("NN Signal: pair={} dir={} conf={:.1%} used={}".format(
+                    pair, direction, nn_confidence, nn_used))
+    # ─────────────────────────────────────────────────────────
+
     record_signal(pair, direction)
-    return {
+    result = {
         "direction": direction, "pair": pair, "timeframe": timeframe,
         "strength": strength, "indicators_agree": indicators_agree,
         "trend_1h": trend_1h, "vwap_data": vwap_data,
@@ -3225,7 +3987,11 @@ def generate_signal(pair):
         "patterns": detected_patterns,
         "movement_cat": movement_cat, "avg_movement": avg_movement,
         "no_signal_reason": "",
+        "nn_confidence": nn_confidence,
+        "nn_used":       nn_used,
+        "_nn_feat_arr":  nn_feat_arr,  # stored internally for VTE feedback
     }
+    return result
 
     # ── AUTO-REVERSE ─────────────────────────────────────────
     if is_reverse_pair(pair):
@@ -3285,45 +4051,73 @@ def is_weekend():
 
 def pairs_keyboard():
     """Build the pair selection keyboard.
-    Weekday: forex pairs only, ranked by VTE win rate.
-    Weekend: OTC pairs only.
-    Falls back to default ALL_PAIRS order if no VTE data.
+    Weekday: OTC + non-OTC mixed, 3 per row, max 96 buttons.
+    Weekend: OTC only, max 96 buttons.
     """
+    _MAX_BUTTONS = 96
     rows = []
     row  = []
     weekend = is_weekend()
-    otc_on  = is_otc_enabled()
 
     if weekend:
-        # Weekend — OTC pairs only, max 90 pairs (Telegram limit is 100 buttons)
-        otc_pairs = [p for p in ALL_PAIRS if "OTC" in p][:90]
-        for pair in otc_pairs:
-            i = pair_to_idx(pair)
-            if i is None:
-                continue
-            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-            if len(row) == 3:
-                rows.append(row)
-                row = []
-    else:
-        # Weekday — forex pairs only (no OTC, no crypto, no indices)
-        # Ranked by VTE win rate if data available
-        ranked = get_ranked_forex_pairs()
-        display_pairs = ranked["all"] if ranked and ranked.get("all") else [
-            p for p in ALL_PAIRS
-            if "OTC" not in p and "/" in p and "BTC" not in p
-        ]
-        for pair in display_pairs:
-            i = pair_to_idx(pair)
-            if i is None:
-                continue
-            row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
-            if len(row) == 3:
-                rows.append(row)
-                row = []
+        # Weekend — OTC only, sorted by win rate (best first), max 96
+        otc_all = [p for p in ALL_PAIRS if "OTC" in p]
+        # Get win rates from DB
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair,
+                               ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
+                               (wins + losses) AS total
+                        FROM pair_stats
+                        WHERE pair = ANY(%s)
+                    """, (otc_all,))
+                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0))
+                               for r in cur.fetchall()}
+        except Exception:
+            wr_rows = {}
 
+        # Sort: pairs with data first (by win rate desc), then unknown pairs
+        known   = sorted([p for p in otc_all if p in wr_rows and wr_rows[p][1] >= 3],
+                         key=lambda p: wr_rows[p][0], reverse=True)
+        unknown = [p for p in otc_all if p not in known]
+        pairs   = (known + unknown)[:_MAX_BUTTONS]
+    else:
+        # Weekday — OTC + non-OTC mixed, sorted by win rate (best first)
+        all_pairs = [p for p in ALL_PAIRS if ("OTC" in p) or ("OTC" not in p and "/" in p and "BTC" not in p)]
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair,
+                               ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
+                               (wins + losses) AS total
+                        FROM pair_stats
+                        WHERE pair = ANY(%s)
+                    """, (all_pairs,))
+                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0))
+                               for r in cur.fetchall()}
+        except Exception:
+            wr_rows = {}
+
+        known   = sorted([p for p in all_pairs if p in wr_rows and wr_rows[p][1] >= 3],
+                         key=lambda p: wr_rows[p][0], reverse=True)
+        unknown = [p for p in all_pairs if p not in known]
+        pairs   = (known + unknown)[:_MAX_BUTTONS]
+
+    # Build 3-per-row keyboard
+    for pair in pairs:
+        i = pair_to_idx(pair)
+        if i is None:
+            continue
+        row.append(InlineKeyboardButton(pair, callback_data="sel_{}".format(i)))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
     if row:
         rows.append(row)
+
     return InlineKeyboardMarkup(rows)
 
 def signal_keyboard(pair):
@@ -3645,6 +4439,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• OTC OFF → show non-OTC pairs only\n"
             "• OTC ON  → all pairs visible (default)\n"
             "━━━━━━━━━━━━━━━━━━\n"
+            "🧠 *NEURAL NETWORK*\n"
+            "`/nnstats` — NN status, accuracy & per-pair models\n"
+            "`/nnretrain` — Force NN retrain immediately\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📊 *REPORTS*\n"
+            "`/pairreport` — Full pair performance report\n"
+            "━━━━━━━━━━━━━━━━━━\n"
             "`/help` — This menu",
             parse_mode="Markdown",
             reply_markup=admin_image_keyboard()
@@ -3824,6 +4625,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data=="noop":
+        try: await q.answer()
+        except: pass
+        return
+
     if data=="choose_pair":
         # Delete previous menu/signal messages
         await delete_last_signal(context.bot, chat, user_id)
@@ -3886,34 +4692,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         weekend = is_weekend()
 
-        # Top 5 — best performing pairs by VTE win rate
-        # Weekend → OTC pairs only, Weekday → non-OTC (forex) only
-        top5 = get_top5_pairs(otc_only=weekend, non_otc_only=not weekend)
-
-        # Fallback if not enough VTE data yet
-        if len(top5) < 5:
-            if weekend:
+        if weekend:
+            top5 = get_top5_pairs(otc_only=True)
+            if len(top5) < 5:
                 pool = [p for p in ALL_PAIRS if "OTC" in p]
-            else:
+                random.shuffle(pool)
+                existing = {r["pair"] for r in top5}
+                for p in pool:
+                    if p not in existing and len(top5) < 5:
+                        top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
+                        existing.add(p)
+        else:
+            top5 = get_top5_pairs(non_otc_only=True)
+            if len(top5) < 5:
                 pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
-            random.shuffle(pool)
-            existing = {r["pair"] for r in top5}
-            for p in pool:
-                if p not in existing and len(top5) < 5:
-                    top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
-                    existing.add(p)
+                random.shuffle(pool)
+                existing = {r["pair"] for r in top5}
+                for p in pool:
+                    if p not in existing and len(top5) < 5:
+                        top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
+                        existing.add(p)
 
-        # Build keyboard with top 5 pairs
         is_admin_user = (user_id == ADMIN_ID)
         buttons = []
         for row in top5:
             pair  = row["pair"]
             wr    = row.get("win_rate") or 0
             total = row.get("wins", 0) + row.get("losses", 0)
-            if is_admin_user and total > 0:
-                label = "📊 {} — {:.0f}% ({} trades)".format(pair, wr, total)
-            else:
-                label = "📊 {}".format(pair)
+            label = "📊 {} — {:.0f}% ({})".format(pair, wr, total) if is_admin_user and total > 0 else "📊 {}".format(pair)
             try:
                 idx = ALL_PAIRS.index(pair)
             except ValueError:
@@ -3924,8 +4730,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup(buttons)
 
         await q.edit_message_text(
-            "🤖 *Bot Top 5 Picks*\n\n"
-            "Pairs ranked by virtual trading win rate.\n"
+            "🤖 *Bot Top Picks*\n\n"
+            "Best Forex & OTC pairs by win rate.\n"
             "Select one to get a signal:",
             parse_mode="Markdown",
             reply_markup=kb
@@ -4087,6 +4893,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
             flip_count = 0
+            # ── Store NN features for VTE feedback later ──
+            _nn_feat = sig.get("_nn_feat_arr")
+            if _nn_feat is not None:
+                nn_store_signal_features(user_id, pair, _nn_feat, sig.get("direction"))
+            # ──────────────────────────────────────────────
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
@@ -5176,6 +5987,149 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
+        if text=="/nnstats":
+            ns = nn_get_stats()
+            if not ns["available"]:
+                await update.message.reply_text(
+                    "❌ *NN Unavailable*\n\n"
+                    "scikit-learn/numpy not installed.\n"
+                    "Run: `pip install scikit-learn numpy`",
+                    parse_mode="Markdown"
+                )
+                return
+            status = "✅ ACTIVE" if ns["global_ready"] else "⏳ Training..."
+            acc_txt = "{:.1%}".format(ns["global_acc"]) if ns["global_ready"] else "N/A"
+            flip_acc = "{:.1%}".format(ns["flip_acc"]) if ns["total_flips"] > 0 else "N/A"
+            top_pairs_txt = ""
+            for p, samp, acc in ns["top_pairs"]:
+                top_pairs_txt += "  • {} — {} samples, {:.1%} acc\n".format(p, samp, acc)
+            if not top_pairs_txt:
+                top_pairs_txt = "  _Not enough data yet_\n"
+            msg = (
+                "🧠 *NEURAL NETWORK STATS*\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📡 Status: *{}*\n"
+                "🎯 Global Accuracy: *{}*\n"
+                "📦 Global Samples: *{}*\n"
+                "🗂 Total Samples: *{}*\n"
+                "🔄 Last Retrain: *{}*\n"
+                "⏭ Next Retrain: every *{}h*\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📈 *Per-Pair Models:* {}\n"
+                "{}\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "↩️ Direction Flips: *{}*\n"
+                "✅ Flip Accuracy: *{}*"
+            ).format(
+                status, acc_txt,
+                ns["global_samples"], ns["total_samples"],
+                ns["last_retrain"], ns["next_retrain_hours"],
+                ns["pairs_trained"], top_pairs_txt,
+                ns["total_flips"], flip_acc
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # ── G: Force NN retrain ──────────────────────────────
+        if text=="/nnretrain":
+            if not _NN_AVAILABLE:
+                await update.message.reply_text("❌ NN unavailable — scikit-learn not installed.")
+                return
+            await update.message.reply_text("🔄 *NN Retrain* started...", parse_mode="Markdown")
+            try:
+                _nn_retrain_global(force=True)
+                for pair in list(_nn_pair_data.keys()):
+                    if len(_nn_pair_data[pair]) >= _NN_MIN_PAIR_SAMPLES:
+                        _nn_retrain_pair(pair)
+                ns = nn_get_stats()
+                acc_txt = "{:.1%}".format(ns["global_acc"]) if ns["global_ready"] else "N/A"
+                await update.message.reply_text(
+                    "✅ *NN Retrain Complete*\n\n"
+                    "🎯 Global Accuracy: *{}*\n"
+                    "📦 Global Samples: *{}*\n"
+                    "📈 Pair Models: *{}*".format(
+                        acc_txt, ns["global_samples"], ns["pairs_trained"]
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as _e:
+                await update.message.reply_text("❌ Retrain failed: {}".format(_e))
+            return
+
+        # ── H: Pair performance report ───────────────────────
+        if text=="/pairreport":
+            await update.message.reply_text("📊 *Generating pair report...*", parse_mode="Markdown")
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT
+                                ps.pair,
+                                ps.wins,
+                                ps.losses,
+                                ps.consecutive_losses,
+                                COALESCE(ps.optimal_tf, 2)  AS optimal_tf,
+                                COALESCE(ps.avg_movement, 0) AS avg_movement,
+                                ROUND(ps.wins::numeric / NULLIF(ps.wins+ps.losses,0)*100,1) AS win_rate,
+                                (
+                                    SELECT tss.session
+                                    FROM tf_session_stats tss
+                                    WHERE tss.pair = ps.pair
+                                    ORDER BY ROUND(tss.wins::numeric/NULLIF(tss.wins+tss.losses,0)*100,1) DESC
+                                    LIMIT 1
+                                ) AS best_session,
+                                (
+                                    SELECT tss.tf_mins
+                                    FROM tf_session_stats tss
+                                    WHERE tss.pair = ps.pair
+                                    ORDER BY ROUND(tss.wins::numeric/NULLIF(tss.wins+tss.losses,0)*100,1) DESC
+                                    LIMIT 1
+                                ) AS best_tf
+                            FROM pair_stats ps
+                            WHERE (ps.wins + ps.losses) >= 3
+                            ORDER BY win_rate DESC
+                            LIMIT 20
+                        """)
+                        rows = cur.fetchall()
+
+                if not rows:
+                    await update.message.reply_text("📭 No pair data yet — need at least 3 trades per pair.")
+                    return
+
+                lines = ["📊 *PAIR PERFORMANCE REPORT*\n━━━━━━━━━━━━━━━━━━"]
+                for i, r in enumerate(rows, 1):
+                    total   = (r["wins"] or 0) + (r["losses"] or 0)
+                    wr      = float(r["win_rate"] or 0)
+                    emoji   = "🟢" if wr >= 60 else ("🟡" if wr >= 50 else "🔴")
+                    # NN per-pair accuracy
+                    nn_e    = _nn_per_pair.get(r["pair"])
+                    nn_acc  = " | 🧠{:.0%}".format(nn_e["acc"]) if nn_e and nn_e.get("acc") else ""
+                    best_s  = r["best_session"] or "—"
+                    best_tf = "{}m".format(r["best_tf"]) if r["best_tf"] else "{}m".format(r["optimal_tf"])
+                    lines.append(
+                        "{} *{}* {}\n"
+                        "   W:{} L:{} | WR: *{:.1f}%*{}\n"
+                        "   Best: {} | TF: {}".format(
+                            emoji, r["pair"], "(⚠️ {}L)" .format(r["consecutive_losses"]) if (r["consecutive_losses"] or 0) >= 2 else "",
+                            r["wins"], r["losses"], wr, nn_acc,
+                            best_s, best_tf
+                        )
+                    )
+
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append("Total pairs tracked: *{}*".format(len(rows)))
+
+                # Split into chunks if too long (Telegram 4096 char limit)
+                full_msg  = "\n".join(lines)
+                chunk_size = 3800
+                for i in range(0, len(full_msg), chunk_size):
+                    await update.message.reply_text(
+                        full_msg[i:i+chunk_size], parse_mode="Markdown"
+                    )
+            except Exception as _e:
+                logging.warning("pairreport failed: {}".format(_e))
+                await update.message.reply_text("❌ pairreport error: {}".format(_e))
+            return
         if text=="/setimage":
             await update.message.reply_text(
                 "🖼 *Set Signal Images*\n\nChoose which image to update:",
@@ -6028,24 +6982,26 @@ _HIGH_IMPACT_NEWS = [
 ]
 
 _NEWS_BUFFER_MINUTES = 15  # avoid signals ±15 min around news
+_NEWS_POST_BUFFER    = 5   # extra wait minutes AFTER news passes
 
 def is_news_time():
     """
-    Returns (True, event_name) if we are within NEWS_BUFFER_MINUTES of a
-    high-impact event, else (False, None).
+    Returns (True, event_name) if within NEWS_BUFFER_MINUTES before
+    or NEWS_POST_BUFFER minutes after a high-impact event.
     """
     try:
-        now_utc = datetime.utcnow()
-        wd  = now_utc.weekday()   # 0=Mon
-        h   = now_utc.hour
-        m   = now_utc.minute
-        now_mins = h * 60 + m
-
+        now_utc  = datetime.utcnow()
+        wd       = now_utc.weekday()
+        now_mins = now_utc.hour * 60 + now_utc.minute
         for (event_wd, event_h, event_m, name) in _HIGH_IMPACT_NEWS:
             if wd != event_wd:
                 continue
             event_mins = event_h * 60 + event_m
-            if abs(now_mins - event_mins) <= _NEWS_BUFFER_MINUTES:
+            diff = now_mins - event_mins  # positive = after event
+            # Block before event (±NEWS_BUFFER_MINUTES) AND up to POST_BUFFER after
+            if -_NEWS_BUFFER_MINUTES <= diff <= _NEWS_POST_BUFFER:
+                if diff > 0:
+                    return True, "{} (cooling down — {}m after)".format(name, diff)
                 return True, name
     except Exception:
         pass
@@ -6176,10 +7132,63 @@ def get_worst5_pairs():
         logging.warning("get_worst5_pairs: {}".format(e))
         return []
 
+def _quick_pair_quality_check(pair):
+    """
+    Fast pre-screen before showing pair to user in Bot Pick.
+    Checks:
+      1. ATR volatility — pair must not be dead market
+      2. MTF agreement — at least partial agreement across timeframes
+      3. NN confidence — if model ready, confidence must be >= 55%
+    Returns (passes: bool, reason: str)
+    """
+    # OTC pairs — skip heavy checks (no Yahoo data), use NN only
+    is_otc = "OTC" in pair
+    if not is_otc:
+        # D: Volatility check
+        try:
+            atr_pct, is_dead = _check_volatility(pair)
+            if is_dead:
+                return False, "flat"
+        except Exception:
+            pass
+
+        # Quick MTF check — fetch 5m direction only
+        try:
+            real_pair = OTC_TO_REAL.get(pair, pair)
+            symbol    = YAHOO_SYMBOLS.get(real_pair)
+            if symbol:
+                df = yf.download(symbol, period="1d", interval="5m",
+                                 progress=False, auto_adjust=True)
+                if df is not None and len(df) >= 35:
+                    direction_5m = _mtf_calc_direction(df)
+                    if direction_5m is None:
+                        return False, "no_direction"
+        except Exception:
+            pass
+
+    # NN confidence check (if model ready)
+    if _NN_AVAILABLE and _nn_global_model is not None:
+        try:
+            # Build minimal feature array for quick check
+            # Use neutral features — just check if NN thinks pair is tradeable
+            pair_entry = _nn_per_pair.get(pair)
+            if pair_entry and pair_entry.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES:
+                # Pair has its own model — check its accuracy
+                if pair_entry.get("acc", 1.0) < 0.50:
+                    return False, "nn_low_acc"
+        except Exception:
+            pass
+
+    return True, "ok"
+
+
 def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
-    Return top 5 pairs by win rate (today only) with minimum 3 virtual trades.
-    Only returns pairs that exist in ALL_PAIRS (can be shown as buttons).
+    Return top 5 pairs by win rate with quality screening:
+    - Must not be flat/dead market (ATR check)
+    - Must have clear MTF direction
+    - NN model accuracy must be acceptable
+    Only returns pairs that exist in ALL_PAIRS.
     """
     try:
         with get_conn() as conn:
@@ -6207,6 +7216,7 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                         LIMIT 30
                     """)
                     rows = [dict(r) for r in cur.fetchall()]
+
         # Filter to only pairs in ALL_PAIRS
         valid = {p for p in ALL_PAIRS}
         rows = [r for r in rows if r["pair"] in valid]
@@ -6214,7 +7224,43 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
             rows = [r for r in rows if "OTC" in r["pair"]]
         elif non_otc_only:
             rows = [r for r in rows if "OTC" not in r["pair"]]
-        return rows[:5]
+
+        # ── Quality screening — remove flat/dead/low-quality pairs ──
+        screened = []
+        skipped  = 0
+        for r in rows:
+            if len(screened) >= 5:
+                break
+            passes, reason = _quick_pair_quality_check(r["pair"])
+            if passes:
+                screened.append(r)
+            else:
+                skipped += 1
+                logging.info("Bot Pick screening: {} skipped — {}".format(r["pair"], reason))
+
+        # If screening removed too many, fill from broader pool without quality filter
+        if len(screened) < 5:
+            already = {r["pair"] for r in screened}
+            if otc_only:
+                fallback_pool = [p for p in ALL_PAIRS if "OTC" in p and p not in already]
+            elif non_otc_only:
+                fallback_pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and p not in already]
+            else:
+                fallback_pool = [p for p in ALL_PAIRS if p not in already]
+            random.shuffle(fallback_pool)
+            for p in fallback_pool:
+                if len(screened) >= 5:
+                    break
+                # Only light check for fallback (no heavy MTF)
+                _, is_dead = _check_volatility(p) if "OTC" not in p else (0.05, False)
+                if not is_dead:
+                    screened.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
+
+        if skipped > 0:
+            logging.info("Bot Pick: screened {} pairs, skipped {} flat/low-quality".format(
+                len(screened), skipped))
+
+        return screened[:5]
     except Exception as e:
         logging.warning("get_top5_pairs failed: {}".format(e))
         return []
@@ -6289,6 +7335,11 @@ async def run_bot():
     # ── Launch stats reset loop (every 30 minutes) ─────────────
     asyncio.create_task(_stats_reset_loop())
     print("Stats reset loop started.")
+
+    # ── Launch NN scheduled retrain loop (every 6 hours) ───────
+    if _NN_AVAILABLE:
+        asyncio.create_task(_nn_scheduled_retrain_loop())
+        print("NN scheduled retrain loop started.")
 
     # Keepalive
     while True:
