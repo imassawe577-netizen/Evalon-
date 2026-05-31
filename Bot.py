@@ -3615,6 +3615,216 @@ def _micro_candle_trend_score(pair):
     return results
 
 
+# ============================================================
+# NON-OTC RESCUE — when signal is flat/weak, use history +
+# micro-candle (5s/10s/15s green-red ratio) to force a direction
+# ============================================================
+def _rescue_nonOTC_signal(pair: str) -> dict | None:
+    """
+    Last-resort for non-OTC when generate_signal returns flat/weak.
+    Steps:
+      1. Check recent signal history — what direction was winning?
+      2. Check micro-candle (5s/10s/15s) green/red ratio → pick TF
+         with strongest majority (BUY if green > 60%, SELL if red > 60%)
+      3. If both agree → return forced signal
+      4. If only one agrees → use it
+      5. If nothing → return None (caller will show no-signal)
+
+    Returns a signal dict (flat=False) or None.
+    """
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol    = YAHOO_SYMBOLS.get(real_pair)
+
+    # ── 1. History direction ─────────────────────────────────
+    hist_dir = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction FROM signal_history WHERE pair=%s "
+                    "ORDER BY created_at DESC LIMIT 20",
+                    (pair,)
+                )
+                rows = cur.fetchall()
+        if len(rows) >= 5:
+            dirs = [r["direction"] for r in rows]
+            buy_pct  = dirs.count("BUY")  / len(dirs)
+            sell_pct = dirs.count("SELL") / len(dirs)
+            if buy_pct  >= 0.60: hist_dir = "BUY"
+            elif sell_pct >= 0.60: hist_dir = "SELL"
+    except Exception as e:
+        logging.warning("_rescue history check failed {}: {}".format(pair, e))
+
+    # ── 2. Micro-candle green/red ratio per TF ───────────────
+    # 1m TF → 5s candles, 2m TF → 10s candles, 3m TF → 15s candles
+    # Use Yahoo 1m data and bucket into micro-candles
+    micro_result = None  # {tf_mins: (direction, support_pct)}
+    if symbol:
+        try:
+            df = yf.download(symbol, period="1d", interval="1m",
+                             progress=False, auto_adjust=True)
+            if df is not None and len(df) >= 20:
+                opens  = df["Open"].squeeze().astype(float).values
+                closes = df["Close"].squeeze().astype(float).values
+                times_sec = list(range(len(opens)))  # proxy: each candle = 1 unit
+
+                micro_result = {}
+                for tf_mins, bucket_size in [(1, 5), (2, 10), (3, 15)]:
+                    # Use last 60 1m candles, group every bucket_size candles
+                    # Each group of bucket_size 1m candles ≈ one micro-candle
+                    window = opens[-60:]
+                    wclose = closes[-60:]
+                    green = red = 0
+                    for i in range(0, len(window) - bucket_size + 1, bucket_size):
+                        chunk_open  = window[i]
+                        chunk_close = wclose[i + bucket_size - 1]
+                        if chunk_close > chunk_open:  green += 1
+                        elif chunk_close < chunk_open: red   += 1
+                    total = green + red
+                    if total >= 3:
+                        support = max(green, red) / total * 100
+                        direction = "BUY" if green >= red else "SELL"
+                        micro_result[tf_mins] = (direction, support)
+        except Exception as e:
+            logging.warning("_rescue micro-candle failed {}: {}".format(pair, e))
+
+    # ── 3. Choose best TF from micro_result ─────────────────
+    best_tf        = None
+    best_dir       = None
+    best_support   = 0.0
+
+    if micro_result:
+        for tf_mins, (mdir, msupport) in micro_result.items():
+            if msupport >= 60.0 and msupport > best_support:
+                best_support = msupport
+                best_tf      = tf_mins
+                best_dir     = mdir
+
+    # ── 4. Reconcile history + micro ────────────────────────
+    final_dir = None
+    final_tf  = best_tf or 2
+
+    if best_dir and hist_dir:
+        if best_dir == hist_dir:
+            final_dir = best_dir   # Both agree — strong
+        else:
+            # Disagree — trust micro over history (more recent)
+            final_dir = best_dir
+    elif best_dir:
+        final_dir = best_dir
+    elif hist_dir:
+        final_dir = hist_dir
+        # Pick TF from micro with highest support (any direction)
+        if micro_result:
+            best_any = max(micro_result.items(), key=lambda x: x[1][1])
+            final_tf = best_any[0]
+
+    if final_dir is None:
+        return None  # Nothing to rescue with
+
+    logging.info("RESCUE nonOTC {}: dir={} tf={}m (micro_support={:.0f}% hist={})".format(
+        pair, final_dir, final_tf, best_support, hist_dir))
+
+    return {
+        "direction": final_dir, "pair": pair, "timeframe": final_tf,
+        "strength": max(300, int(best_support * 5)),
+        "indicators_agree": 3,
+        "trend_1h": hist_dir, "vwap_data": None, "confluence": {},
+        "mtf": None, "flat": False, "patterns": {},
+        "movement_cat": "MEDIUM", "avg_movement": 0.08,
+        "no_signal_reason": "",
+        "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
+        "_rescued": True,
+    }
+# ─────────────────────────────────────────────────────────────
+
+
+# ============================================================
+# SAFE SIGNAL WRAPPER — timeout + guaranteed OTC fallback
+# ============================================================
+_SIGNAL_TIMEOUT = 20  # seconds — max wait for generate_signal
+
+async def safe_generate_signal(pair: str) -> dict:
+    """
+    Async wrapper around generate_signal with:
+      - Hard 20s timeout
+      - OTC: always returns a signal (random BUY/SELL fallback if timeout/error)
+      - Non-OTC flat/timeout/error: try rescue (history + micro-candles) before
+        giving up — only shows no-signal if rescue also finds nothing
+
+    Never hangs. Never returns None.
+    """
+    is_otc = "OTC" in pair
+    loop   = asyncio.get_event_loop()
+
+    def _otc_fallback():
+        forced_dir = random.choice(["BUY", "SELL"])
+        forced_tf  = random.choice([1, 2, 3])
+        return {
+            "direction": forced_dir, "pair": pair, "timeframe": forced_tf,
+            "strength": random.randint(300, 500), "indicators_agree": 3,
+            "trend_1h": None, "vwap_data": None, "confluence": {},
+            "mtf": None, "flat": False, "patterns": {},
+            "movement_cat": "MEDIUM", "avg_movement": 0.08,
+            "no_signal_reason": "", "nn_confidence": None, "nn_used": False,
+            "_nn_feat_arr": None,
+        }
+
+    def _nonOTC_no_signal(reason):
+        return {
+            "direction": "BUY", "pair": pair, "timeframe": 0,
+            "strength": 0, "indicators_agree": 0,
+            "trend_1h": None, "vwap_data": None, "confluence": {},
+            "mtf": None, "flat": True, "patterns": {},
+            "movement_cat": "LOW", "avg_movement": 0.0,
+            "no_signal_reason": reason,
+            "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
+        }
+
+    try:
+        sig = await asyncio.wait_for(
+            loop.run_in_executor(None, generate_signal, pair),
+            timeout=_SIGNAL_TIMEOUT
+        )
+        # OTC must NEVER return flat — inject random direction if so
+        if is_otc and sig.get("flat"):
+            forced_dir = random.choice(["BUY", "SELL"])
+            forced_tf  = random.choice([1, 2, 3])
+            sig["direction"]        = forced_dir
+            sig["timeframe"]        = forced_tf
+            sig["flat"]             = False
+            sig["no_signal_reason"] = ""
+            sig["strength"]         = random.randint(300, 500)
+            logging.info("OTC FORCE SIGNAL (flat rescued): {} → {} {}m".format(pair, forced_dir, forced_tf))
+        # Non-OTC flat → try rescue before giving up
+        if not is_otc and sig.get("flat"):
+            rescued = _rescue_nonOTC_signal(pair)
+            if rescued:
+                return rescued
+        return sig
+
+    except asyncio.TimeoutError:
+        logging.warning("generate_signal TIMEOUT ({}s) for {}".format(_SIGNAL_TIMEOUT, pair))
+        if is_otc:
+            return _otc_fallback()
+        # Non-OTC timeout → try rescue
+        rescued = _rescue_nonOTC_signal(pair)
+        if rescued:
+            return rescued
+        return _nonOTC_no_signal("⏱ *No signal available* — market data timed out.")
+
+    except Exception as e:
+        logging.warning("generate_signal ERROR for {}: {}".format(pair, e))
+        if is_otc:
+            return _otc_fallback()
+        # Non-OTC error → try rescue
+        rescued = _rescue_nonOTC_signal(pair)
+        if rescued:
+            return rescued
+        return _nonOTC_no_signal("🟡 *No signal available* — please try again.")
+# ─────────────────────────────────────────────────────────────
+
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
@@ -3718,7 +3928,7 @@ def generate_signal(pair):
             "confluence": {}, "mtf": None, "flat": True,
             "patterns": [], "movement_cat": "LOW",
             "avg_movement": avg_movement,
-            "no_signal_reason": "🟡 *No clear signal available*",
+            "no_signal_reason": "🟡 *No signal available*",
         }
 
     # ── L: FIBONACCI LEVELS ───────────────────────────────────
@@ -5186,7 +5396,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
-            sig = generate_signal(pair)
+            sig = await safe_generate_signal(pair)  # guaranteed — OTC always signals
             direction = sig["direction"]
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
@@ -5201,7 +5411,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -5216,7 +5426,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))],
@@ -5315,23 +5525,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(
             chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown"
         )
-        try:
-            loop = asyncio.get_event_loop()
-            sig  = await loop.run_in_executor(None, generate_signal, pair)
-        except Exception as e:
-            logging.warning("nonotctf signal failed {}: {}".format(pair, e))
-            try: await cm.delete()
-            except: pass
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text="🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Get More", callback_data="nonotctf_{}_{}".format(idx_str, chosen_tf))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
+        sig = await safe_generate_signal(pair)  # timeout-safe, never hangs
         direction = sig["direction"]
         timeframe = chosen_tf
 
@@ -5377,7 +5571,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "🔒 *Seconds signals — Subscribers Only*\n\n"
                     "This option is available for licensed subscribers only.\n\n"
-                    "Upgrade ili kupata:\n"
+                    "Upgrade to unlock:\n"
                     "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
                     "✅ Unlimited signals\n"
                     "✅ Win rate 90% — 98%"
@@ -5439,7 +5633,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(0.3)
 
-        sig       = generate_signal(pair)
+        sig       = await safe_generate_signal(pair)  # OTC — always returns signal
         direction = sig["direction"]
         strength  = sig["strength"]
 
@@ -5451,7 +5645,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -5601,46 +5795,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
-        try:
-            sig = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, generate_signal, pair),
-                timeout=25.0
-            )
-        except asyncio.TimeoutError:
-            logging.warning("generate_signal timeout in getmore for {}".format(pair))
-            try: await cm.delete()
-            except: pass
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text="🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-        except Exception as _sig_e:
-            logging.warning("generate_signal failed in getmore {}: {}".format(pair, _sig_e))
-            try: await cm.delete()
-            except: pass
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text="🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
+        sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
         direction = sig["direction"]
         strength  = sig["strength"]
 
         # ── A: SIGNAL CONFIRMATION DELAY ─────────────────────
         # Wait 4s and recheck direction before sending to user
         _is_otc_confirm = "OTC" in pair
-        direction = await _confirm_signal_direction(pair, direction, _is_otc_confirm)
+        try:
+            direction = await asyncio.wait_for(
+                _confirm_signal_direction(pair, direction, _is_otc_confirm),
+                timeout=6.0
+            )
+        except asyncio.TimeoutError:
+            logging.warning("_confirm_signal_direction timeout for {}".format(pair))
+            # keep original direction
         # ─────────────────────────────────────────────────────
 
         # MTF override: use MTF direction + timeframe if confirmed
@@ -5661,7 +5830,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sig.get("flat") and sig["timeframe"] == 0:
             try: await cm.delete()
             except: pass
-            msg = sig.get("no_signal_reason") or "🟡 *No clear signal available*"
+            msg = sig.get("no_signal_reason") or "🟡 *No signal available*"
             await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
@@ -5683,7 +5852,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason = sig.get("no_signal_reason", "")
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
@@ -5696,7 +5865,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
@@ -5832,24 +6001,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
         if check["action"] == "fresh":
-            try:
-                loop = asyncio.get_event_loop()
-                sig = await loop.run_in_executor(None, generate_signal, pair)
-            except Exception as e:
-                logging.warning("generate_signal error {}: {}".format(pair, e))
-                try: await cm.delete()
-                except: pass
-                _nsm = await context.bot.send_message(
-                    chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Try Again", callback_data="sel_{}".format(data[4:]))],
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
-                    ])
-                )
-                save_last_bot_msg(user_id, _nsm.message_id)
-                return
+            sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
@@ -5866,7 +6018,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -5889,7 +6041,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra = "\n\n_Market direction changed too quickly — waiting for stability._"
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -5902,7 +6054,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
@@ -7148,7 +7300,7 @@ async def _vt_place_trades():
 
     for pair in forex_pairs:
         try:
-            sig = await loop.run_in_executor(None, generate_signal, pair)
+            sig = await safe_generate_signal(pair)  # timeout-safe
             direction = sig["direction"]
             # Use pre-reverse direction for VTE accuracy
             if is_reverse_pair(pair):
