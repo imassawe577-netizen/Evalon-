@@ -420,6 +420,7 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS consecutive_losses INTEGER DEFAULT 0;
+                ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS consecutive_wins INTEGER DEFAULT 0;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS optimal_tf INTEGER DEFAULT NULL;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS avg_movement DOUBLE PRECISION DEFAULT NULL;
                 ALTER TABLE pair_stats ADD COLUMN IF NOT EXISTS wins_today INTEGER DEFAULT 0;
@@ -456,22 +457,24 @@ def update_pair_stats(pair, won, was_reversed=False):
         with get_conn() as conn:
             with conn.cursor() as cur:
                 if won:
-                    # Win resets consecutive loss streak
+                    # Win resets consecutive loss streak, increments win streak
                     cur.execute("""
-                        INSERT INTO pair_stats (pair, wins, losses, consecutive_losses)
-                        VALUES (%s, 1, 0, 0)
+                        INSERT INTO pair_stats (pair, wins, losses, consecutive_losses, consecutive_wins)
+                        VALUES (%s, 1, 0, 0, 1)
                         ON CONFLICT (pair) DO UPDATE SET
                             wins = pair_stats.wins + 1,
-                            consecutive_losses = 0
+                            consecutive_losses = 0,
+                            consecutive_wins = pair_stats.consecutive_wins + 1
                     """, (pair,))
                 else:
-                    # Loss increments consecutive streak
+                    # Loss resets win streak, increments loss streak
                     cur.execute("""
-                        INSERT INTO pair_stats (pair, wins, losses, consecutive_losses)
-                        VALUES (%s, 0, 1, 1)
+                        INSERT INTO pair_stats (pair, wins, losses, consecutive_losses, consecutive_wins)
+                        VALUES (%s, 0, 1, 1, 0)
                         ON CONFLICT (pair) DO UPDATE SET
                             losses = pair_stats.losses + 1,
-                            consecutive_losses = pair_stats.consecutive_losses + 1
+                            consecutive_losses = pair_stats.consecutive_losses + 1,
+                            consecutive_wins = 0
                     """, (pair,))
                     # Check if consecutive losses hit 3 — auto-reverse
                     cur.execute("SELECT consecutive_losses FROM pair_stats WHERE pair=%s", (pair,))
@@ -886,22 +889,62 @@ def save_last_bot_msg(user_id, msg_id):
 # ANTI-SPAM
 # ============================================================
 LAST_SIGNAL_TIME = {}
-SPAM_SECONDS = 3  # Minimal anti-flood only — no cooldown between signals
+SPAM_SECONDS = 2  # Minimal anti-flood — tiny delay only, never block signal
 
 def is_spam(user_id):
-    """Minimal flood guard — 3 seconds only. No signal cooldown."""
-    now = time.time()
+    """Never block the user — just track timing for slight delay."""
+    now  = time.time()
     last = LAST_SIGNAL_TIME.get(user_id, 0)
-    if now - last < SPAM_SECONDS:
-        return True
     LAST_SIGNAL_TIME[user_id] = now
-    return False
+    return False  # Never block — user always gets signal + Get More button
 
-def spam_wait(user_id):
-    now = time.time()
+async def _spam_gentle_delay(user_id):
+    """If user is pressing too fast, add a tiny delay (no message shown)."""
+    now  = time.time()
     last = LAST_SIGNAL_TIME.get(user_id, 0)
-    remaining = SPAM_SECONDS - (now - last)
-    return max(0, int(remaining) + 1)
+    gap  = now - last
+    if gap < SPAM_SECONDS:
+        await asyncio.sleep(SPAM_SECONDS - gap)
+
+
+# ── A: SIGNAL CONFIRMATION DELAY ─────────────────────────────
+# After generating signal, wait 4 seconds and re-check direction.
+# If direction changed → use new direction. User never sees the check.
+_CONFIRM_DELAY_SECS = 4
+
+async def _confirm_signal_direction(pair, initial_direction, is_otc):
+    """
+    Wait CONFIRM_DELAY_SECS seconds then re-check quick direction.
+    Returns confirmed direction (may differ from initial if market moved).
+    Only runs for non-OTC pairs (OTC has no Yahoo data for recheck).
+    """
+    if is_otc:
+        return initial_direction
+    await asyncio.sleep(_CONFIRM_DELAY_SECS)
+    try:
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        symbol    = YAHOO_SYMBOLS.get(real_pair)
+        if not symbol:
+            return initial_direction
+        df = yf.download(symbol, period="1d", interval="1m",
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 4:
+            return initial_direction
+        closes = df["Close"].squeeze().astype(float)
+        opens  = df["Open"].squeeze().astype(float)
+        # Check last 3 candles direction
+        bull = sum(1 for i in range(-3, 0) if float(closes.iloc[i]) > float(opens.iloc[i]))
+        bear = 3 - bull
+        if bull >= 2 and initial_direction == "SELL":
+            logging.info("CONFIRM FLIP {}: SELL→BUY (recheck shows {}bull/{}bear)".format(pair, bull, bear))
+            return "BUY"
+        if bear >= 2 and initial_direction == "BUY":
+            logging.info("CONFIRM FLIP {}: BUY→SELL (recheck shows {}bull/{}bear)".format(pair, bull, bear))
+            return "SELL"
+    except Exception as e:
+        logging.warning("_confirm_signal_direction {} failed: {}".format(pair, e))
+    return initial_direction
+# ─────────────────────────────────────────────────────────────
 
 # ============================================================
 # BLACKLIST
@@ -4049,6 +4092,28 @@ def is_weekend():
         return True
     return False
 
+def _session_header_text():
+    """Return current session line for display above pair keyboard."""
+    _SESSION_EMOJIS = {
+        "London Open":  "🟢",
+        "London Mid":   "🟢",
+        "NY/London":    "🟡",
+        "NY Session":   "🟡",
+        "Asian":        "🔵",
+        "Pre-London":   "🟠",
+        "Dead Hours":   "🔴",
+    }
+    try:
+        sess = _get_session()
+        name = sess.get("name", "")
+        if not name or name in ("Dead Hours", "Off Hours", ""):
+            return "🔴 *Dead Hours* — low activity"
+        emoji = _SESSION_EMOJIS.get(name, "🕐")
+        return "{} *{}*".format(emoji, name)
+    except Exception:
+        return ""
+
+
 def pairs_keyboard():
     """Build the pair selection keyboard.
     Weekday: OTC + non-OTC mixed, 3 per row, max 96 buttons.
@@ -4060,31 +4125,32 @@ def pairs_keyboard():
     weekend = is_weekend()
 
     if weekend:
-        # Weekend — OTC only, sorted by win rate (best first), max 96
+        # Weekend - OTC only, hot pairs first, then by win rate, max 96
         otc_all = [p for p in ALL_PAIRS if "OTC" in p]
-        # Get win rates from DB
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT pair,
                                ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
-                               (wins + losses) AS total
-                        FROM pair_stats
-                        WHERE pair = ANY(%s)
+                               (wins + losses) AS total,
+                               COALESCE(consecutive_wins, 0) AS consecutive_wins
+                        FROM pair_stats WHERE pair = ANY(%s)
                     """, (otc_all,))
-                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0))
+                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0), int(r["consecutive_wins"] or 0))
                                for r in cur.fetchall()}
         except Exception:
             wr_rows = {}
 
-        # Sort: pairs with data first (by win rate desc), then unknown pairs
-        known   = sorted([p for p in otc_all if p in wr_rows and wr_rows[p][1] >= 3],
-                         key=lambda p: wr_rows[p][0], reverse=True)
+        def _sort_key_w(p):
+            wr, total, cw = wr_rows.get(p, (0, 0, 0))
+            return (-(cw >= 3), -wr, -total)
+
+        known   = sorted([p for p in otc_all if p in wr_rows and wr_rows[p][1] >= 3], key=_sort_key_w)
         unknown = [p for p in otc_all if p not in known]
         pairs   = (known + unknown)[:_MAX_BUTTONS]
     else:
-        # Weekday — OTC + non-OTC mixed, sorted by win rate (best first)
+        # Weekday - OTC + non-OTC mixed, hot pairs first, then by win rate
         all_pairs = [p for p in ALL_PAIRS if ("OTC" in p) or ("OTC" not in p and "/" in p and "BTC" not in p)]
         try:
             with get_conn() as conn:
@@ -4092,17 +4158,20 @@ def pairs_keyboard():
                     cur.execute("""
                         SELECT pair,
                                ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
-                               (wins + losses) AS total
-                        FROM pair_stats
-                        WHERE pair = ANY(%s)
+                               (wins + losses) AS total,
+                               COALESCE(consecutive_wins, 0) AS consecutive_wins
+                        FROM pair_stats WHERE pair = ANY(%s)
                     """, (all_pairs,))
-                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0))
+                    wr_rows = {r["pair"]: (float(r["win_rate"] or 0), int(r["total"] or 0), int(r["consecutive_wins"] or 0))
                                for r in cur.fetchall()}
         except Exception:
             wr_rows = {}
 
-        known   = sorted([p for p in all_pairs if p in wr_rows and wr_rows[p][1] >= 3],
-                         key=lambda p: wr_rows[p][0], reverse=True)
+        def _sort_key_d(p):
+            wr, total, cw = wr_rows.get(p, (0, 0, 0))
+            return (-(cw >= 3), -wr, -total)
+
+        known   = sorted([p for p in all_pairs if p in wr_rows and wr_rows[p][1] >= 3], key=_sort_key_d)
         unknown = [p for p in all_pairs if p not in known]
         pairs   = (known + unknown)[:_MAX_BUTTONS]
 
@@ -4118,9 +4187,12 @@ def pairs_keyboard():
     if row:
         rows.append(row)
 
-    return InlineKeyboardMarkup(rows)
+    # Session info as first row (non-clickable)
+    sess_line = _session_header_text()
+    if sess_line:
+        rows.insert(0, [InlineKeyboardButton(sess_line, callback_data="noop")])
 
-def signal_keyboard(pair):
+    return InlineKeyboardMarkup(rows)
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
@@ -4865,21 +4937,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # --- Check user signal state (normal OTC flow) ---
+        # --- Always fresh signal — ignore cooldown, generate new one ---
         check = check_signal_request(user_id, pair)
-        if check["action"] == "cooldown":
-            return
-
-        if not is_candle_safe_zone():
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
-                ])
-            )
-            return
+        clear_user_signal_state(user_id, pair)  # Force fresh always
 
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         is_non_otc = False  # pair is OTC
@@ -5135,19 +5195,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         inactivity_reset(user_id, chat)
 
-        if not is_candle_safe_zone():
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
-                                          callback_data="otctf_{}_{}".format(idx_str, chosen_secs))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
         try: await q.message.delete()
         except: pass
 
@@ -5297,18 +5344,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inactivity_reset(user_id, chat)
             clear_user_signal_state(user_id, pair)
 
-        if not is_candle_safe_zone():
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
         await asyncio.sleep(0.3)
 
@@ -5338,6 +5373,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         direction = sig["direction"]
         strength  = sig["strength"]
+
+        # ── A: SIGNAL CONFIRMATION DELAY ─────────────────────
+        # Wait 4s and recheck direction before sending to user
+        _is_otc_confirm = "OTC" in pair
+        direction = await _confirm_signal_direction(pair, direction, _is_otc_confirm)
+        # ─────────────────────────────────────────────────────
 
         # MTF override: use MTF direction + timeframe if confirmed
         _mtf_cap = None
@@ -5570,23 +5611,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     # Continue to generate — don't return
 
-        # --- Candle safe zone check ---
-        # Block if we are in the first 10 seconds (new candle) or last 10 seconds (candle closing)
-        if not is_candle_safe_zone():
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No clear signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
+        # --- Capture entry price IMMEDIATELY (before any processing delay) ---
         cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
 
-        # --- Capture entry price IMMEDIATELY (before any processing delay) ---
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
         entry_price = None
         if is_non_otc:
@@ -7282,6 +7309,51 @@ def is_contrarian_pair(pair):
 
 
 # ============================================================
+# ── H: LICENCE EXPIRY WARNING LOOP ──────────────────────────
+async def _licence_expiry_warning_loop(bot):
+    """
+    Runs every 12 hours. Sends warning to users whose licence
+    expires in exactly 3 days or 1 day. Sent once per threshold.
+    """
+    while True:
+        await asyncio.sleep(12 * 3600)
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, expiry_date
+                        FROM users
+                        WHERE licence_type IN ('monthly','lifetime')
+                          AND expiry_date IS NOT NULL
+                          AND expiry_date > NOW()
+                          AND expiry_date <= NOW() + INTERVAL '4 days'
+                    """)
+                    rows = cur.fetchall()
+            for r in rows:
+                uid    = r["user_id"]
+                expiry = r["expiry_date"]
+                days   = (expiry - datetime.now()).days
+                if days not in (3, 1):
+                    continue
+                emoji = "⚠️" if days == 3 else "🚨"
+                try:
+                    await bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            "{} *Licence Expiry Reminder*\n\n"
+                            "Your subscription expires in *{} day{}*.\n"
+                            "Renew now to keep receiving signals uninterrupted."
+                        ).format(emoji, days, "s" if days > 1 else ""),
+                        parse_mode="Markdown"
+                    )
+                    logging.info("Expiry warning sent to user={} days={}".format(uid, days))
+                except Exception as _e:
+                    logging.warning("Expiry warning failed user={}: {}".format(uid, _e))
+        except Exception as e:
+            logging.warning("_licence_expiry_warning_loop error: {}".format(e))
+# ─────────────────────────────────────────────────────────────
+
+
 async def _stats_reset_loop():
     """Reset wins_today/losses_today every 30 minutes."""
     while True:
@@ -7340,6 +7412,10 @@ async def run_bot():
     if _NN_AVAILABLE:
         asyncio.create_task(_nn_scheduled_retrain_loop())
         print("NN scheduled retrain loop started.")
+
+    # ── Launch licence expiry warning loop (every 12 hours) ────
+    asyncio.create_task(_licence_expiry_warning_loop(ptb_app.bot))
+    print("Licence expiry warning loop started.")
 
     # Keepalive
     while True:
