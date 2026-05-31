@@ -2135,6 +2135,12 @@ def _check_pip_movement(pair):
 # D — SPREAD/VOLATILITY (ATR) CHECK
 # ============================================================
 _ATR_DEAD_THRESHOLD = 0.015  # % — below this = dead market, no signal
+_FORCE_PAIRS = set()  # Admin-forced pairs — bypass flat/dead market filter
+
+
+def is_force_pair(pair):
+    """Return True if admin has forced this pair to always give signal."""
+    return pair in _FORCE_PAIRS or "__ALL__" in _FORCE_PAIRS
 
 def _check_volatility(pair):
     """
@@ -3513,7 +3519,7 @@ def generate_signal(pair):
 
     # ── D: VOLATILITY (ATR) CHECK — dead market filter ────────
     atr_pct, is_dead_market = 0.05, False
-    if not is_otc:
+    if not is_otc and not is_force_pair(pair):
         try:
             atr_pct, is_dead_market = _check_volatility(pair)
         except Exception as _e:
@@ -4510,6 +4516,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/toggleotc` — Enable or disable OTC pairs\n"
             "• OTC OFF → show non-OTC pairs only\n"
             "• OTC ON  → all pairs visible (default)\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔓 *FORCE PAIR*\n"
+            "`/forcepair EURUSD OTC` — bypass flat filter for pair\n"
+            "`/forcepair all` — bypass for all pairs\n"
+            "`/forcepair list` — show forced pairs\n"
+            "`/unforcepair all` — clear all overrides\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🧠 *NEURAL NETWORK*\n"
             "`/nnstats` — NN status, accuracy & per-pair models\n"
@@ -5573,7 +5585,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Non-OTC: Show TF selection keyboard ────────────────
-        context.user_data["_user_chose_tf"] = True  # user will pick TF manually
+        context.user_data["_user_chose_tf"] = True
         _tfm = await context.bot.send_message(
             chat_id=chat,
             text="⚡ *{}*\n\nSelect signal duration:".format(pair),
@@ -5582,48 +5594,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         save_last_bot_msg(user_id, _tfm.message_id)
         return
-
-        # --- Check user signal state ---
-        check = check_signal_request(user_id, pair)
-
-        if check["action"] == "cooldown":
-            # Silent — do nothing
-            return
-
-        # (block removed — user always gets a signal without restriction)
-
-        # Signal still active — redirect to getmore_ for a new signal
-        if check["action"] not in ("fresh", "flip", "same"):
-            state = get_user_signal_state(user_id, pair)
-            if state:
-                signal_time = state["signal_time"]
-                if isinstance(signal_time, str):
-                    signal_time = datetime.fromisoformat(signal_time)
-                elapsed   = (datetime.utcnow() - signal_time).total_seconds()
-                threshold = state["last_timeframe"] * 60
-                if elapsed < threshold:
-                    # Signal still active — issue new signal immediately for same pair
-                    idx_str = pair_to_idx(pair)
-                    await context.bot.send_message(
-                        chat_id=chat,
-                        text="⚠️ *Previous signal still active!*\n\nGenerating a new signal for *{}*...".format(pair),
-                        parse_mode="Markdown"
-                    )
-                    # Continue to generate — don't return
-
-        # --- Capture entry price IMMEDIATELY (before any processing delay) ---
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
-
-        is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-        entry_price = None
-        if is_non_otc:
-            entry_price = _fetch_current_price(pair)
-        signal_capture_time = datetime.utcnow()
-
-        await asyncio.sleep(0.2)
-
-        # --- Trend validation ---
-        trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
             try:
@@ -6014,6 +5984,50 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
+        # ── Force pair bypass flat filter ───────────────────
+        if text.startswith("/forcepair"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await update.message.reply_text(
+                    "Usage:\n`/forcepair EURUSD OTC` — force one pair\n`/forcepair all` — force all pairs\n`/forcepair list` — show forced pairs",
+                    parse_mode="Markdown"
+                )
+                return
+            arg = parts[1].strip().upper()
+            if arg == "LIST":
+                if not _FORCE_PAIRS:
+                    await update.message.reply_text("No forced pairs.")
+                else:
+                    await update.message.reply_text("Forced pairs:\n{}".format("\n".join(sorted(_FORCE_PAIRS))))
+                return
+            if arg == "ALL":
+                _FORCE_PAIRS.clear()
+                _FORCE_PAIRS.add("__ALL__")
+                await update.message.reply_text("✅ ALL pairs forced — flat filter bypassed.")
+                return
+            # Match partial pair name
+            matched = [p for p in ALL_PAIRS if arg in p.upper().replace("/","").replace(" ","")]
+            if not matched:
+                await update.message.reply_text("❌ No pair matched: {}".format(arg))
+                return
+            for p in matched:
+                _FORCE_PAIRS.add(p)
+            await update.message.reply_text("✅ Forced: {}".format(", ".join(matched)))
+            return
+
+        if text.startswith("/unforcepair"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or parts[1].strip().upper() == "ALL":
+                _FORCE_PAIRS.clear()
+                await update.message.reply_text("✅ All force overrides cleared.")
+                return
+            arg = parts[1].strip().upper()
+            removed = [p for p in list(_FORCE_PAIRS) if arg in p.upper().replace("/","").replace(" ","")]
+            for p in removed:
+                _FORCE_PAIRS.discard(p)
+            await update.message.reply_text("✅ Removed: {}".format(", ".join(removed) if removed else "none found"))
+            return
+
         if text=="/nnstats":
             ns = nn_get_stats()
             if not ns["available"]:
