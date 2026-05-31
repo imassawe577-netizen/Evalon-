@@ -3834,13 +3834,9 @@ def generate_signal(pair):
         if tv > sv:
             bonus = int((tv / tf_total) * 30)
             b += bonus
-            if direction == "BUY":
-                indicators_agree += tv
         elif sv > tv:
             bonus = int((sv / tf_total) * 30)
             s += bonus
-            if direction == "SELL":
-                indicators_agree += sv
         else:
             # Conflict across timeframes — reduce confidence
             b -= 10
@@ -3936,6 +3932,13 @@ def generate_signal(pair):
         if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
     if trend_1h == direction:
         indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection is stronger
+
+    # ── NON-OTC TF VOTE CONFLUENCE (added here — direction is now known) ──
+    if real and not is_otc and real.get("tf_count", 0) >= 2:
+        tv = real.get("tf_buy_votes", 0)
+        sv = real.get("tf_sell_votes", 0)
+        if direction == "BUY"  and tv > sv: indicators_agree += tv
+        if direction == "SELL" and sv > tv: indicators_agree += sv
 
     # ── PATTERN CONFLUENCE ───────────────────────────────────
     # If patterns agree with direction — boost indicators_agree
@@ -4259,6 +4262,11 @@ def generate_signal(pair):
                     pair, direction, nn_confidence, nn_used))
     # ─────────────────────────────────────────────────────────
 
+    # ── AUTO-REVERSE ─────────────────────────────────────────
+    if is_reverse_pair(pair):
+        direction = "SELL" if direction == "BUY" else "BUY"
+        logging.info("AUTO-REVERSE applied: {} → {}".format(pair, direction))
+
     record_signal(pair, direction)
     result = {
         "direction": direction, "pair": pair, "timeframe": timeframe,
@@ -4273,27 +4281,6 @@ def generate_signal(pair):
         "_nn_feat_arr":  nn_feat_arr,  # stored internally for VTE feedback
     }
     return result
-
-    # ── AUTO-REVERSE ─────────────────────────────────────────
-    if is_reverse_pair(pair):
-        direction = "SELL" if direction == "BUY" else "BUY"
-
-    record_signal(pair, direction)
-    return {
-        "direction": direction,
-        "pair": pair,
-        "timeframe": timeframe,
-        "strength": strength,
-        "indicators_agree": indicators_agree,
-        "trend_1h": trend_1h,
-        "vwap_data": vwap_data,
-        "confluence": confluence,
-        "mtf": mtf,
-        "flat": (timeframe == 0),
-        "patterns": detected_patterns,
-        "movement_cat": movement_cat,
-        "avg_movement": avg_movement,
-    }
 
 
 # ============================================================
@@ -4431,10 +4418,6 @@ def pairs_keyboard():
         rows.insert(0, [InlineKeyboardButton(sess_line, callback_data="noop")])
 
     return InlineKeyboardMarkup(rows)
-    idx = pair_to_idx(pair)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
-    ])
 
 def nonotc_signal_keyboard(pair, chosen_tf):
     idx = pair_to_idx(pair)
@@ -5228,7 +5211,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if trend is not None:
                 direction = trend
-            elif sig.get("indicators_agree", 7) < 4:
+            elif sig.get("indicators_agree", 7) < 4 and is_non_otc:
                 try: await cm.delete()
                 except: pass
                 _nsm = await context.bot.send_message(
@@ -5463,7 +5446,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend_dir = get_trend_direction(pair)
         if trend_dir is not None:
             direction = trend_dir
-        elif sig.get("indicators_agree", 7) < 4:
+        elif sig.get("indicators_agree", 7) < 4 and "OTC" not in pair:
             try: await cm.delete()
             except: pass
             _nsm = await context.bot.send_message(
@@ -5708,7 +5691,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             save_last_bot_msg(user_id, _nsm.message_id)
             return
-        elif is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
+        elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
             try: await cm.delete()
             except: pass
             _nsm = await context.bot.send_message(
@@ -5914,7 +5897,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
-            elif not is_non_otc and sig.get("indicators_agree", 7) < 4:
+            elif is_non_otc and sig.get("indicators_agree", 7) < 4:
                 try: await cm.delete()
                 except: pass
                 _nsm = await context.bot.send_message(
