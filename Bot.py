@@ -4715,6 +4715,13 @@ def admin_image_keyboard():
         [InlineKeyboardButton("📉 Set SELL Image", callback_data="set_sell_img")],
     ])
 
+def signal_keyboard(pair):
+    """Get More button shown after every signal."""
+    idx = pair_to_idx(pair)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))],
+    ])
+
 # ============================================================
 # PAYMENT TEXT
 # ============================================================
@@ -4933,7 +4940,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 *PAIR STATS & REVERSE*\n"
             "`/pairstats` — Win/loss stats for all pairs\n"
-            "`/addreverse PAIR` — Pair itoe direction kinyume\n"
+            "`/addreverse PAIR` — Flip signal direction for a pair\n"
             "`/removereverse PAIR` — Remove reverse for a pair\n"
             "`/listreverse` — List all reverse pairs\n"
             "━━━━━━━━━━━━━━━━━━\n"
@@ -4943,16 +4950,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• OTC ON  → all pairs visible (default)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🎛 *SIGNAL FILTERS*\n"
-            "`/filterstatus` — Angalia hali ya filters zote\n"
-            "`/filteroff news` — Zima news block filter\n"
-            "`/filteroff dead` — Zima dead market filter\n"
-            "`/filteroff conflict` — Zima 1H vs short-TF filter\n"
-            "`/filteroff stability` — Zima signal stability filter\n"
-            "`/filteroff confluence` — Zima min confluence filter\n"
-            "`/filteroff h1confirm` — Zima 1H candle gate\n"
-            "`/filteroff micro_trend` — Zima micro-candle trend filter\n"
-            "`/filteroff all` — Zima FILTERS ZOTE\n"
-            "`/filteron [name|all]` — Washa filter/filters\n"
+            "`/filterstatus` — View status of all filters\n"
+            "`/filteroff news` — Disable news block filter\n"
+            "`/filteroff dead` — Disable dead market filter\n"
+            "`/filteroff conflict` — Disable 1H vs short-TF filter\n"
+            "`/filteroff stability` — Disable signal stability filter\n"
+            "`/filteroff confluence` — Disable min confluence filter\n"
+            "`/filteroff h1confirm` — Disable 1H candle gate\n"
+            "`/filteroff micro_trend` — Disable micro-candle trend filter\n"
+            "`/filteroff all` — Disable ALL filters\n"
+            "`/filteron [name|all]` — Enable filter(s)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔓 *FORCE PAIR*\n"
             "`/forcepair EURUSD OTC` — bypass flat filter for pair\n"
@@ -5973,32 +5980,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # ── OTC: Show mode selection (seconds OR normal minutes) ───
+        # ── OTC: Show seconds keyboard (mtumiaji achague mwenyewe) ───
         if "OTC" in pair:
+            if not is_licensed(user_id):
+                _otcm = await context.bot.send_message(
+                    chat_id=chat,
+                    text=(
+                        "🔒 *Seconds signals — Subscribers Only*\n\n"
+                        "This option is available for licensed subscribers only.\n\n"
+                        "Upgrade to unlock:\n"
+                        "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
+                        "✅ Unlimited signals\n"
+                        "✅ Win rate 90% — 98%"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
+                        [InlineKeyboardButton("🔙 Back", callback_data="choose_pair")],
+                    ])
+                )
+                save_last_bot_msg(user_id, _otcm.message_id)
+                return
             _otcm = await context.bot.send_message(
                 chat_id=chat,
-                text=(
-                    "⚡ *{}*\n\n"
-                    "Choose signal type:\n\n"
-                    "⏱ *Seconds* — 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
-                    "📊 *Normal* — minute-based signal"
-                ).format(pair),
+                text="⏱ *{}*\n\nChoose signal duration:".format(pair),
                 parse_mode="Markdown",
-                reply_markup=otc_mode_keyboard(pair)
+                reply_markup=otc_seconds_keyboard(pair)
             )
             save_last_bot_msg(user_id, _otcm.message_id)
             return
 
-        # ── Non-OTC: Show TF selection keyboard ────────────────
-        context.user_data["_user_chose_tf"] = True
-        _tfm = await context.bot.send_message(
-            chat_id=chat,
-            text="⚡ *{}*\n\nSelect signal duration:".format(pair),
-            parse_mode="Markdown",
-            reply_markup=nonotc_tf_keyboard(pair)
+        # ── Non-OTC: Bot decides TF automatically (1m/2m/3m) ────────────────
+        context.user_data["_user_chose_tf"] = False
+
+        # Initialize variables for non-OTC auto flow
+        is_non_otc  = True
+        entry_price = None
+        trend       = get_trend_direction(pair)
+        check       = check_signal_request(user_id, pair)
+        clear_user_signal_state(user_id, pair)
+        cm = await context.bot.send_message(
+            chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown"
         )
-        save_last_bot_msg(user_id, _tfm.message_id)
-        return
+        await asyncio.sleep(0.3)
 
         if check["action"] == "fresh":
             sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
@@ -6143,169 +6167,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         task = asyncio.create_task(inactivity_expire(user_id, chat))
         USER_INACTIVITY[user_id]["task"] = task
-
-async def query_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Directly handle reply keyboard button presses — no middleman button needed."""
-    user_id = update.effective_user.id
-
-    if data == "help_inline":
-        await query.answer()
-        await query.message.reply_text(
-            "ℹ️ *EVALON MASTER PRO — Help*\n\n"
-            "⚡ *Get Signal* — Chagua pair na upate signal\n"
-            "🤖 *Bot Pick Pair* — Bot inakuchagulia pair bora\n"
-            "📊 *My Stats* — Angalia matokeo yako\n"
-            "💎 *Upgrade* — Nunua licence ya monthly au lifetime\n\n"
-            "📌 *Jinsi ya kutumia:*\n"
-            "1. Bonyeza EVALON MENU\n"
-            "2. Chagua Get Signal au Bot Pick Pair\n"
-            "3. Subiri signal — ingia trade wakati signal inaonekana\n\n"
-            "",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data == "choose_pair":
-        weekend = is_weekend()
-        taglines = [
-            "🌙 *After-Hours Trading*\nWeekend-only pairs available 24/7." if weekend else
-            "🌍 *Real Market Pairs*\nTrade on live market data.",
-        ]
-        tagline = random.choice(taglines)
-        sess = get_trading_session()
-        sess_txt = ""
-        if sess and sess.get("name","") not in ("Dead Hours","Off Hours",""):
-            sess_txt = "\n🕐 *{}* active".format(sess["name"])
-        header = "⚡ *EVALON MASTER PRO*\n\n{}{}\n\n📊 Select your trading pair:".format(tagline, sess_txt)
-        await update.message.reply_text(
-            header,
-            parse_mode="Markdown",
-            reply_markup=pairs_keyboard()
-        )
-        return
-
-    if data == "bot_pick_pair":
-        # Free trial users cannot use Bot Pick Pair — subscribers only
-        if not is_licensed(user_id):
-            await update.message.reply_text(
-                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
-                "This feature is available for licensed subscribers only.\n\n"
-                "Upgrade to get:\n"
-                "✅ Bot-picked best pairs\n"
-                "✅ Unlimited signals\n"
-                "✅ Win rate 90% — 98%",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
-                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
-        weekend      = is_weekend()
-        otc_on       = is_otc_enabled()
-        force_non_otc = not otc_on
-
-        # Get top 5 — weekend=OTC only, weekday=Forex only
-        if force_non_otc or not weekend:
-            top5 = get_top5_pairs(non_otc_only=True)
-        else:
-            top5 = get_top5_pairs(otc_only=True)
-
-        # Fallback
-        if len(top5) < 3:
-            if not weekend:
-                pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
-            else:
-                pool = [p for p in ALL_PAIRS if "OTC" in p]
-            random.shuffle(pool)
-            existing = {r["pair"] for r in top5}
-            for p in pool:
-                if p not in existing and len(top5) < 5:
-                    top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
-                    existing.add(p)
-
-        is_admin_user = (user_id == ADMIN_ID)
-        buttons = []
-        for row in top5:
-            pair  = row["pair"]
-            wr    = row.get("win_rate") or 0
-            total = row.get("wins", 0) + row.get("losses", 0)
-            if is_admin_user and total > 0:
-                label = "📊 {} — {:.0f}% ({} trades)".format(pair, wr, total)
-            else:
-                label = "📊 {}".format(pair)
-            try:
-                idx = ALL_PAIRS.index(pair)
-            except ValueError:
-                continue
-            buttons.append([InlineKeyboardButton(label, callback_data="sel_{}".format(idx))])
-
-        kb = InlineKeyboardMarkup(buttons)
-
-        await update.message.reply_text(
-            "🤖 *Bot Top 5 Picks*\n\n"
-            "Pairs ranked by virtual trading win rate.\n"
-            "Select one to get a signal:",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-        return
-
-    if data == "pay_info":
-        await update.message.reply_text(
-            PAYMENT_TEXT,
-            parse_mode="Markdown",
-            reply_markup=payment_keyboard()
-        )
-        return
-
-    if data == "my_stats":
-        u = get_user(user_id)
-        licensed = is_licensed(user_id)
-        lic_type = u.get("licence_type", "").capitalize() if licensed else "Free Trial"
-        expiry_txt = get_expiry_text(user_id) if licensed else "—"
-        free_used = free_signals_used(user_id)
-        free_allowed = total_free_allowed(user_id)
-        refs = count_referrals(user_id)
-        bonus = get_bonus_signals(user_id)
-        # Referral link → REFERRAL_BOT (separate from admin bot)
-        ref_link = "https://t.me/{}?start=REF_{}".format(REFERRAL_BOT, user_id)
-        share_url = "https://t.me/share/url?url={}".format(ref_link)
-        if refs >= 5:
-            ref_status = "🎁 {} bonus signals (5+ referrals)".format(bonus)
-        elif refs >= 3:
-            ref_status = "🎁 {} bonus signals (3-4 referrals)".format(bonus)
-        else:
-            needed = 3 - refs
-            ref_status = "⏳ Invite {} more to get bonus signals!".format(needed)
-        await update.message.reply_text(
-            "📊 *YOUR STATS*\n\n"
-            "🔑 Status: {}\n"
-            "⏳ Expiry: {}\n"
-            "🆓 Free signals: {}/{}\n"
-            "👥 Referrals: {}\n"
-            "🎁 Bonus signals: {}\n"
-            "{}\n\n"
-            ""
-            "{}".format(
-                lic_type, expiry_txt, free_used, free_allowed, refs, bonus,
-                ref_status, ref_link,
-                "_Upgrade to get unlimited signals!_" if not licensed else "_Thank you for being a subscriber!_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
-                [InlineKeyboardButton("💎 Upgrade", callback_data="pay_info")],
-                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
-            ]) if not licensed else InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Referral Link", url=share_url)],
-                [InlineKeyboardButton("📊 Get Signal", callback_data="choose_pair")],
-            ])
-        )
-        return
-
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id=update.effective_user.id
@@ -6794,14 +6655,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_otc_enabled(new_state)
             if new_state:
                 await update.message.reply_text(
-                    "✅ *OTC Pairs: WASHA (ON)*\n\n"
+                    "✅ *OTC Pairs: ON*\n\n"
                     "All pairs are now visible — OTC and non-OTC.\n\n"
                     "_Use /toggleotc again to disable OTC._",
                     parse_mode="Markdown"
                 )
             else:
                 await update.message.reply_text(
-                    "🔴 *OTC Pairs: ZIMA (OFF)*\n\n"
+                    "🔴 *OTC Pairs: OFF*\n\n"
                     "Users will see *non-OTC pairs only* now.\n"
                     "OTC pairs are hidden from the keyboard.\n\n"
                     "_Use /toggleotc again to enable OTC._",
@@ -6815,8 +6676,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🎛 *SIGNAL FILTERS STATUS*\n\n"
                 "{}\n\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                "Zima: `/filteroff news` au `/filteroff all`\n"
-                "Washa: `/filteron news` au `/filteron all`".format(get_filters_status()),
+                "Disable: `/filteroff news` or `/filteroff all`\n"
+                "Enable: `/filteron news` or `/filteron all`".format(get_filters_status()),
                 parse_mode="Markdown"
             )
             return
@@ -6828,7 +6689,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "Usage: `/filteroff [name|all]`\n\n"
                     "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
-                    "Au: `/filteroff all` — zima zote",
+                    "Or: `/filteroff all` — disable all",
                     parse_mode="Markdown"
                 )
                 return
@@ -6842,12 +6703,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif arg in _FILTER_FLAGS:
                 _FILTER_FLAGS[arg] = False
                 await update.message.reply_text(
-                    "🔴 *Filter zimwa:* `{}`\n\n{}".format(arg, get_filters_status()),
+                    "🔴 *Filter disabled:* `{}`\n\n{}".format(arg, get_filters_status()),
                     parse_mode="Markdown"
                 )
             else:
                 await update.message.reply_text(
-                    "❌ Filter haijulikani: `{}`\n\nNames sahihi: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
+                    "❌ Unknown filter: `{}`\n\nValid names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
                     parse_mode="Markdown"
                 )
             return
@@ -6859,7 +6720,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "Usage: `/filteron [name|all]`\n\n"
                     "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
-                    "Au: `/filteron all` — washa zote",
+                    "Or: `/filteron all` — enable all",
                     parse_mode="Markdown"
                 )
                 return
@@ -6867,18 +6728,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for k in _FILTER_FLAGS:
                     _FILTER_FLAGS[k] = True
                 await update.message.reply_text(
-                    "✅ *Filters ZOTE zimewashwa*\n\n{}".format(get_filters_status()),
+                    "✅ *All filters enabled*\n\n{}".format(get_filters_status()),
                     parse_mode="Markdown"
                 )
             elif arg in _FILTER_FLAGS:
                 _FILTER_FLAGS[arg] = True
                 await update.message.reply_text(
-                    "✅ *Filter washa:* `{}`\n\n{}".format(arg, get_filters_status()),
+                    "✅ *Filter enabled:* `{}`\n\n{}".format(arg, get_filters_status()),
                     parse_mode="Markdown"
                 )
             else:
                 await update.message.reply_text(
-                    "❌ Filter haijulikani: `{}`\n\nNames sahihi: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
+                    "❌ Unknown filter: `{}`\n\nValid names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`".format(arg),
                     parse_mode="Markdown"
                 )
             return
