@@ -322,7 +322,17 @@ def support_url():
 # NEON POSTGRESQL
 # ============================================================
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    """Connect to Neon PostgreSQL with retry on SSL/EOF errors."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor,
+                                    connect_timeout=10)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1)
+    raise last_err
 
 def init_db():
     with get_conn() as conn:
@@ -1716,6 +1726,10 @@ def _get_session():
 def _session_bias():
     s = _get_session()
     return (s["buy_bias"], s["sell_bias"])
+
+# Alias — used in handlers
+def get_trading_session():
+    return _get_session()
 
 def _pair_type(pair):
     p = pair.replace(" OTC", "").upper()
@@ -4865,7 +4879,13 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import ReplyKeyboardMarkup, KeyboardButton
     user_id = update.effective_user.id
-    get_user(user_id)
+
+    # DB calls wrapped — bot still responds even if DB is temporarily down
+    try:
+        get_user(user_id)
+    except Exception as e:
+        logging.warning("start: get_user failed for {}: {}".format(user_id, e))
+
     # Referral check
     if context.args:
         try:
@@ -4875,11 +4895,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 register_referral(user_id, referrer_id)
         except Exception:
             pass
-    # Channel membership check
-    if not await check_channel_and_proceed(update, context):
-        return
 
-    # ── 1 Button keyboard ─────────────────────────────────────
+    # Channel membership check — skip if it fails, don't block user
+    try:
+        if not await check_channel_and_proceed(update, context):
+            return
+    except Exception as e:
+        logging.warning("start: channel check failed for {}: {}".format(user_id, e))
+
     reply_kb = ReplyKeyboardMarkup(
         [["🏆 EVALON MENU"]],
         resize_keyboard=True,
