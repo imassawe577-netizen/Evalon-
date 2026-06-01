@@ -4,3 +4,5 @@ aiohttp>=3.9.0
 yfinance
 pandas
 websockets>=11.0
+scikit-learn
+numpy
