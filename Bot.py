@@ -2474,28 +2474,18 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 _otc_flip_cache: dict = {}
 
 async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
-    """Send a non-OTC signal with MTF-style caption."""
-    ib       = direction == "BUY"
-    mtf_dir  = "CALL" if ib else "PUT"
-    trend_score = min(99.0, max(50.0, 50.0 + float(sig.get("indicators_agree", 5)) * 2.5))
-
-    # Build MTF tf_labels from available data
-    mtf      = sig.get("mtf")
-    tf_labels = []
-    if mtf and mtf.get("details"):
-        label_map = [("5s", None), ("1m", "1m"), ("15m", "15m"), ("4h", None)]
-        details   = mtf["details"]
-        for lbl, key in label_map:
-            if key and key in details:
-                tf_labels.append((lbl, details[key]))
-            else:
-                tf_labels.append((lbl, None))
-    else:
-        tf_labels = [("5s", None), ("1m", direction), ("15m", direction), ("4h", None)]
-
-    caption  = build_mtf_caption(pair, mtf_dir, timeframe, tf_labels, trend_score, near=True)
-    kb       = nonotc_signal_keyboard(pair, timeframe)
-    img      = get_buy_image() if ib else get_sell_image()
+    """Send a non-OTC signal — simple clean caption."""
+    ib          = direction == "BUY"
+    arrow       = "Up 🟢" if ib else "Down 🔴"
+    strength    = sig.get("strength", 70)
+    # Ensure strength is in % format (60–99)
+    if isinstance(strength, int) and strength > 100:
+        strength = int(60 + (strength - 300) / 200 * 39)
+    strength = max(60, min(99, int(strength)))
+    caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(
+        pair, arrow, timeframe, strength)
+    kb  = nonotc_signal_keyboard(pair, timeframe)
+    img = get_buy_image() if ib else get_sell_image()
     try:
         await delete_last_signal(context.bot, chat, user_id)
         sent = await context.bot.send_photo(chat_id=chat, photo=img, caption=caption,
@@ -2966,27 +2956,14 @@ def run_mtf_signal_engine(pair):
 
 
 def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=False):
-    """
-    Build signal caption with MTF TF breakdown.
-    direction: 'CALL' or 'PUT'
-    """
-    arrow    = "Up 🟢" if direction == "CALL" else "Down 🔴"
-    near_tag = " _(near)_" if near else ""
-    badge    = "✅ FULL CONFIRMATION" if not near else "⚡ NEAR CONFIRMATION"
-    lines    = []
-    for lbl, d in tf_labels:
-        if d == "BUY":   lines.append("🟢 {}".format(lbl))
-        elif d == "SELL": lines.append("🔴 {}".format(lbl))
-        else:             lines.append("⚪ {} (no data)".format(lbl))
-    tf_block = "\n".join(lines)
+    """Simple signal caption — clean na wazi."""
+    arrow = "Up 🟢" if direction == "CALL" else "Down 🔴"
+    strength_pct = int(max(60, min(99, trend_score)))
     return (
         "*{}* {}\n"
-        "🕐 In *{}* min{}\n\n"
-        "📋 *MTF Confirmation:*\n"
-        "{}\n\n"
-        "{}\n"
-        "📊 Trend strength: *{:.0f}%*"
-    ).format(pair, arrow, sig_type, near_tag, tf_block, badge, trend_score)
+        "🕐 In *{}* min\n"
+        "📊 Signal strength: {}%"
+    ).format(pair, arrow, sig_type, strength_pct)
 
 # ── END MTF ENGINE ───────────────────────────────────────────
 
@@ -3914,7 +3891,51 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
 # ============================================================
 # SAFE SIGNAL WRAPPER — timeout + guaranteed OTC fallback
 # ============================================================
-_SIGNAL_TIMEOUT = 20  # seconds — max wait for generate_signal
+_SIGNAL_TIMEOUT = 12  # seconds — max wait for generate_signal
+
+async def animated_analyzing(bot, chat_id, pair: str):
+    """
+    Inatuma ujumbe wa 'Analyzing...' na animation ya dots inayobadilika.
+    Inarudisha (message_obj, stop_event) — piga stop_event.set() ukitaka isimame.
+
+    Mfano wa matumizi:
+        cm, stop = await animated_analyzing(context.bot, chat, pair)
+        sig = await safe_generate_signal(pair)
+        stop.set()
+        try: await cm.delete()
+        except: pass
+    """
+    frames = [
+        "🔵 *Analyzing {}*".format(pair),
+        "🔵 *Analyzing {}.*".format(pair),
+        "🔵 *Analyzing {}...*".format(pair),
+        "🔵 *Analyzing {}...* ↪️".format(pair),
+        "🟣 *Processing {}...* ✨".format(pair),
+        "🟣 *Processing {}...* 🔍".format(pair),
+        "🔵 *Checking indicators {}...* ⏳".format(pair),
+        "🔵 *Checking indicators {}* 🏆".format(pair),
+    ]
+    stop_event = asyncio.Event()
+    try:
+        cm = await bot.send_message(chat_id=chat_id, text=frames[0], parse_mode="Markdown")
+    except Exception:
+        return None, stop_event
+
+    async def _animate():
+        i = 1
+        while not stop_event.is_set():
+            await asyncio.sleep(1.2)
+            if stop_event.is_set():
+                break
+            try:
+                await cm.edit_text(frames[i % len(frames)], parse_mode="Markdown")
+            except Exception:
+                break
+            i += 1
+
+    asyncio.create_task(_animate())
+    return cm, stop_event
+
 
 async def safe_generate_signal(pair: str) -> dict:
     """
@@ -4447,14 +4468,16 @@ def generate_signal(pair):
     if mtf and mtf["total"] >= 3:
         agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
         mtf_bonus = int((agreeing / mtf["total"]) * 45)
-    trend_bonus = 20 if trend_1h == direction else 0  # Increased from 15
+    trend_bonus = 20 if trend_1h == direction else 0
     pattern_bonus_str = min(30, pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus)
     hist_bonus_str = int(hist_pct * 20) if hist_total >= 5 else 0
 
-    # Strength formula: base 280 + bonuses (max 500)
-    strength = min(500, max(300, 280 + indicators_agree*25 + int((dom/tot)*100)
+    # Strength formula: base 280 + bonuses (max 500) → convert to 60–99%
+    _raw_strength = min(500, max(300, 280 + indicators_agree*25 + int((dom/tot)*100)
                             + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
                             ))
+    # Map 300–500 → 60–99%
+    strength = int(60 + (_raw_strength - 300) / 200 * 39)
 
     # ── TIMEFRAME SELECTION ──────────────────────────────────
     if is_otc:
@@ -5674,14 +5697,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         check = check_signal_request(user_id, pair)
         clear_user_signal_state(user_id, pair)  # Force fresh always
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
+        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
         is_non_otc = False  # pair is OTC
         entry_price = None
-        await asyncio.sleep(0.3)
         trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
             sig = await safe_generate_signal(pair)  # guaranteed — OTC always signals
+            _anim_stop.set()
             direction = sig["direction"]
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
@@ -5694,6 +5717,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
+                await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -5709,6 +5733,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif sig.get("indicators_agree", 7) < 4 and is_non_otc:
                 try: await cm.delete()
                 except: pass
+                await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -5742,7 +5767,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In {} min.\n📊 Signal strength: {}%".format(pair, arrow, timeframe, strength)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
@@ -5807,10 +5832,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_chose_tf = context.user_data.pop("_user_chose_tf", False)
         try: await q.message.delete()
         except: pass
-        cm = await context.bot.send_message(
-            chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown"
-        )
+        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
         sig = await safe_generate_signal(pair)  # timeout-safe, never hangs
+        _anim_stop.set()
         direction = sig["direction"]
         timeframe = chosen_tf
 
@@ -5924,10 +5948,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
-        await asyncio.sleep(0.3)
+        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
         sig       = await safe_generate_signal(pair)  # OTC — always returns signal
+        _anim_stop.set()
         direction = sig["direction"]
         strength  = sig["strength"]
 
@@ -5937,6 +5961,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif sig.get("indicators_agree", 7) < 4 and "OTC" not in pair:
             try: await cm.delete()
             except: pass
+            await delete_last_signal(context.bot, chat, user_id)
             _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -5959,7 +5984,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
 
-        cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}".format(pair, arrow, chosen_secs, strength)
+        cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%".format(pair, arrow, chosen_secs, strength)
         sent_msg = await context.bot.send_photo(
             chat_id=chat,
             photo=img,
@@ -6070,8 +6095,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inactivity_reset(user_id, chat)
             clear_user_signal_state(user_id, pair)
 
-        cm = await context.bot.send_message(chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown")
-        await asyncio.sleep(0.3)
+        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
         _is_non_otc_pair = "OTC" not in pair and pair in YAHOO_SYMBOLS
         _mtf_result = None
@@ -6081,7 +6105,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     asyncio.get_event_loop().run_in_executor(
                         None, run_mtf_signal_engine_with_fallback, pair
                     ),
-                    timeout=18.0
+                    timeout=10.0
                 )
             except asyncio.TimeoutError:
                 logging.warning("MTF timeout for {} — skipping MTF".format(pair))
@@ -6090,6 +6114,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
         sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
+        _anim_stop.set()
         direction = sig["direction"]
         strength  = sig["strength"]
 
@@ -6144,8 +6169,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sig.get("flat") and sig["timeframe"] == 0:
             try: await cm.delete()
             except: pass
+            await delete_last_signal(context.bot, chat, user_id)
             msg = sig.get("no_signal_reason") or "🟡 *No signal available*"
-            await context.bot.send_message(
+            _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text=msg,
                 parse_mode="Markdown",
@@ -6153,6 +6179,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
+            save_last_bot_msg(user_id, _nsm.message_id)
             return
 
         # Trend validation
@@ -6163,7 +6190,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 4):
             try: await cm.delete()
             except: pass
-            reason = sig.get("no_signal_reason", "")
+            await delete_last_signal(context.bot, chat, user_id)
             _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -6177,6 +6204,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
             try: await cm.delete()
             except: pass
+            await delete_last_signal(context.bot, chat, user_id)
             _nsm = await context.bot.send_message(
                 chat_id=chat,
                 text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -6202,30 +6230,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
+        arrow = "Up 🟢" if ib else "Down 🔴"
+        _str  = sig.get("strength", 70)
+        if isinstance(_str, int) and _str > 100:
+            _str = int(60 + (_str - 300) / 200 * 39)
+        _str = max(60, min(99, int(_str)))
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        if _mtf_cap:
-            cap = _mtf_cap
-        elif gm_is_non_otc:
-            _gm_dir_s = "CALL" if ib else "PUT"
-            _gm_ts = min(99.0, max(50.0, 50.0 + float(sig.get("indicators_agree", 5)) * 2.5))
-            _gm_mtf = sig.get("mtf")
-            _gm_tf_labels = []
-            if _gm_mtf and _gm_mtf.get("details"):
-                _gm_details = _gm_mtf["details"]
-                for _lbl, _key in [("5s", None), ("1m", "1m"), ("15m", "15m"), ("4h", None)]:
-                    if _key and _key in _gm_details:
-                        _gm_tf_labels.append((_lbl, _gm_details[_key]))
-                    else:
-                        _gm_tf_labels.append((_lbl, None))
-            else:
-                _gm_tf_labels = [("5s", None), ("1m", direction), ("15m", direction), ("4h", None)]
-            cap = build_mtf_caption(pair, _gm_dir_s, timeframe, _gm_tf_labels, _gm_ts, near=True)
-        else:
-            arrow = "Up 🟢" if ib else "Down 🔴"
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
 
@@ -6364,13 +6378,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend       = get_trend_direction(pair)
         check       = check_signal_request(user_id, pair)
         clear_user_signal_state(user_id, pair)
-        cm = await context.bot.send_message(
-            chat_id=chat, text="🔵 *Analyzing {}...*".format(pair), parse_mode="Markdown"
-        )
-        await asyncio.sleep(0.3)
+        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
         if check["action"] == "fresh":
             sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
+            _anim_stop.set()
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
@@ -6379,12 +6391,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
-                reason = sig.get("no_signal_reason", "")
-                extra = ""
-                if "conflict" in reason:
-                    extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
-                elif "flip" in reason:
-                    extra = "\n\n_Market direction changed too quickly — waiting for stability._"
+                await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -6402,12 +6409,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
                 try: await cm.delete()
                 except: pass
-                reason = sig.get("no_signal_reason", "")
-                extra = ""
-                if "conflict" in reason:
-                    extra = "\n\n_1H trend and short-term momentum are not aligned yet._"
-                elif "flip" in reason:
-                    extra = "\n\n_Market direction changed too quickly — waiting for stability._"
+                await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -6421,6 +6423,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif is_non_otc and sig.get("indicators_agree", 7) < 4:
                 try: await cm.delete()
                 except: pass
+                await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
@@ -6472,28 +6475,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
+        arrow = "Up 🟢" if ib else "Down 🔴"
+        _str2 = sig.get("strength", 70)
+        if isinstance(_str2, int) and _str2 > 100:
+            _str2 = int(60 + (_str2 - 300) / 200 * 39)
+        _str2 = max(60, min(99, int(_str2)))
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        if is_non_otc:
-            _mtf_dir_s = "CALL" if ib else "PUT"
-            _ts = min(99.0, max(50.0, 50.0 + float(sig.get("indicators_agree", 5)) * 2.5))
-            _mtf = sig.get("mtf")
-            _tf_labels = []
-            if _mtf and _mtf.get("details"):
-                _details = _mtf["details"]
-                for _lbl, _key in [("5s", None), ("1m", "1m"), ("15m", "15m"), ("4h", None)]:
-                    if _key and _key in _details:
-                        _tf_labels.append((_lbl, _details[_key]))
-                    else:
-                        _tf_labels.append((_lbl, None))
-            else:
-                _tf_labels = [("5s", None), ("1m", direction), ("15m", direction), ("4h", None)]
-            cap = build_mtf_caption(pair, _mtf_dir_s, timeframe, _tf_labels, _ts, near=True)
-        else:
-            arrow = "Up 🟢" if ib else "Down 🔴"
-            cap = "*{}* {}\n🕐 In {} mins.\n📊 Signal strength: {}".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str2)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
 
