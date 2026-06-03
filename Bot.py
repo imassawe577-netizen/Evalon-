@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-EVALON WINNERS BOT - Telegram Bot
+EVALON WINNERS BOT - Telegram Bot v3.1
+Upgraded: Ensemble ML, ADX filter, signal_outcomes, smart expiry, midnight reset
 python-telegram-bot[webhooks]==21.3 + Neon PostgreSQL via psycopg2
 """
 
@@ -12,8 +13,16 @@ from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _Ba
 
 class _H(_BaseHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"EVALON WINNERS BOT OK")
+        if self.path == "/health":
+            body = b'{"status":"ok","version":"3.1","bot":"EVALON WINNERS BOT"}' 
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"EVALON WINNERS BOT OK v3.1")
     def log_message(self, *a): pass
 
 _PORT = int(_os.environ.get("PORT", 8080))
@@ -45,14 +54,14 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID       = 8054370971
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
-FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "d8cl2q1r01qidic8fee0d8cl2q1r01qidic8feeg")
+FINNHUB_KEY    = os.environ.get("FINNHUB_KEY", "")
 CHANNEL_INVITE = "https://t.me/+mRNfGaNhz3RkZGRk"
 CHANNEL_ID     = -1003403743370  # EVALON WINNERS BOT channel
 BOT_USERNAME   = ""  # Set at startup in run_bot()
 
 SUPPORT_BOT  = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
-DERIV_TOKEN  = os.environ.get("DERIV_TOKEN", "pat_c518f7669d62cbae95d46e0052ff8b44d07601a1b89bb035fd668a2e35fafdb4")
+DERIV_TOKEN  = os.environ.get("DERIV_TOKEN", "")
 # ============================================================
 # DERIV WEBSOCKET — MICRO CANDLE ENGINE (5s/10s/15s)
 # Used to confirm 1m signals before sending
@@ -69,11 +78,28 @@ try:
     from sklearn.neural_network import MLPClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.exceptions import NotFittedError
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+    from sklearn.linear_model import LogisticRegression
     import pickle, os as _os_nn
     _NN_AVAILABLE = True
+    # XGBoost optional
+    try:
+        import xgboost as xgb
+        _XGB_AVAILABLE = True
+    except ImportError:
+        _XGB_AVAILABLE = False
+        logging.info("XGBoost not installed — using GradientBoosting fallback. pip install xgboost")
+    # LightGBM optional
+    try:
+        import lightgbm as lgb
+        _LGB_AVAILABLE = True
+    except ImportError:
+        _LGB_AVAILABLE = False
 except ImportError:
     _NN_AVAILABLE = False
-    logging.warning("scikit-learn/numpy not installed — NN disabled. Run: pip install scikit-learn numpy")
+    _XGB_AVAILABLE = False
+    _LGB_AVAILABLE = False
+    logging.warning("scikit-learn/numpy not installed — Ensemble ML disabled. Run: pip install scikit-learn numpy")
 # ─────────────────────────────────────────────────────────────
 
 # Deriv symbol mapping — Pocket Option pair → Deriv symbol
@@ -415,6 +441,175 @@ async def confirm_signal_with_deriv(pair, signal_direction):
 
 
 
+
+async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
+                                     rsi, sto, ma_diff, macd, bb_pos, mom, vol, candle,
+                                     atr_pct=0.05, adx_val=20.0, cci_val=0.0, wpr_val=-50.0,
+                                     fib_bonus=0, pa_score=0, pattern_bonus=0,
+                                     tf_votes=0, pip_movement=0.08):
+    """
+    Intelligently select best expiry for a non-OTC signal.
+
+    Returns: (best_tf: int, reason: str)
+    - best_tf: 1, 2, or 3 (minutes). Returns 0 if no good TF found.
+    - reason: explanation string for logging
+
+    Scoring per TF (1/2/3):
+      score_tf = (deriv_score * 0.40) + (db_score * 0.35) + (ml_score * 0.25)
+    """
+    if "OTC" in pair:
+        return (2, "OTC — expiry not applicable")
+
+    scores = {1: 0.0, 2: 0.0, 3: 0.0}
+    reasons = {1: [], 2: [], 3: []}
+
+    # ── A. Deriv WebSocket micro-trend (40% weight) ──────────
+    deriv_score = {1: 0.0, 2: 0.0, 3: 0.0}
+    try:
+        data = await asyncio.wait_for(
+            _fetch_deriv_ticks(pair, seconds=15),
+            timeout=8
+        )
+        if data:
+            # 1m → 5s micro, 2m → 10s micro, 3m → 15s micro
+            tf_key_map = {1: "5_s", 2: "10_s", 3: "15_s"}
+            for tf_m, micro_key in tf_key_map.items():
+                trend = data.get(micro_key)
+                if trend:
+                    d   = trend.get("direction", "FLAT")
+                    str_val = trend.get("strength", 0)
+                    rev = trend.get("reversal", False)
+                    if d == direction and not rev:
+                        deriv_score[tf_m] = min(1.0, str_val / 100.0)
+                        reasons[tf_m].append("Deriv {:.0f}%".format(str_val))
+                    elif rev:
+                        deriv_score[tf_m] = -0.2  # Reversal penalty
+                        reasons[tf_m].append("reversal!")
+    except Exception as e:
+        logging.info("select_best_expiry Deriv failed {}: {}".format(pair, e))
+
+    for tf_m in [1, 2, 3]:
+        scores[tf_m] += deriv_score[tf_m] * 0.40
+
+    # ── B. DB historical win rate per pair/session/TF (35% weight) ──
+    db_score = {1: 0.0, 2: 0.0, 3: 0.0}
+    try:
+        session_name = _get_session().get("name", "Unknown")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS win_rate,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                """, (pair, session_name))
+                rows = cur.fetchall()
+                # Also try overall stats
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS win_rate,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND tf_mins IN (1, 2, 3)
+                """, (pair,))
+                overall_rows = cur.fetchall()
+        # Session-specific wins (higher weight)
+        session_data = {}
+        for r in rows:
+            if r["win_rate"] is not None and int(r["total"]) >= 3:
+                session_data[int(r["tf_mins"])] = (float(r["win_rate"]), int(r["total"]))
+        # Overall wins (fallback)
+        overall_data = {}
+        for r in overall_rows:
+            if r["win_rate"] is not None and int(r["total"]) >= 3:
+                overall_data[int(r["tf_mins"])] = (float(r["win_rate"]), int(r["total"]))
+
+        for tf_m in [1, 2, 3]:
+            if tf_m in session_data:
+                wr, total = session_data[tf_m]
+                # Win rate 0.5 = neutral, 1.0 = max positive, 0.0 = max negative
+                db_score[tf_m] = (wr - 0.4) / 0.6   # Normalise: 0.4=0, 1.0=1
+                db_score[tf_m] = max(-0.5, min(1.0, db_score[tf_m]))
+                conf = min(1.0, total / 20.0)  # Confidence rises with total trades
+                db_score[tf_m] *= conf
+                reasons[tf_m].append("DB session {:.0f}% ({} trades)".format(wr * 100, total))
+            elif tf_m in overall_data:
+                wr, total = overall_data[tf_m]
+                db_score[tf_m] = (wr - 0.4) / 0.6
+                db_score[tf_m] = max(-0.5, min(1.0, db_score[tf_m]))
+                conf = min(1.0, total / 30.0)
+                db_score[tf_m] *= conf * 0.7  # Overall has less weight than session
+                reasons[tf_m].append("DB overall {:.0f}%".format(wr * 100))
+    except Exception as e:
+        logging.info("select_best_expiry DB failed {}: {}".format(pair, e))
+
+    for tf_m in [1, 2, 3]:
+        scores[tf_m] += db_score[tf_m] * 0.35
+
+    # ── C. Ensemble ML probability per TF (25% weight) ──────
+    ml_score = {1: 0.0, 2: 0.0, 3: 0.0}
+    if _NN_AVAILABLE and _nn_global_model is not None and _nn_global_scaler is not None:
+        try:
+            for tf_m in [1, 2, 3]:
+                feat = _nn_features_from_signal(
+                    sig_snapshot, rsi, sto, ma_diff, macd, bb_pos, mom, vol, candle,
+                    atr_pct=atr_pct, adx_val=adx_val, cci_val=cci_val, wpr_val=wpr_val,
+                    fib_bonus=fib_bonus, pa_score=pa_score, pattern_bonus=pattern_bonus,
+                    tf_votes=tf_votes, pip_movement=pip_movement, tf_mins=tf_m
+                )
+                if feat is not None:
+                    # Pad/trim to match scaler feature count
+                    expected_features = _nn_global_scaler.n_features_in_
+                    if feat.shape[1] != expected_features:
+                        if feat.shape[1] < expected_features:
+                            pad = np.zeros((1, expected_features - feat.shape[1]), dtype=np.float32)
+                            feat = np.hstack([feat, pad])
+                        else:
+                            feat = feat[:, :expected_features]
+
+                    # Check per-pair model first
+                    pair_entry = _nn_per_pair.get(pair)
+                    if pair_entry and pair_entry.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES:
+                        model  = pair_entry["model"]
+                        scaler = pair_entry["scaler"]
+                    else:
+                        model  = _nn_global_model
+                        scaler = _nn_global_scaler
+
+                    X_sc   = scaler.transform(feat)
+                    proba  = model.predict_proba(X_sc)[0]
+                    prob_win = float(proba[1]) if len(proba) > 1 else 0.5
+                    # Normalise: 0.5=neutral → 0, 1.0=max → 1
+                    ml_score[tf_m] = (prob_win - 0.5) * 2.0
+                    ml_score[tf_m] = max(-1.0, min(1.0, ml_score[tf_m]))
+                    reasons[tf_m].append("ML {:.0f}%".format(prob_win * 100))
+        except Exception as e:
+            logging.info("select_best_expiry ML failed {}: {}".format(pair, e))
+
+    for tf_m in [1, 2, 3]:
+        scores[tf_m] += ml_score[tf_m] * 0.25
+
+    # ── D. Final decision ───────────────────────────────────
+    best_tf   = max(scores, key=lambda t: scores[t])
+    best_score = scores[best_tf]
+
+    # Minimum threshold: composite score must be positive to use a TF
+    if best_score < 0.05:
+        # No TF has strong enough evidence
+        return (0, "no_tf_support score={:.2f}".format(best_score))
+
+    reason_str = "tf={}m score={:.2f} [1m:{:.2f} 2m:{:.2f} 3m:{:.2f}] | {}".format(
+        best_tf, best_score,
+        scores[1], scores[2], scores[3],
+        " / ".join(reasons[best_tf])
+    )
+    logging.info("EXPIRY SELECT {}: {}".format(pair, reason_str))
+    return (best_tf, reason_str)
+
+
+
+
 def support_url():
     """Returns support link — opens support bot with 'admin' pre-filled."""
     return "https://t.me/{}?text=admin".format(SUPPORT_BOT)
@@ -425,16 +620,22 @@ def support_url():
 # NEON POSTGRESQL
 # ============================================================
 def get_conn():
-    """Connect to Neon PostgreSQL with retry on SSL/EOF errors."""
+    """Connect to Neon PostgreSQL with retry on SSL/EOF errors. Uses statement_timeout=15s."""
     last_err = None
     for attempt in range(3):
         try:
-            return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor,
-                                    connect_timeout=10)
+            conn = psycopg2.connect(
+                DATABASE_URL,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=10,
+                options="-c statement_timeout=15000"  # 15s query timeout
+            )
+            conn.autocommit = False
+            return conn
         except Exception as e:
             last_err = e
             if attempt < 2:
-                time.sleep(1)
+                time.sleep(1 + attempt)
     raise last_err
 
 def init_db():
@@ -543,10 +744,79 @@ def init_db():
                     tf_mins INTEGER NOT NULL,
                     wins INTEGER DEFAULT 0,
                     losses INTEGER DEFAULT 0,
+                    avg_movement DOUBLE PRECISION DEFAULT 0.0,
                     PRIMARY KEY (pair, session, tf_mins)
                 );
+                ALTER TABLE tf_session_stats ADD COLUMN IF NOT EXISTS avg_movement DOUBLE PRECISION DEFAULT 0.0;
+                CREATE INDEX IF NOT EXISTS idx_tf_session_pair ON tf_session_stats (pair, session);
+                CREATE INDEX IF NOT EXISTS idx_signal_history_pair ON signal_history (pair, created_at DESC);
+                CREATE TABLE IF NOT EXISTS reverse_pairs (
+                    pair TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS nn_models (
+                    model_key TEXT PRIMARY KEY,
+                    model_data BYTEA NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS nn_training_data (
+                    id SERIAL PRIMARY KEY,
+                    pair TEXT NOT NULL,
+                    features BYTEA NOT NULL,
+                    label INTEGER NOT NULL,
+                    tf_mins INTEGER DEFAULT 0,
+                    won_at_tf1 BOOLEAN DEFAULT NULL,
+                    won_at_tf2 BOOLEAN DEFAULT NULL,
+                    won_at_tf3 BOOLEAN DEFAULT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                ALTER TABLE nn_training_data ADD COLUMN IF NOT EXISTS tf_mins INTEGER DEFAULT 0;
+                CREATE TABLE IF NOT EXISTS signal_outcomes (
+                    id SERIAL PRIMARY KEY,
+                    pair TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    tf_used INTEGER NOT NULL,
+                    won BOOLEAN NOT NULL,
+                    entry_price DOUBLE PRECISION DEFAULT NULL,
+                    exit_price DOUBLE PRECISION DEFAULT NULL,
+                    movement_pct DOUBLE PRECISION DEFAULT 0.0,
+                    session TEXT DEFAULT NULL,
+                    indicators_agree INTEGER DEFAULT 0,
+                    trend_1h TEXT DEFAULT NULL,
+                    confluence_level TEXT DEFAULT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS last_msg_store (
+                    user_id BIGINT NOT NULL,
+                    msg_type TEXT NOT NULL,
+                    msg_id BIGINT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, msg_type)
+                );
+                CREATE TABLE IF NOT EXISTS last_signal_time (
+                    user_id BIGINT PRIMARY KEY,
+                    signal_time DOUBLE PRECISION NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS virtual_trades (
+                    id SERIAL PRIMARY KEY,
+                    pair TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    direction TEXT NOT NULL,
+                    expiry DOUBLE PRECISION NOT NULL,
+                    tf_secs INTEGER NOT NULL,
+                    nn_feat BYTEA DEFAULT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_virtual_trades_pair ON virtual_trades (pair);
+                CREATE INDEX IF NOT EXISTS idx_virtual_trades_expiry ON virtual_trades (expiry);
+                CREATE TABLE IF NOT EXISTS nn_signal_features (
+                    user_id BIGINT NOT NULL,
+                    pair TEXT NOT NULL,
+                    features BYTEA NOT NULL,
+                    original_direction TEXT DEFAULT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, pair)
+                );
 
-            """)
         conn.commit()
 
 # ============================================================
@@ -590,6 +860,41 @@ def get_pair_stats_all():
                 return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logging.warning("get_pair_stats_all failed: {}".format(e))
+        return []
+
+
+
+# ============================================================
+# REVERSE PAIRS — bot flips direction for these pairs
+# ============================================================
+def is_reverse_pair(pair):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM reverse_pairs WHERE pair = %s", (pair,))
+                return cur.fetchone() is not None
+    except:
+        return False
+
+def add_reverse_pair(pair):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO reverse_pairs (pair) VALUES (%s) ON CONFLICT DO NOTHING", (pair,))
+        conn.commit()
+
+def remove_reverse_pair(pair):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM reverse_pairs WHERE pair = %s", (pair,))
+        conn.commit()
+
+def get_all_reverse_pairs():
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pair FROM reverse_pairs ORDER BY pair")
+                return [r["pair"] for r in cur.fetchall()]
+    except:
         return []
 
 def get_best_pair(otc_only=False):
@@ -901,13 +1206,29 @@ def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
 
 # Track last signal + last bot message per user (for deletion on next action)
-LAST_SIGNAL_MSG = {}  # {user_id: message_id}
-LAST_BOT_MSG    = {}  # {user_id: message_id} — menus, no-signal, etc.
+# DB is source of truth — in-memory dicts are cache only
+LAST_SIGNAL_MSG = {}
+LAST_BOT_MSG    = {}
 
 async def delete_last_signal(bot, chat_id, user_id):
     """Delete previous signal AND last bot message if exists."""
-    for store in [LAST_SIGNAL_MSG, LAST_BOT_MSG]:
-        msg_id = store.pop(user_id, None)
+    for msg_type in ["signal", "bot"]:
+        msg_id = None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM last_msg_store WHERE user_id=%s AND msg_type=%s RETURNING msg_id",
+                        (user_id, msg_type)
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if row:
+                msg_id = row["msg_id"]
+        except Exception:
+            # fallback to in-memory
+            store = LAST_SIGNAL_MSG if msg_type == "signal" else LAST_BOT_MSG
+            msg_id = store.pop(user_id, None)
         if msg_id:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
@@ -915,21 +1236,69 @@ async def delete_last_signal(bot, chat_id, user_id):
                 pass
 
 def save_last_signal_msg(user_id, msg_id):
-    LAST_SIGNAL_MSG[user_id] = msg_id
+    LAST_SIGNAL_MSG[user_id] = msg_id  # in-memory cache
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO last_msg_store (user_id, msg_type, msg_id, updated_at) "
+                    "VALUES (%s, 'signal', %s, NOW()) "
+                    "ON CONFLICT (user_id, msg_type) DO UPDATE SET msg_id=%s, updated_at=NOW()",
+                    (user_id, msg_id, msg_id)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("save_last_signal_msg DB failed: {}".format(e))
 
 def save_last_bot_msg(user_id, msg_id):
-    LAST_BOT_MSG[user_id] = msg_id
+    LAST_BOT_MSG[user_id] = msg_id  # in-memory cache
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO last_msg_store (user_id, msg_type, msg_id, updated_at) "
+                    "VALUES (%s, 'bot', %s, NOW()) "
+                    "ON CONFLICT (user_id, msg_type) DO UPDATE SET msg_id=%s, updated_at=NOW()",
+                    (user_id, msg_id, msg_id)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("save_last_bot_msg DB failed: {}".format(e))
 
 # ============================================================
 # ANTI-SPAM
 # ============================================================
-LAST_SIGNAL_TIME = {}
-SPAM_SECONDS = 2  # Minimal anti-flood — tiny delay only, never block signal
+LAST_SIGNAL_TIME = {}  # in-memory cache only
 
 def is_spam(user_id):
     """Never block the user — just track timing for slight delay."""
     now  = time.time()
     last = LAST_SIGNAL_TIME.get(user_id, 0)
+    if last == 0:
+        # try DB
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT signal_time FROM last_signal_time WHERE user_id=%s", (user_id,))
+                    row = cur.fetchone()
+            if row:
+                last = row["signal_time"]
+                LAST_SIGNAL_TIME[user_id] = last
+        except Exception:
+            pass
+    LAST_SIGNAL_TIME[user_id] = now
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO last_signal_time (user_id, signal_time) VALUES (%s, %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET signal_time=%s",
+                    (user_id, now, now)
+                )
+            conn.commit()
+    except Exception:
+        pass
+    return (now - last) < SPAM_SECONDS
     LAST_SIGNAL_TIME[user_id] = now
     return False  # Never block — user always gets signal + Get More button
 
@@ -3382,6 +3751,99 @@ def _nn_load_training_data_from_db():
     return samples
 
 
+def _nn_make_mlp():
+    """Create a fresh MLP model."""
+    return MLPClassifier(
+        hidden_layer_sizes=(128, 64, 32),
+        activation="relu",
+        solver="adam",
+        alpha=0.001,
+        learning_rate="adaptive",
+        max_iter=600,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=25,
+    )
+
+
+def _nn_make_xgb():
+    """Create XGBoost or GradientBoosting model."""
+    if _XGB_AVAILABLE:
+        return xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=5,
+            learning_rate=0.08,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=42,
+            verbosity=0,
+        )
+    else:
+        return GradientBoostingClassifier(
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.08,
+            subsample=0.8,
+            random_state=42,
+        )
+
+
+def _nn_make_rf():
+    """Create Random Forest model."""
+    return RandomForestClassifier(
+        n_estimators=200,
+        max_depth=8,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+def _nn_make_lgb():
+    """Create LightGBM or fallback LogisticRegression."""
+    if _LGB_AVAILABLE:
+        return lgb.LGBMClassifier(
+            n_estimators=150,
+            max_depth=5,
+            learning_rate=0.08,
+            subsample=0.8,
+            random_state=42,
+            verbosity=-1,
+            n_jobs=-1,
+        )
+    else:
+        return LogisticRegression(
+            C=1.0,
+            max_iter=500,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+
+def _nn_make_model():
+    """Create the global ensemble model (VotingClassifier soft voting)."""
+    mlp = _nn_make_mlp()
+    xgb_m = _nn_make_xgb()
+    rf  = _nn_make_rf()
+    lgb_m = _nn_make_lgb()
+    # Soft voting: average probabilities from all 4 models
+    # Each model gets equal weight — can be tuned later
+    ensemble = VotingClassifier(
+        estimators=[
+            ("mlp",  mlp),
+            ("xgb",  xgb_m),
+            ("rf",   rf),
+            ("lgb",  lgb_m),
+        ],
+        voting="soft",
+        weights=[1.5, 2.0, 1.5, 1.5],  # XGBoost slightly higher weight
+    )
+    return ensemble
+
+
 def _nn_retrain_global(force=False):
     """Retrain global model. Called on schedule or after 20 new samples."""
     global _nn_global_model, _nn_global_scaler, _nn_last_retrain
@@ -3525,14 +3987,80 @@ def _nn_adjust_direction(pair, features_arr, current_direction):
 
 
 # ── NN Feature + flip cache ──────────────────────────────────
-_NN_SIGNAL_FEATURES = {}   # {(user_id, pair): (np.array, original_direction)}
-
+_NN_SIGNAL_FEATURES = {}  # in-memory cache only — DB is source of truth
 
 def nn_store_signal_features(user_id, pair, feat_arr, original_direction=None):
-    """Store features + original direction for VTE feedback."""
-    if feat_arr is not None:
-        _NN_SIGNAL_FEATURES[(user_id, pair)] = (feat_arr, original_direction)
+    """Store features + original direction for VTE feedback — DB + memory."""
+    if feat_arr is None:
+        return
+    _NN_SIGNAL_FEATURES[(user_id, pair)] = (feat_arr, original_direction)
+    if not _NN_AVAILABLE:
+        return
+    try:
+        import pickle as _pk
+        feat_bytes = _pk.dumps(feat_arr)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO nn_signal_features (user_id, pair, features, original_direction, created_at) "
+                    "VALUES (%s, %s, %s, %s, NOW()) "
+                    "ON CONFLICT (user_id, pair) DO UPDATE SET features=%s, original_direction=%s, created_at=NOW()",
+                    (user_id, pair, feat_bytes, original_direction, feat_bytes, original_direction)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("nn_store_signal_features DB failed: {}".format(e))
 
+def nn_get_signal_features(user_id, pair):
+    """Get stored features — try memory first, then DB."""
+    cached = _NN_SIGNAL_FEATURES.get((user_id, pair))
+    if cached:
+        return cached
+    if not _NN_AVAILABLE:
+        return None
+    try:
+        import pickle as _pk
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT features, original_direction FROM nn_signal_features "
+                    "WHERE user_id=%s AND pair=%s",
+                    (user_id, pair)
+                )
+                row = cur.fetchone()
+        if row:
+            feat_arr = _pk.loads(row["features"])
+            result = (feat_arr, row["original_direction"])
+            _NN_SIGNAL_FEATURES[(user_id, pair)] = result
+            return result
+    except Exception as e:
+        logging.warning("nn_get_signal_features DB failed: {}".format(e))
+    return None
+
+
+
+
+def record_signal_outcome(pair, direction, tf_used, won, entry_price=None, exit_price=None,
+                          movement_pct=0.0, session=None, indicators_agree=0,
+                          trend_1h=None, confluence_level=None):
+    """
+    Record detailed signal outcome to signal_outcomes table.
+    Used for expiry learning: tracks which TF worked best per setup.
+    Survives Render restarts (stored in Neon).
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO signal_outcomes
+                        (pair, direction, tf_used, won, entry_price, exit_price,
+                         movement_pct, session, indicators_agree, trend_1h, confluence_level)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (pair, direction, tf_used, won, entry_price, exit_price,
+                      movement_pct, session, indicators_agree, trend_1h, confluence_level))
+            conn.commit()
+    except Exception as e:
+        logging.warning("record_signal_outcome failed {}: {}".format(pair, e))
 
 def nn_feedback_from_vte(user_id, pair, won: bool):
     """Feed VTE trade outcome back to NN for learning."""
@@ -3783,6 +4311,51 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     symbol    = YAHOO_SYMBOLS.get(real_pair)
+
+    # ── 0. Deriv WebSocket — kwanza kabla ya yote ────────────
+    # Kama Deriv cache ipo na bado fresh → tumia moja kwa moja
+    # Kama cache imepita muda → jaribu fetch mpya (sync via cached data)
+    deriv_rescue_dir = None
+    deriv_rescue_tf  = None
+    _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)  # non-OTC pair — same kwa non-OTC
+    if _deriv_rescue_pair in DERIV_SYMBOLS:
+        try:
+            _dc = _deriv_tick_cache.get(_deriv_rescue_pair)
+            if _dc:
+                _dc_age = time.time() - _dc.get("ts", 0)
+                if _dc_age <= _DERIV_CACHE_TTL:
+                    _td = _dc["data"]
+                    _tf_map_r = {"5_s": 1, "10_s": 2, "15_s": 3}
+                    _best_str_r = -1
+                    for _mk, _tm in _tf_map_r.items():
+                        _tr = _td.get(_mk)
+                        if _tr and _tr.get("direction") not in (None, "FLAT"):
+                            _sv = _tr.get("strength", 0)
+                            if _sv > _best_str_r:
+                                _best_str_r    = _sv
+                                deriv_rescue_dir = _tr["direction"]
+                                deriv_rescue_tf  = _tm
+                    if deriv_rescue_dir:
+                        logging.info("RESCUE Deriv cache hit {}: {} {}m str={}".format(
+                            pair, deriv_rescue_dir, deriv_rescue_tf, _best_str_r))
+        except Exception as _de:
+            logging.warning("_rescue Deriv cache read failed {}: {}".format(pair, _de))
+
+    # Kama Deriv imetoa direction yenye nguvu (str >= 60) → rudisha moja kwa moja
+    if deriv_rescue_dir and _best_str_r >= 60:
+        _rescue_tf_final = deriv_rescue_tf or 1
+        logging.info("RESCUE nonOTC {} via Deriv: dir={} tf={}m".format(pair, deriv_rescue_dir, _rescue_tf_final))
+        return {
+            "direction": deriv_rescue_dir, "pair": pair, "timeframe": _rescue_tf_final,
+            "strength": min(99, 60 + int((_best_str_r / 100) * 39)),
+            "indicators_agree": 4,
+            "trend_1h": deriv_rescue_dir, "vwap_data": None, "confluence": {},
+            "mtf": None, "flat": False, "patterns": {},
+            "movement_cat": "MEDIUM", "avg_movement": 0.08,
+            "no_signal_reason": "",
+            "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
+            "_rescued": True,
+        }
 
     # ── 1. History direction ─────────────────────────────────
     hist_dir = None
@@ -4517,11 +5090,21 @@ def generate_signal(pair):
             _ia_thresholds = {1: 8, 2: 7, 3: 6}
             if indicators_agree >= _ia_thresholds[_tf]:
                 _score += indicators_agree * 5
-            # Micro support bonus
+            # Micro support bonus (Yahoo proxy)
             _score += _micro_scores.get(_tf, 0.0) * 0.5
-            # 1H trend confirmation bonus — TF yoyote inafaidika sawa
+            # 1H trend confirmation bonus
             if trend_1h == direction:
                 _score += 20
+            # ── Deriv cache bonus: kama cached Deriv data inakubaliana na direction ──
+            _dc_bonus = _deriv_ind_data  # fetched earlier at top of generate_signal
+            if _dc_bonus:
+                _dc_key_map = {1: "5_s", 2: "10_s", 3: "15_s"}
+                _dc_trend = _dc_bonus.get(_dc_key_map.get(_tf, ""))
+                if _dc_trend and _dc_trend.get("direction") == direction:
+                    _dc_str = _dc_trend.get("strength", 0)
+                    _score += int(_dc_str * 0.6)  # max +60 — Deriv inakuwa na uzito mkubwa
+                elif _dc_trend and _dc_trend.get("direction") not in (None, "FLAT") and _dc_trend["direction"] != direction:
+                    _score -= 20  # Deriv inapinga — punguza score
             _tf_candidate_scores[_tf] = _score
 
         # Chagua TF yenye score kubwa zaidi
@@ -4547,6 +5130,35 @@ def generate_signal(pair):
         ))
 
     # ── MICRO-CANDLE TREND: imeshughulikiwa ndani ya TF SELECTION block juu ──
+    # ─────────────────────────────────────────────────────────
+
+
+    # ── NON-OTC: ADX Weak-Trend Blocker ─────────────────────
+    # Block only in genuinely ranging/choppy market.
+    # ADX < 14  → always block
+    # ADX 14-20 + agree < 4 + no 1H trend + no VTE → block
+    if not is_otc and real is not None:
+        _adx_live = float(real.get("adx", 25.0)) if real.get("adx") else 25.0
+        _adx_block = False
+        if _adx_live < 14.0:
+            _adx_block = True
+        elif _adx_live < 20.0 and indicators_agree < 4 and trend_1h is None and vte_tf is None:
+            _adx_block = True
+
+        if _adx_block:
+            logging.info("ADX BLOCK {}: adx={:.1f} agree={} trend={} → no signal".format(
+                pair, _adx_live, indicators_agree, trend_1h))
+            record_signal(pair, direction)
+            return {
+                "direction": direction, "pair": pair, "timeframe": 0,
+                "strength": 0, "indicators_agree": indicators_agree,
+                "trend_1h": None, "vwap_data": vwap_data,
+                "confluence": {"level": "WEAK", "score": 0, "badge": "⚠️ RANGING"},
+                "mtf": mtf, "flat": True, "patterns": detected_patterns,
+                "movement_cat": movement_cat, "avg_movement": avg_movement,
+                "no_signal_reason": "🟡 *Market is ranging – ADX={:.0f}. No clear trend.*".format(_adx_live),
+                "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
+            }
     # ─────────────────────────────────────────────────────────
 
     # ── NON-OTC: Weak confluence → fuata 1H trend (ilikuwa ina bug ya kupinga 1H) ──
@@ -5846,17 +6458,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info("Deriv best_tf={} dir={} str={} — {}".format(
                     _best_tf, _micro_dir, _best_str, _best_reason))
                 if _best_tf is not None and _micro_dir is not None:
-                    # Sekunde inaamua — override direction na TF
+                    # Deriv sekunde inaamua — override direction na TF
                     direction = _micro_dir
                     timeframe = _best_tf
                 else:
-                    # Deriv FLAT — fallback: tumia MTF direction, chosen_tf
-                    logging.info("Deriv FLAT for {} — falling back to MTF direction".format(pair))
+                    # Deriv FLAT — angalia nguvu ya MTF kabla ya kutuma signal
+                    _weak_agree = sig.get("indicators_agree", 0) < 4
+                    _no_1h      = sig.get("trend_1h") is None
+                    if _weak_agree and _no_1h:
+                        # Deriv FLAT + MTF dhaifu + hakuna 1H trend → no signal
+                        _anim_stop.set()
+                        try: await cm.delete()
+                        except: pass
+                        _nsm = await context.bot.send_message(
+                            chat_id=chat,
+                            text="🟡 *No signal available* — market is unclear right now. Please try again in a few minutes.",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                            ])
+                        )
+                        save_last_bot_msg(user_id, _nsm.message_id)
+                        return
+                    # Deriv FLAT lakini MTF ina nguvu → tumia MTF direction, chosen_tf
+                    logging.info("Deriv FLAT for {} — MTF strong enough, using MTF direction".format(pair))
                     timeframe = chosen_tf
-                    # direction already set from safe_generate_signal above
             except Exception as _de:
                 logging.warning("Deriv pick_best_tf error: {} — falling back to MTF".format(_de))
-                timeframe = chosen_tf  # fallback kwa chosen_tf tu
+                timeframe = chosen_tf
         else:
             timeframe = chosen_tf  # Pair haipo Deriv — tumia chosen_tf
         # ─────────────────────────────────────────────────────
@@ -6145,12 +6774,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     direction = _micro_dir
                     timeframe = _best_tf
                 else:
-                    # Deriv FLAT — fallback: tumia MTF direction, keep existing timeframe
-                    logging.info("getmore Deriv FLAT for {} — falling back to MTF direction".format(pair))
-                    # direction already set from safe_generate_signal; timeframe unchanged
+                    # Deriv FLAT — angalia nguvu ya MTF
+                    _gm_weak = sig.get("indicators_agree", 0) < 4 and sig.get("trend_1h") is None
+                    if _gm_weak:
+                        try: await cm.delete()
+                        except: pass
+                        await delete_last_signal(context.bot, chat, user_id)
+                        _nsm = await context.bot.send_message(
+                            chat_id=chat,
+                            text="🟡 *No signal available* — market is unclear. Try again in a few minutes.",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                            ])
+                        )
+                        save_last_bot_msg(user_id, _nsm.message_id)
+                        return
+                    logging.info("getmore Deriv FLAT for {} — MTF strong, using MTF direction".format(pair))
             except Exception as _de:
                 logging.warning("getmore Deriv failed {}: {} — falling back to MTF".format(pair, _de))
-                # Deriv imeshindwa — fallback kwa MTF direction (usiache bila signal)
         elif _gm_is_non_otc:
             # Pair haipo Deriv — tumia MTF au generate_signal timeframe
             if _mtf_result and _mtf_result.get("direction") in ("CALL","PUT"):
@@ -7317,9 +7959,78 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # and skip recording those results (does not affect user signals).
 # ============================================================
 
-# In-memory store for pending virtual trades
-# { pair: [(entry_price, direction, expiry_timestamp, tf_secs), ...] }
+# _virtual_trades — DB is source of truth, in-memory dict is runtime cache only
 _virtual_trades: dict = {}
+
+def _vt_add_trade(pair, entry_price, direction, expiry, tf_secs, nn_feat=None):
+    """Save virtual trade to DB and in-memory cache."""
+    nn_bytes = None
+    if nn_feat is not None and _NN_AVAILABLE:
+        try:
+            import pickle as _pk
+            nn_bytes = _pk.dumps(nn_feat)
+        except Exception:
+            pass
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO virtual_trades (pair, entry_price, direction, expiry, tf_secs, nn_feat) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (pair, entry_price, direction, expiry, tf_secs, nn_bytes)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("_vt_add_trade DB failed {}: {}".format(pair, e))
+    # also keep in memory for speed
+    if pair not in _virtual_trades:
+        _virtual_trades[pair] = []
+    _virtual_trades[pair].append((entry_price, direction, expiry, tf_secs, nn_feat))
+
+def _vt_load_pending():
+    """Load all pending (unexpired) virtual trades from DB into memory on startup."""
+    now = time.time()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, pair, entry_price, direction, expiry, tf_secs, nn_feat "
+                    "FROM virtual_trades WHERE expiry > %s",
+                    (now,)
+                )
+                rows = cur.fetchall()
+        for row in rows:
+            pair = row["pair"]
+            nn_feat = None
+            if row["nn_feat"] and _NN_AVAILABLE:
+                try:
+                    import pickle as _pk
+                    nn_feat = _pk.loads(row["nn_feat"])
+                except Exception:
+                    pass
+            if pair not in _virtual_trades:
+                _virtual_trades[pair] = []
+            _virtual_trades[pair].append((
+                row["entry_price"], row["direction"],
+                row["expiry"], row["tf_secs"], nn_feat
+            ))
+        logging.info("VTE: loaded {} pending trades from DB".format(len(rows)))
+    except Exception as e:
+        logging.warning("_vt_load_pending failed: {}".format(e))
+
+def _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs):
+    """Remove a completed trade from DB."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM virtual_trades WHERE pair=%s AND entry_price=%s "
+                    "AND direction=%s AND expiry=%s AND tf_secs=%s",
+                    (pair, entry_price, direction, expiry, tf_secs)
+                )
+            conn.commit()
+    except Exception as e:
+        logging.warning("_vt_delete_trade failed {}: {}".format(pair, e))
 
 def _vt_get_last_direction(pair):
     """Get last recorded VTE direction for a pair from DB (survives restarts)."""
@@ -7422,7 +8133,7 @@ async def _vt_place_trades():
             # Place one trade per timeframe
             for tf_secs in VIRTUAL_TF_SECONDS:
                 expiry = now + tf_secs
-                _virtual_trades[pair].append((price, direction, expiry, tf_secs, nn_feat))
+                _vt_add_trade(pair, price, direction, expiry, tf_secs, nn_feat)
 
             logging.info("VTE NEW TRADE: {} → {} @ {:.5f}".format(
                 pair, direction, price))
@@ -7455,6 +8166,9 @@ async def _vt_check_results():
             if now < expiry:
                 remaining.append(trade)
                 continue
+
+            # Trade expired — delete from DB
+            _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs)
 
             exit_price = _fetch_current_price(pair)
             if exit_price is None or entry_price is None:
@@ -7665,43 +8379,121 @@ def is_news_time():
 
 def get_best_tf_for_session(pair):
     """
-    Pick best TF (1m/2m/3m) for a pair based on session-aware win rate from VTE.
-    Falls back to overall optimal_tf, then to 2m default.
-    Only considers TFs 1/2/3 minutes.
+    Pick best TF (1m/2m/3m) for a pair using 3 data sources:
+    1. signal_outcomes historical win rate + movement per TF (highest weight — real outcomes)
+    2. tf_session_stats session-specific win rate + movement
+    3. pair_stats.optimal_tf fallback
+
+    Scoring: win_rate(60%) + normalized_movement(25%) + sample_confidence(15%)
+    Falls back to 2m default if no data.
     """
     session = get_trading_session()
     sess_name = session.get("name", "Unknown") if session else "Unknown"
     target_tfs = [1, 2, 3]
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Try session-specific first
+                # ── Source 1: signal_outcomes — most accurate (real trade outcomes) ──
+                cur.execute("""
+                    SELECT tf_used AS tf_mins,
+                           COUNT(*) FILTER (WHERE won=TRUE)::float / NULLIF(COUNT(*), 0) AS win_rate,
+                           COUNT(*) AS total,
+                           AVG(movement_pct) AS avg_movement,
+                           AVG(movement_pct) FILTER (WHERE won=TRUE) AS avg_win_movement
+                    FROM signal_outcomes
+                    WHERE pair = %s
+                      AND tf_used = ANY(%s)
+                      AND created_at >= NOW() - INTERVAL '30 days'
+                    GROUP BY tf_used
+                    HAVING COUNT(*) >= 5
+                    ORDER BY tf_used
+                """, (pair, target_tfs))
+                outcome_rows = {int(r["tf_mins"]): r for r in cur.fetchall()}
+
+                # Also fetch session-specific from signal_outcomes
+                cur.execute("""
+                    SELECT tf_used AS tf_mins,
+                           COUNT(*) FILTER (WHERE won=TRUE)::float / NULLIF(COUNT(*), 0) AS win_rate,
+                           COUNT(*) AS total,
+                           AVG(movement_pct) AS avg_movement
+                    FROM signal_outcomes
+                    WHERE pair = %s AND session = %s
+                      AND tf_used = ANY(%s)
+                      AND created_at >= NOW() - INTERVAL '14 days'
+                    GROUP BY tf_used
+                    HAVING COUNT(*) >= 3
+                """, (pair, sess_name, target_tfs))
+                session_outcome_rows = {int(r["tf_mins"]): r for r in cur.fetchall()}
+
+                # ── Source 2: tf_session_stats ──
                 cur.execute("""
                     SELECT tf_mins,
-                           ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate,
+                           COALESCE(wins::float / NULLIF(wins+losses,0), 0.0) AS win_rate,
+                           COALESCE(avg_movement, 0.0) AS avg_movement,
                            (wins + losses) AS total
                     FROM tf_session_stats
-                    WHERE pair=%s AND session=%s AND tf_mins = ANY(%s)
+                    WHERE pair = %s AND session = %s AND tf_mins = ANY(%s)
                       AND (wins + losses) >= 5
-                    ORDER BY win_rate DESC, total DESC
-                    LIMIT 1
                 """, (pair, sess_name, target_tfs))
-                row = cur.fetchone()
-                if row:
-                    return int(row["tf_mins"])
+                tf_rows = {int(r["tf_mins"]): r for r in cur.fetchall()}
 
-                # Fallback: overall best TF from pair_stats (if in 1/2/3)
-                cur.execute(
-                    "SELECT optimal_tf FROM pair_stats WHERE pair=%s",
-                    (pair,)
-                )
-                row2 = cur.fetchone()
-                if row2 and row2["optimal_tf"] and int(row2["optimal_tf"]) in target_tfs:
-                    return int(row2["optimal_tf"])
+                # ── Source 3: pair_stats.optimal_tf ──
+                cur.execute("SELECT optimal_tf FROM pair_stats WHERE pair=%s", (pair,))
+                pair_row = cur.fetchone()
+                pair_optimal = int(pair_row["optimal_tf"]) if pair_row and pair_row["optimal_tf"] else None
+
+        # ── Scoring ──────────────────────────────────────────────
+        tf_scores = {}
+        for tf_m in target_tfs:
+            score = 0.0
+            has_data = False
+
+            # Signal outcomes — overall (30d) — highest weight
+            if tf_m in outcome_rows:
+                r = outcome_rows[tf_m]
+                wr  = float(r["win_rate"] or 0.5)
+                mov = min(float(r["avg_movement"] or 0), 0.5) / 0.5
+                total = int(r["total"])
+                conf = min(1.0, total / 25.0)
+                score += (wr * 0.60 + mov * 0.25 + conf * 0.15) * 2.5  # weight 2.5x
+                has_data = True
+
+            # Session outcomes (14d) — bonus if session-specific data available
+            if tf_m in session_outcome_rows:
+                r = session_outcome_rows[tf_m]
+                wr  = float(r["win_rate"] or 0.5)
+                mov = min(float(r["avg_movement"] or 0), 0.5) / 0.5
+                total = int(r["total"])
+                conf = min(1.0, total / 15.0)
+                score += (wr * 0.65 + mov * 0.20 + conf * 0.15) * 1.5  # weight 1.5x
+                has_data = True
+
+            # tf_session_stats fallback
+            if tf_m in tf_rows:
+                r = tf_rows[tf_m]
+                wr  = float(r["win_rate"])
+                mov = min(float(r["avg_movement"]), 0.5) / 0.5
+                total = int(r["total"])
+                conf = min(1.0, total / 20.0)
+                score += (wr * 0.60 + mov * 0.25 + conf * 0.15) * 1.0  # weight 1.0x
+                has_data = True
+
+            if has_data:
+                tf_scores[tf_m] = score
+
+        if tf_scores:
+            best_tf = max(tf_scores, key=tf_scores.get)
+            logging.info("TF select {}: scores={} → {}m".format(pair, tf_scores, best_tf))
+            return best_tf
+
+        # Fallback: pair_stats.optimal_tf
+        if pair_optimal and pair_optimal in target_tfs:
+            return pair_optimal
+
     except Exception as e:
         logging.warning("get_best_tf_for_session failed {}: {}".format(pair, e))
     return 2  # Default: 2m
-
 
 def update_tf_session_stats(pair, tf_mins, session_name, won):
     """Update session-specific TF stats after VTE result."""
@@ -7950,17 +8742,17 @@ async def _licence_expiry_warning_loop(bot):
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        SELECT user_id, expiry_date
+                        SELECT user_id, expiry
                         FROM users
                         WHERE licence_type IN ('monthly','lifetime')
-                          AND expiry_date IS NOT NULL
-                          AND expiry_date > NOW()
-                          AND expiry_date <= NOW() + INTERVAL '4 days'
+                          AND expiry IS NOT NULL
+                          AND expiry > NOW()
+                          AND expiry <= NOW() + INTERVAL '4 days'
                     """)
                     rows = cur.fetchall()
             for r in rows:
                 uid    = r["user_id"]
-                expiry = r["expiry_date"]
+                expiry = r["expiry"]
                 days   = (expiry - datetime.now()).days
                 if days not in (3, 1):
                     continue
@@ -7984,9 +8776,13 @@ async def _licence_expiry_warning_loop(bot):
 
 
 async def _stats_reset_loop():
-    """Reset wins_today/losses_today every 1 hour."""
+    """Reset wins_today/losses_today once per day at midnight UTC."""
     while True:
-        await asyncio.sleep(3600)  # 1 hour
+        # Calculate seconds until next midnight UTC
+        now = datetime.utcnow()
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        secs_until_midnight = (midnight - now).total_seconds()
+        await asyncio.sleep(secs_until_midnight)
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -7994,7 +8790,7 @@ async def _stats_reset_loop():
                         "UPDATE pair_stats SET wins_today = 0, losses_today = 0"
                     )
                 conn.commit()
-            logging.info("Pair stats reset (30 min cycle): OK")
+            logging.info("Pair stats daily reset (midnight UTC): OK")
         except Exception as e:
             logging.warning("Stats reset failed: {}".format(e))
 
@@ -8028,6 +8824,10 @@ async def run_bot():
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     print("Bot polling active.")
+
+    # ── Load pending virtual trades from DB (survive restarts) ─
+    _vt_load_pending()
+    print("Virtual trades loaded from DB.")
 
     # ── Launch Virtual Trading Engine in background ────────────
     asyncio.create_task(virtual_trading_engine())
