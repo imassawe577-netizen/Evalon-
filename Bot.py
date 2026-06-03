@@ -5,7 +5,7 @@ Upgraded: Ensemble ML, ADX filter, signal_outcomes, smart expiry, midnight reset
 python-telegram-bot[webhooks]==21.3 + Neon PostgreSQL via psycopg2
 """
 
-# ── OPEN PORT IMMEDIATELY — before all imports ─────────────
+# -- OPEN PORT IMMEDIATELY - before all imports -------------
 # Render requires port to open within ~5 seconds of startup
 import os as _os
 import threading as _threading
@@ -29,7 +29,7 @@ _PORT = int(_os.environ.get("PORT", 8080))
 _t = _threading.Thread(target=lambda: _HTTPServer(("0.0.0.0", _PORT), _H).serve_forever(), daemon=True)
 _t.start()
 print("PORT {} open.".format(_PORT), flush=True)
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 import random
 import os
@@ -63,7 +63,7 @@ SUPPORT_BOT  = "Evalonwinnersbot"   # ← Admin/support bot (do not change)
 REFERRAL_BOT = "Thtgalshhgsvvokksh90bot"  # Referral bot username
 DERIV_TOKEN  = os.environ.get("DERIV_TOKEN", "")
 # ============================================================
-# DERIV WEBSOCKET — MICRO CANDLE ENGINE (5s/10s/15s)
+# DERIV WEBSOCKET - MICRO CANDLE ENGINE (5s/10s/15s)
 # Used to confirm 1m signals before sending
 # ============================================================
 import websockets
@@ -72,7 +72,7 @@ import asyncio as _asyncio
 from collections import defaultdict as _defaultdict
 from datetime import datetime as _dt
 
-# ── NN IMPORTS ───────────────────────────────────────────────
+# -- NN IMPORTS -----------------------------------------------
 try:
     import numpy as np
     from sklearn.neural_network import MLPClassifier
@@ -88,7 +88,7 @@ try:
         _XGB_AVAILABLE = True
     except ImportError:
         _XGB_AVAILABLE = False
-        logging.info("XGBoost not installed — using GradientBoosting fallback. pip install xgboost")
+        logging.info("XGBoost not installed - using GradientBoosting fallback. pip install xgboost")
     # LightGBM optional
     try:
         import lightgbm as lgb
@@ -99,10 +99,10 @@ except ImportError:
     _NN_AVAILABLE = False
     _XGB_AVAILABLE = False
     _LGB_AVAILABLE = False
-    logging.warning("scikit-learn/numpy not installed — Ensemble ML disabled. Run: pip install scikit-learn numpy")
-# ─────────────────────────────────────────────────────────────
+    logging.warning("scikit-learn/numpy not installed - Ensemble ML disabled. Run: pip install scikit-learn numpy")
+# -------------------------------------------------------------
 
-# Deriv symbol mapping — Pocket Option pair → Deriv symbol
+# Deriv symbol mapping - Pocket Option pair → Deriv symbol
 DERIV_SYMBOLS = {
     "EUR/USD": "frxEURUSD",
     "GBP/USD": "frxGBPUSD",
@@ -136,7 +136,7 @@ _DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 # Cache: last Deriv tick indicators per pair {pair: {data, timestamp}}
 _deriv_tick_cache = {}
-_DERIV_CACHE_TTL  = 30  # seconds — reuse if fresher than 30s
+_DERIV_CACHE_TTL  = 30  # seconds - reuse if fresher than 30s
 
 async def _fetch_deriv_ticks(pair, seconds=15):
     """
@@ -334,12 +334,12 @@ def _micro_trend(candles):
         direction = "SELL"
         strength  = int(bears / total * 100)
     else:
-        # Tie — use momentum as tiebreaker instead of FLAT
+        # Tie - use momentum as tiebreaker instead of FLAT
         if momentum >= 0:
             direction = "BUY"
         else:
             direction = "SELL"
-        strength = 51  # minimal strength — tie broken by momentum
+        strength = 51  # minimal strength - tie broken by momentum
 
     return {
         "direction": direction,
@@ -360,10 +360,10 @@ async def pick_best_tf_deriv(pair, signal_direction=None):
       - Kama direction == SELL → toa 1m/2m/3m SELL signal
       - Kama FLAT             → no signal kwa TF hiyo
       - Kati ya 5s/10s/15s zilizopita (si FLAT) → chagua yenye strength kubwa zaidi
-      - signal_direction parameter imekuwa optional — sekunde inaamua direction yenyewe
+      - signal_direction parameter imekuwa optional - sekunde inaamua direction yenyewe
 
     Returns: (best_tf_mins, strength, direction, reason)
-      best_tf_mins: 1, 2, au 3 — au None kama hakuna signal
+      best_tf_mins: 1, 2, au 3 - au None kama hakuna signal
       strength: 0-100
       direction: "BUY" au "SELL" (kutoka sekunde, si kutoka parameter)
       reason: maelezo ya log
@@ -405,10 +405,10 @@ async def pick_best_tf_deriv(pair, signal_direction=None):
 
         # FLAT → no signal for this TF
         if direction == "FLAT":
-            logging.info("Deriv {}s FLAT — skip".format(trade_tf * 5))
+            logging.info("Deriv {}s FLAT - skip".format(trade_tf * 5))
             continue
 
-        # Reversal candle = unstable — lower strength penalty
+        # Reversal candle = unstable - lower strength penalty
         if trend.get("reversal"):
             strength = max(0, strength - 20)
 
@@ -421,11 +421,11 @@ async def pick_best_tf_deriv(pair, signal_direction=None):
                 trade_tf * 5, strength, direction, trend.get("reversal", False))
 
     if best_tf is None or best_direction is None:
-        reason = "all micro-trends FLAT or no data — no signal"
-        logging.info("Deriv pick_best_tf {}: NONE — {}".format(pair, reason))
+        reason = "all micro-trends FLAT or no data - no signal"
+        logging.info("Deriv pick_best_tf {}: NONE - {}".format(pair, reason))
         return (None, 0, None, reason)
 
-    logging.info("Deriv pick_best_tf {}: {}m {} (str={}) — {}".format(
+    logging.info("Deriv pick_best_tf {}: {}m {} (str={}) - {}".format(
         pair, best_tf, best_direction, best_str, best_reason))
     return (best_tf, best_str, best_direction, best_reason)
 
@@ -458,12 +458,12 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
       score_tf = (deriv_score * 0.40) + (db_score * 0.35) + (ml_score * 0.25)
     """
     if "OTC" in pair:
-        return (2, "OTC — expiry not applicable")
+        return (2, "OTC - expiry not applicable")
 
     scores = {1: 0.0, 2: 0.0, 3: 0.0}
     reasons = {1: [], 2: [], 3: []}
 
-    # ── A. Deriv WebSocket micro-trend (40% weight) ──────────
+    # -- A. Deriv WebSocket micro-trend (40% weight) ----------
     deriv_score = {1: 0.0, 2: 0.0, 3: 0.0}
     try:
         data = await asyncio.wait_for(
@@ -491,7 +491,7 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
     for tf_m in [1, 2, 3]:
         scores[tf_m] += deriv_score[tf_m] * 0.40
 
-    # ── B. DB historical win rate per pair/session/TF (35% weight) ──
+    # -- B. DB historical win rate per pair/session/TF (35% weight) --
     db_score = {1: 0.0, 2: 0.0, 3: 0.0}
     try:
         session_name = _get_session().get("name", "Unknown")
@@ -547,7 +547,7 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
     for tf_m in [1, 2, 3]:
         scores[tf_m] += db_score[tf_m] * 0.35
 
-    # ── C. Ensemble ML probability per TF (25% weight) ──────
+    # -- C. Ensemble ML probability per TF (25% weight) ------
     ml_score = {1: 0.0, 2: 0.0, 3: 0.0}
     if _NN_AVAILABLE and _nn_global_model is not None and _nn_global_scaler is not None:
         try:
@@ -590,7 +590,7 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
     for tf_m in [1, 2, 3]:
         scores[tf_m] += ml_score[tf_m] * 0.25
 
-    # ── D. Final decision ───────────────────────────────────
+    # -- D. Final decision -----------------------------------
     best_tf   = max(scores, key=lambda t: scores[t])
     best_score = scores[best_tf]
 
@@ -611,7 +611,7 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
 
 
 def support_url():
-    """Returns support link — opens support bot with 'admin' pre-filled."""
+    """Returns support link - opens support bot with 'admin' pre-filled."""
     return "https://t.me/{}?text=admin".format(SUPPORT_BOT)
 
 # Health check handled by webhook server at /health path
@@ -816,11 +816,12 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (user_id, pair)
                 );
+            """)
 
         conn.commit()
 
 # ============================================================
-# PAIR STATS — win/loss tracking per pair
+# PAIR STATS - win/loss tracking per pair
 # ============================================================
 def update_pair_stats(pair, won):
     """Update win/loss stats for a pair. won: True if signal was correct."""
@@ -865,7 +866,7 @@ def get_pair_stats_all():
 
 
 # ============================================================
-# REVERSE PAIRS — bot flips direction for these pairs
+# REVERSE PAIRS - bot flips direction for these pairs
 # ============================================================
 def is_reverse_pair(pair):
     try:
@@ -1098,7 +1099,7 @@ def activate_licence(code, user_id):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM licences WHERE code = %s", (code,))
             lic = cur.fetchone()
-            # Block if not found, already used, or revoked — revoked codes NEVER reactivate
+            # Block if not found, already used, or revoked - revoked codes NEVER reactivate
             if not lic or lic.get("revoked") or lic["used"]:
                 return False
             ltype  = lic["type"]
@@ -1181,7 +1182,7 @@ def get_all_user_ids():
             return [r["user_id"] for r in cur.fetchall()]
 
 # ============================================================
-# INACTIVITY TRACKER — 30 min without activity → clear state
+# INACTIVITY TRACKER - 30 min without activity → clear state
 # ============================================================
 INACTIVITY_MINUTES = 30
 # user_id -> {"task": asyncio.Task, "msg_ids": [list], "chat_id": int}
@@ -1206,7 +1207,7 @@ def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
 
 # Track last signal + last bot message per user (for deletion on next action)
-# DB is source of truth — in-memory dicts are cache only
+# DB is source of truth - in-memory dicts are cache only
 LAST_SIGNAL_MSG = {}
 LAST_BOT_MSG    = {}
 
@@ -1271,7 +1272,7 @@ def save_last_bot_msg(user_id, msg_id):
 LAST_SIGNAL_TIME = {}  # in-memory cache only
 
 def is_spam(user_id):
-    """Never block the user — just track timing for slight delay."""
+    """Never block the user - just track timing for slight delay."""
     now  = time.time()
     last = LAST_SIGNAL_TIME.get(user_id, 0)
     if last == 0:
@@ -1300,7 +1301,7 @@ def is_spam(user_id):
         pass
     return (now - last) < SPAM_SECONDS
     LAST_SIGNAL_TIME[user_id] = now
-    return False  # Never block — user always gets signal + Get More button
+    return False  # Never block - user always gets signal + Get More button
 
 async def _spam_gentle_delay(user_id):
     """If user is pressing too fast, add a tiny delay (no message shown)."""
@@ -1311,10 +1312,10 @@ async def _spam_gentle_delay(user_id):
         await asyncio.sleep(SPAM_SECONDS - gap)
 
 
-# ── A: SIGNAL CONFIRMATION DELAY ─────────────────────────────
+# -- A: SIGNAL CONFIRMATION DELAY -----------------------------
 # After generating signal, wait 4 seconds and re-check direction.
 # If direction changed → use new direction. User never sees the check.
-_CONFIRM_DELAY_SECS = 8  # Raised from 4 — gives more time for Yahoo recheck (non-OTC)
+_CONFIRM_DELAY_SECS = 8  # Raised from 4 - gives more time for Yahoo recheck (non-OTC)
 
 async def _confirm_signal_direction(pair, initial_direction, is_otc):
     """
@@ -1348,7 +1349,7 @@ async def _confirm_signal_direction(pair, initial_direction, is_otc):
     except Exception as e:
         logging.warning("_confirm_signal_direction {} failed: {}".format(pair, e))
     return initial_direction
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 # ============================================================
 # BLACKLIST
@@ -1428,10 +1429,10 @@ def total_free_allowed(user_id):
     return 3 + get_bonus_signals(user_id)
 
 # ============================================================
-# ALL PAIRS — Pocket Option (forex, OTC, indices, stocks, commodities)
+# ALL PAIRS - Pocket Option (forex, OTC, indices, stocks, commodities)
 # ============================================================
 ALL_PAIRS = [
-    # Currencies — mix of OTC and non-OTC
+    # Currencies - mix of OTC and non-OTC
     "EUR/USD OTC", "EUR/USD", "GBP/USD OTC", "GBP/USD",
     "USD/JPY OTC", "USD/JPY", "USD/CHF OTC", "USD/CHF",
     "AUD/USD OTC", "AUD/USD", "NZD/USD OTC", "NZD/USD",
@@ -1447,7 +1448,7 @@ ALL_PAIRS = [
     "CAD/JPY OTC", "CAD/JPY", "CAD/CHF OTC", "CAD/CHF",
     "CHF/NOK OTC", "USD/MXN OTC", "USD/MXN",
     "USD/SGD OTC", "USD/BRL OTC", "USD/BDT OTC",
-    # Additional non-OTC forex — minors & exotics
+    # Additional non-OTC forex - minors & exotics
     "AUD/NZD", "EUR/NZD", "GBP/NZD", "NZD/JPY", "NZD/CAD", "NZD/CHF",
     "USD/NOK", "USD/SEK", "USD/DKK", "USD/TRY", "USD/ZAR", "USD/SGD",
     "EUR/NOK", "EUR/SEK", "EUR/PLN", "EUR/TRY",
@@ -1553,7 +1554,7 @@ def _calc_indicators_from_df(df):
     sto = max(0.0, min(100.0, float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])))
     # Volume ratio
     vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
-    # RSI divergence (simple: last 5 bars — price up, RSI down = bearish div)
+    # RSI divergence (simple: last 5 bars - price up, RSI down = bearish div)
     rsi_series = (100 - 100 / (1 + gain / loss.replace(0, 1e-9)))
     price_change = float(close.iloc[-1] - close.iloc[-6])
     rsi_change   = float(rsi_series.iloc[-1] - rsi_series.iloc[-6])
@@ -1563,7 +1564,7 @@ def _calc_indicators_from_df(df):
     elif price_change < 0 and rsi_change > 3:
         divergence = "BUY"    # Bullish divergence
 
-    # Williams Fractal — scan recent candles
+    # Williams Fractal - scan recent candles
     # Bullish fractal: low[i] < low[i-2], low[i-1], low[i+1], low[i+2]
     # Bearish fractal: high[i] > high[i-2], high[i-1], high[i+1], high[i+2]
     # Check fractals formed recently (last 3-10 candles)
@@ -1599,7 +1600,7 @@ def _calc_indicators_from_df(df):
             # Bearish fractal wins if both present
             fractal_signal = "SELL"
             fractal_strength = min(2, len(recent_bear_fractals))
-    # If both present — pick the one closest to current price
+    # If both present - pick the one closest to current price
     if recent_bull_fractals and recent_bear_fractals:
         bull_dist = abs(current_price_val - float(low_vals[recent_bull_fractals[0]]))
         bear_dist = abs(current_price_val - float(high_vals[recent_bear_fractals[0]]))
@@ -1647,14 +1648,14 @@ def _fetch_1h_trend(pair):
     Fetch 1H candle data and determine trend direction using layered confirmation.
 
     Rules (in order of priority):
-    1. EMA cross (9 vs 21) is REQUIRED — if absent/flat, return None immediately.
+    1. EMA cross (9 vs 21) is REQUIRED - if absent/flat, return None immediately.
     2. Price position vs EMA21 must agree with EMA cross.
     3. MACD histogram direction must confirm.
     4. RSI 1H provides momentum confirmation.
     5. Last 3 candles direction provides momentum check.
     6. Reversal detection: if recent candles strongly oppose EMA cross + MACD flips, override.
 
-    Returns: 'BUY', 'SELL', or None (unclear — no signal should be issued).
+    Returns: 'BUY', 'SELL', or None (unclear - no signal should be issued).
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     symbol = YAHOO_SYMBOLS.get(real_pair)
@@ -1678,7 +1679,7 @@ def _fetch_1h_trend(pair):
         ema21_prev = float(close.ewm(span=21, adjust=False).mean().iloc[-2])
 
         ema_gap_pct = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
-        # EMA gap must be meaningful (> 0.005%) — flat EMAs = no trend
+        # EMA gap must be meaningful (> 0.005%) - flat EMAs = no trend
         if ema_gap_pct < 0.005:
             return None
 
@@ -1687,10 +1688,10 @@ def _fetch_1h_trend(pair):
         # --- LAYER 2: Price vs EMA21 must agree with EMA cross ---
         price_above_ema21 = current_price > ema21
         if ema_bull and not price_above_ema21:
-            # EMA says BUY but price is below EMA21 — conflict
+            # EMA says BUY but price is below EMA21 - conflict
             return None
         if not ema_bull and price_above_ema21:
-            # EMA says SELL but price is above EMA21 — conflict
+            # EMA says SELL but price is above EMA21 - conflict
             return None
 
         # --- LAYER 3: MACD on 1H ---
@@ -1722,9 +1723,9 @@ def _fetch_1h_trend(pair):
         # --- REVERSAL DETECTION ---
         # If EMA says BUY but ALL 3 recent candles are falling + MACD turned bear = reversal
         if ema_bull and candle_bear_count >= 3 and (macd_turning_bear or not macd_bull):
-            return None   # Trend is reversing — no signal, wait for clarity
+            return None   # Trend is reversing - no signal, wait for clarity
         if not ema_bull and candle_bull_count >= 3 and (macd_turning_bull or macd_bull):
-            return None   # Trend is reversing — no signal, wait for clarity
+            return None   # Trend is reversing - no signal, wait for clarity
 
         # --- FINAL LAYERED DECISION ---
         # EMA cross already confirmed above (Layer 1+2).
@@ -1759,12 +1760,12 @@ def _confirm_1h_direction(pair, direction):
     Smart check: if short-TF signal (1m/2m) is SELL,
     verify recent 1H candles are trending down.
     Returns True if 1H confirms direction, False if it opposes.
-    Extra accuracy layer — if no 1H data, return True (proceed).
+    Extra accuracy layer - if no 1H data, return True (proceed).
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     symbol = YAHOO_SYMBOLS.get(real_pair)
     if not symbol:
-        return True  # No real data — proceed with signal
+        return True  # No real data - proceed with signal
     try:
         df = yf.download(symbol, period="3d", interval="1h", progress=False, auto_adjust=True)
         if df is None or len(df) < 5:
@@ -2137,7 +2138,7 @@ def _session_bias():
     s = _get_session()
     return (s["buy_bias"], s["sell_bias"])
 
-# Alias — used in handlers
+# Alias - used in handlers
 def get_trading_session():
     return _get_session()
 
@@ -2228,7 +2229,7 @@ def get_trend_direction(pair, window=20, min_signals=8, threshold=0.65):
                 )
                 rows = cur.fetchall()
         if len(rows) < min_signals:
-            return None  # Not enough history — no trend decision
+            return None  # Not enough history - no trend decision
         directions = [r["direction"] for r in rows]
         total = len(directions)
         buy_ratio  = directions.count("BUY")  / total
@@ -2237,7 +2238,7 @@ def get_trend_direction(pair, window=20, min_signals=8, threshold=0.65):
             return "BUY"
         if sell_ratio >= threshold:
             return "SELL"
-        return None  # Flat market — mixed signals
+        return None  # Flat market - mixed signals
     except Exception as e:
         logging.warning("get_trend_direction failed: {}".format(e))
         return None
@@ -2335,7 +2336,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
     if entry_price is None:
         return
 
-    # Fetch exit price — retry up to 3 times with 3s gap if API fails
+    # Fetch exit price - retry up to 3 times with 3s gap if API fails
     exit_price = None
     for _ in range(3):
         exit_price = _fetch_current_price(pair)
@@ -2348,7 +2349,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
 
     price_diff = exit_price - entry_price
     if abs(price_diff) < 0.000001:
-        return  # No movement — skip
+        return  # No movement - skip
 
     if direction == "BUY":
         won = price_diff > 0
@@ -2356,22 +2357,22 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
         won = price_diff < 0
 
     if won:
-        result_text = "🏆 *EVALON WINNERS BOT {}* TF {}M — *WON* ✅".format(pair, timeframe_mins)
+        result_text = "🏆 *EVALON WINNERS BOT {}* TF {}M - *WON* ✅".format(pair, timeframe_mins)
     else:
-        result_text = "💔 *EVALON WINNERS BOT {}* TF {}M — *LOSS* ❌".format(pair, timeframe_mins)
+        result_text = "💔 *EVALON WINNERS BOT {}* TF {}M - *LOSS* ❌".format(pair, timeframe_mins)
 
-    # ── NN FEEDBACK: feed trade outcome back to neural network ──
+    # -- NN FEEDBACK: feed trade outcome back to neural network --
     try:
         nn_feedback_from_vte(user_id, pair, won)
     except Exception as _nn_e:
         logging.warning("NN feedback error: {}".format(_nn_e))
-    # ────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------
 
     if not is_results_enabled():
         update_pair_stats(pair, won)
         return
 
-    # OTC pairs — update stats internally but don't send result to user
+    # OTC pairs - update stats internally but don't send result to user
     if "OTC" in pair:
         update_pair_stats(pair, won)
         return
@@ -2398,7 +2399,7 @@ def check_signal_request(user_id, pair):
       {"action": "cooldown"}                -- still in cooldown
     """
     # Cooldown check first
-    # No cooldown — signals available at any time
+    # No cooldown - signals available at any time
 
     state = get_user_signal_state(user_id, pair)
     if state is None:
@@ -2411,7 +2412,7 @@ def check_signal_request(user_id, pair):
     threshold  = state["last_timeframe"] * 60
     flip_count = state["flip_count"]
 
-    # Returned after timeframe expired — treat as fresh
+    # Returned after timeframe expired - treat as fresh
     if elapsed >= threshold:
         clear_user_signal_state(user_id, pair)
         return {"action": "fresh"}
@@ -2427,11 +2428,11 @@ def check_signal_request(user_id, pair):
     if flip_count == 0:
         return {"action": "flip", "direction": flipped}
     else:
-        # Always "same" — no block here. Warning shown in getmore_ handler
+        # Always "same" - no block here. Warning shown in getmore_ handler
         return {"action": "same", "direction": flipped}
 
 # ============================================================
-# MARKET PATTERN DETECTION — candlestick patterns
+# MARKET PATTERN DETECTION - candlestick patterns
 # ============================================================
 def _detect_candlestick_patterns(df):
     """
@@ -2458,7 +2459,7 @@ def _detect_candlestick_patterns(df):
     range1 = h1 - l1 + 1e-9
     range2 = h2 - l2 + 1e-9
 
-    # ── DOJI: very small body (<10% of range) → trend exhaustion ──
+    # -- DOJI: very small body (<10% of range) → trend exhaustion --
     if body1 / range1 < 0.10 and range1 > 0:
         # Doji after uptrend = potential SELL reversal
         if c2 > o2 and body2 / range2 > 0.4:
@@ -2467,35 +2468,35 @@ def _detect_candlestick_patterns(df):
         elif c2 < o2 and body2 / range2 > 0.4:
             patterns["doji_reversal_buy"] = ("BUY", 20)
 
-    # ── HAMMER: lower shadow long, small body at top → BUY reversal ──
+    # -- HAMMER: lower shadow long, small body at top → BUY reversal --
     lower_shadow1 = min(o1, c1) - l1
     upper_shadow1 = h1 - max(o1, c1)
     if lower_shadow1 > body1 * 2 and upper_shadow1 < body1 * 0.5 and c2 < o2:
         patterns["hammer"] = ("BUY", 25)
 
-    # ── SHOOTING STAR: upper shadow long, small body → SELL reversal ──
+    # -- SHOOTING STAR: upper shadow long, small body → SELL reversal --
     if upper_shadow1 > body1 * 2 and lower_shadow1 < body1 * 0.5 and c2 > o2:
         patterns["shooting_star"] = ("SELL", 25)
 
-    # ── ENGULFING BULLISH: candle 2 bearish, candle 1 bullish > candle 2 ──
+    # -- ENGULFING BULLISH: candle 2 bearish, candle 1 bullish > candle 2 --
     if c2 < o2 and c1 > o1 and c1 > o2 and o1 < c2:
         patterns["bullish_engulfing"] = ("BUY", 35)
 
-    # ── ENGULFING BEARISH ──
+    # -- ENGULFING BEARISH --
     if c2 > o2 and c1 < o1 and c1 < o2 and o1 > c2:
         patterns["bearish_engulfing"] = ("SELL", 35)
 
-    # ── THREE WHITE SOLDIERS: candles 3 bullish mfululizo ──
+    # -- THREE WHITE SOLDIERS: candles 3 bullish mfululizo --
     if c1 > o1 and c2 > o2 and c3 > o3 and c1 > c2 > c3:
         patterns["three_white_soldiers"] = ("BUY", 40)
 
-    # ── THREE BLACK CROWS: candles 3 bearish mfululizo ──
+    # -- THREE BLACK CROWS: candles 3 bearish mfululizo --
     if c1 < o1 and c2 < o2 and c3 < o3 and c1 < c2 < c3:
         patterns["three_black_crows"] = ("SELL", 40)
 
-    # ── INSIDE BAR: candle 1 within range of candle 2 (consolidation → breakout) ──
+    # -- INSIDE BAR: candle 1 within range of candle 2 (consolidation → breakout) --
     if h1 < h2 and l1 > l2:
-        # Inside bar — neutral/continuation; follow candle 2 direction
+        # Inside bar - neutral/continuation; follow candle 2 direction
         if c2 > o2:
             patterns["inside_bar_continuation"] = ("BUY", 15)
         else:
@@ -2508,9 +2509,9 @@ def _check_pip_movement(pair):
     """
     Check average pip movement for this pair.
     Returns (avg_movement_pct, category) where category is:
-      'HIGH'   — pair moves a lot (>0.12%) → 1m is sufficient
-      'MEDIUM' — (0.06-0.12%) → 2m recommended
-      'LOW'    — (<0.06%) → 3m, small movement
+      'HIGH'   - pair moves a lot (>0.12%) → 1m is sufficient
+      'MEDIUM' - (0.06-0.12%) → 2m recommended
+      'LOW'    - (<0.06%) → 3m, small movement
     Prefers VTE data from DB, falls back to Yahoo Finance.
     """
     # Try DB first (VTE learned data)
@@ -2554,16 +2555,16 @@ def _check_pip_movement(pair):
 
 
 # ============================================================
-# D — SPREAD/VOLATILITY (ATR) CHECK
+# D - SPREAD/VOLATILITY (ATR) CHECK
 # ============================================================
-_ATR_DEAD_THRESHOLD = 0.015  # % — below this = dead market, no signal
-_FORCE_PAIRS = set()  # Admin-forced pairs — bypass flat/dead market filter
+_ATR_DEAD_THRESHOLD = 0.015  # % - below this = dead market, no signal
+_FORCE_PAIRS = set()  # Admin-forced pairs - bypass flat/dead market filter
 
-# ── ADMIN FILTER TOGGLES ─────────────────────────────────────
+# -- ADMIN FILTER TOGGLES -------------------------------------
 # Admin anaweza kuzima/kuwasha filters hizi kwa /filteroff na /filteron
 _FILTER_FLAGS = {
     "news":        True,   # News time block
-    "dead":        False,  # Dead market / ATR filter — OFF by default (admin: /filteron dead)
+    "dead":        False,  # Dead market / ATR filter - OFF by default (admin: /filteron dead)
     "conflict":    True,   # 1H vs short-TF conflict filter
     "stability":   True,   # Signal stability / flip filter
     "confluence":  True,   # Min confluence filter (indicators_agree)
@@ -2601,9 +2602,9 @@ def get_filters_status():
         icon = icons.get(name, "🔧")
         desc = descs.get(name, name)
         status = "✅ ON" if state else "🔴 OFF"
-        lines.append("{} *{}* — {} `[{}]`".format(icon, desc, status, name))
+        lines.append("{} *{}* - {} `[{}]`".format(icon, desc, status, name))
     return "\n".join(lines)
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 
 def is_force_pair(pair):
@@ -2644,7 +2645,7 @@ def _check_volatility(pair):
 
 
 # ============================================================
-# L — FIBONACCI RETRACEMENT LEVELS
+# L - FIBONACCI RETRACEMENT LEVELS
 # ============================================================
 _FIB_LEVELS = [0.236, 0.382, 0.500, 0.618, 0.786]
 _FIB_ZONE   = 0.008  # ±0.8% of price counts as "near a level"
@@ -2708,7 +2709,7 @@ def _check_fibonacci(pair, direction):
 
 
 # ============================================================
-# M — PRICE ACTION SCORE (Higher Highs / Lower Lows)
+# M - PRICE ACTION SCORE (Higher Highs / Lower Lows)
 # ============================================================
 def _price_action_score(pair):
     """
@@ -2770,7 +2771,7 @@ def _price_action_score(pair):
 
 def _check_signal_history_bias(pair, direction, window=15):
     """
-    Check signal history — if recent signals are mostly the same direction,
+    Check signal history - if recent signals are mostly the same direction,
     that reinforces the decision.
     Returns: (same_count, total, same_pct)
     """
@@ -2798,7 +2799,7 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
     compared to recent signals within the last window_minutes.
 
     Returns True if signal is STABLE (safe to issue).
-    Returns False if signal flipped abruptly — do not issue.
+    Returns False if signal flipped abruptly - do not issue.
 
     Logic: fetch last N signals within the time window.
     If the majority were the OPPOSITE direction, and this is a sudden flip,
@@ -2816,7 +2817,7 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
                 )
                 rows = cur.fetchall()
         if not rows or len(rows) < 3:
-            return True   # Not enough history — allow signal
+            return True   # Not enough history - allow signal
 
         directions = [r["direction"] for r in rows]
         total = len(directions)
@@ -2824,7 +2825,7 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
         opposite_pct = directions.count(opposite) / total
 
         # If 70%+ of recent signals (last 5 min) were the opposite direction
-        # and now we're flipping — it's an unstable sudden reversal
+        # and now we're flipping - it's an unstable sudden reversal
         if opposite_pct >= 0.70:
             logging.info("STABILITY FILTER: {} blocked flip to {} ({}% were {})".format(
                 pair, proposed_direction, int(opposite_pct*100), opposite))
@@ -2837,13 +2838,13 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 
 
 # ============================================================
-# SIGNAL ALGORITHM — Multi-Timeframe + 1H Trend Filter + Patterns
+# SIGNAL ALGORITHM - Multi-Timeframe + 1H Trend Filter + Patterns
 # ============================================================
-# Per-pair OTC flip decision cache (in-memory, reset on restart — fine for OTC)
+# Per-pair OTC flip decision cache (in-memory, reset on restart - fine for OTC)
 _otc_flip_cache: dict = {}
 
 async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
-    """Send a non-OTC signal — simple clean caption."""
+    """Send a non-OTC signal - simple clean caption."""
     ib          = direction == "BUY"
     arrow       = "Up 🟢" if ib else "Down 🔴"
     strength    = sig.get("strength", 70)
@@ -2865,7 +2866,7 @@ async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe
 
 # ============================================================
 # FINNHUB + YFINANCE MTF SIGNAL ENGINE
-# Called by GET SIGNAL handler — does not modify generate_signal
+# Called by GET SIGNAL handler - does not modify generate_signal
 # ============================================================
 FINNHUB_FOREX_SYMBOLS = {
     "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
@@ -3206,7 +3207,7 @@ def _mtf_confirmation_score(cfg, all_dirs):
 
 def run_mtf_signal_engine(pair):
     """
-    Main entry point — called from GET SIGNAL handler.
+    Main entry point - called from GET SIGNAL handler.
     Evaluates ALL three TFs (1m, 2m, 3m) simultaneously and
     picks the one with the STRONGEST confirmation score.
 
@@ -3220,7 +3221,7 @@ def run_mtf_signal_engine(pair):
       - Among equal confirmation level → highest agree_count wins
       - Among equal agree_count → highest trend_score wins
       - Near-confirmation only accepted if trend_score >= 55%
-      - Minimum trend_score: 45% — below this returns no signal
+      - Minimum trend_score: 45% - below this returns no signal
 
     Returns dict:
       signal_type : 1/2/3/None
@@ -3268,12 +3269,12 @@ def run_mtf_signal_engine(pair):
             "labels": [("15s", "micro"), ("3m", "3m"), ("1h", "1h"), ("4h", "4h")]},
     }
 
-    # ── Evaluate ALL three TFs and collect candidates ──────────
-    # TF kubwa (1m/15m/4h n.k.) ni NYONGEZA — zinaimarisha nguvu ya signal
+    # -- Evaluate ALL three TFs and collect candidates ----------
+    # TF kubwa (1m/15m/4h n.k.) ni NYONGEZA - zinaimarisha nguvu ya signal
     # Direction inakuja kutoka Deriv sekunde (pick_best_tf_deriv)
     # Hapa tunachagua TF yenye confirmation score kubwa zaidi
     # Each candidate: (priority, agree_count, trend_score, sig_type, direction, near, tf_labels, message)
-    # priority: 0 = full (4/4), 1 = near (3/4) — lower is better
+    # priority: 0 = full (4/4), 1 = near (3/4) - lower is better
     candidates = []
 
     for sig_type in [1, 2, 3]:
@@ -3310,7 +3311,7 @@ def run_mtf_signal_engine(pair):
                 "trend_score": trend_score, "trend_dir": trend_dir,
                 "tf_labels": [], "message": "No MTF confirmation (1m/2m/3m)"}
 
-    # ── Pick the BEST candidate ────────────────────────────────
+    # -- Pick the BEST candidate --------------------------------
     # Sort: priority ASC (full > near), then agree_count DESC, then trend_score DESC
     candidates.sort(key=lambda c: (c[0], -c[1], -c[2]))
     best = candidates[0]
@@ -3325,7 +3326,7 @@ def run_mtf_signal_engine(pair):
 
 
 def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=False):
-    """Simple signal caption — clean na wazi."""
+    """Simple signal caption - clean na wazi."""
     arrow = "Up 🟢" if direction == "CALL" else "Down 🔴"
     strength_pct = int(max(60, min(99, trend_score)))
     return (
@@ -3334,11 +3335,11 @@ def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=Fa
         "📊 Signal strength: {}%"
     ).format(pair, arrow, sig_type, strength_pct)
 
-# ── END MTF ENGINE ───────────────────────────────────────────
+# -- END MTF ENGINE -------------------------------------------
 
 def _force_signal_from_micro(pair, signal_type):
     """
-    Last-resort fallback — scan last 100 micro-timeframe candles.
+    Last-resort fallback - scan last 100 micro-timeframe candles.
 
     Micro TF per signal type:
       signal_type 1 = 5s  proxy → Finnhub/Yahoo 1m candles 100
@@ -3351,7 +3352,7 @@ def _force_signal_from_micro(pair, signal_type):
       - close < open = red (bearish)
       - Majority direction shows true market trend
       - More green → BUY, more red → SELL
-      - Always returns a signal — never fails
+      - Always returns a signal - never fails
     """
     real_pair = OTC_TO_REAL.get(pair, pair)
     yf_sym    = YAHOO_SYMBOLS.get(real_pair)
@@ -3414,9 +3415,9 @@ def _force_signal_from_micro(pair, signal_type):
     logging.info("MICRO HISTORY {}: {} candles | green={:.0f}% red={:.0f}% → {} [{}]".format(
         pair, total, bull_pct, bear_pct, direction, source))
 
-    # Non-OTC: require minimum 65% dominance — below this is near-random, return None
+    # Non-OTC: require minimum 65% dominance - below this is near-random, return None
     if "OTC" not in pair and trend_score < 65.0:
-        logging.info("MICRO HISTORY {}: trend_score {:.0f}% < 65% — no signal (non-OTC)".format(
+        logging.info("MICRO HISTORY {}: trend_score {:.0f}% < 65% - no signal (non-OTC)".format(
             pair, trend_score))
         return None
 
@@ -3437,24 +3438,24 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
     Full MTF engine with fallback for non-OTC pairs.
     Attempt order:
       1. Full confirmation (4/4)
-      2. Near confirmation (3/4) — trend >= 55%
-      3. 2/4 confirmation — trend >= 45%, both agreeing TFs required
-      4. Micro history fallback — only if trend_score >= 60% (non-OTC)
+      2. Near confirmation (3/4) - trend >= 55%
+      3. 2/4 confirmation - trend >= 45%, both agreeing TFs required
+      4. Micro history fallback - only if trend_score >= 60% (non-OTC)
          Returns None if nothing meets the bar (non-OTC won't force weak signals)
 
     signal_type: 1/2/3 or None (try all)
     """
-    # For OTC — skip MTF entirely, return None so generate_signal runs
+    # For OTC - skip MTF entirely, return None so generate_signal runs
     if "OTC" in pair:
         return None
 
     result = run_mtf_signal_engine(pair)
 
-    # Got full or near confirmation — done
+    # Got full or near confirmation - done
     if result and result.get("direction") in ("CALL", "PUT"):
         return result
 
-    # 2/4 attempt — lower bar further
+    # 2/4 attempt - lower bar further
     real_pair = OTC_TO_REAL.get(pair, pair)
     yf_sym    = YAHOO_SYMBOLS.get(real_pair)
     fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
@@ -3509,20 +3510,20 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
         except Exception as e:
             logging.warning("2/4 attempt st={} failed: {}".format(st, e))
 
-    # Last resort: micro history fallback — only if trend_score >= 60% (non-OTC)
+    # Last resort: micro history fallback - only if trend_score >= 60% (non-OTC)
     # If below threshold, _force_signal_from_micro returns None and we pass None up
     st = types_to_try[0] if types_to_try else 1
     return _force_signal_from_micro(pair, st)
 
 
 # ============================================================
-# NEURAL NETWORK SIGNAL FILTER — ENHANCED
+# NEURAL NETWORK SIGNAL FILTER - ENHANCED
 # ============================================================
 # Features:
-#   1. Per-pair models  — each pair has its own trained model
-#   2. Session-aware    — session (London/NY/Asian) added as feature
-#   3. Scheduled retrain — every 6 hours automatically
-#   4. Admin /nnstats   — live stats command
+#   1. Per-pair models  - each pair has its own trained model
+#   2. Session-aware    - session (London/NY/Asian) added as feature
+#   3. Scheduled retrain - every 6 hours automatically
+#   4. Admin /nnstats   - live stats command
 #
 # Architecture: MLPClassifier (2 hidden layers: 64→32 neurons)
 # Input features (15): rsi, sto, ma_diff, macd, bb_pos, mom, vol,
@@ -3530,14 +3531,14 @@ def run_mtf_signal_engine_with_fallback(pair, signal_type=None):
 #   session_num, is_otc, strength
 # Output: probability of WIN
 # Training: self-supervised from VTE win/loss results
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 _NN_MODEL_DIR        = "/tmp/evalon_nn_models"
 _NN_GLOBAL_FILE      = "/tmp/evalon_nn_models/global_model.pkl"
 _NN_SCALER_FILE      = "/tmp/evalon_nn_models/global_scaler.pkl"
 _NN_MIN_SAMPLES      = 40    # Minimum before NN activates
 _NN_MIN_PAIR_SAMPLES = 25    # Minimum per-pair samples before pair model activates
-_NN_CONFIDENCE_THRESHOLD = 0.78  # Raised from 0.72 — higher bar for accuracy
+_NN_CONFIDENCE_THRESHOLD = 0.78  # Raised from 0.72 - higher bar for accuracy
 _NN_RETRAIN_HOURS    = 6     # Scheduled retrain interval
 
 # In-memory model cache
@@ -3660,7 +3661,7 @@ def _nn_load_global():
         if db_samples:
             _nn_training_data = [s for s in db_samples]
             for feats, label in db_samples:
-                # We don't have pair info in global load — skip per-pair seeding here
+                # We don't have pair info in global load - skip per-pair seeding here
                 pass
             logging.info("NN: Seeded {} real outcomes from DB".format(len(db_samples)))
     except Exception as e:
@@ -3746,7 +3747,7 @@ def _nn_load_training_data_from_db():
             except Exception:
                 pass
     except Exception as e:
-        # Table may not exist yet — that is fine, start with empty
+        # Table may not exist yet - that is fine, start with empty
         logging.info("NN load_training_data_from_db: {}".format(e))
     return samples
 
@@ -3830,7 +3831,7 @@ def _nn_make_model():
     rf  = _nn_make_rf()
     lgb_m = _nn_make_lgb()
     # Soft voting: average probabilities from all 4 models
-    # Each model gets equal weight — can be tuned later
+    # Each model gets equal weight - can be tuned later
     ensemble = VotingClassifier(
         estimators=[
             ("mlp",  mlp),
@@ -3986,11 +3987,11 @@ def _nn_adjust_direction(pair, features_arr, current_direction):
         return current_direction, None, False
 
 
-# ── NN Feature + flip cache ──────────────────────────────────
-_NN_SIGNAL_FEATURES = {}  # in-memory cache only — DB is source of truth
+# -- NN Feature + flip cache ----------------------------------
+_NN_SIGNAL_FEATURES = {}  # in-memory cache only - DB is source of truth
 
 def nn_store_signal_features(user_id, pair, feat_arr, original_direction=None):
-    """Store features + original direction for VTE feedback — DB + memory."""
+    """Store features + original direction for VTE feedback - DB + memory."""
     if feat_arr is None:
         return
     _NN_SIGNAL_FEATURES[(user_id, pair)] = (feat_arr, original_direction)
@@ -4012,7 +4013,7 @@ def nn_store_signal_features(user_id, pair, feat_arr, original_direction=None):
         logging.warning("nn_store_signal_features DB failed: {}".format(e))
 
 def nn_get_signal_features(user_id, pair):
-    """Get stored features — try memory first, then DB."""
+    """Get stored features - try memory first, then DB."""
     cached = _NN_SIGNAL_FEATURES.get((user_id, pair))
     if cached:
         return cached
@@ -4072,7 +4073,7 @@ def nn_feedback_from_vte(user_id, pair, won: bool):
         _nn_record_outcome(pair, feat_arr, won)
         # Track flip accuracy
         if orig_dir is not None:
-            # If direction was flipped and it won — record flip win
+            # If direction was flipped and it won - record flip win
             # (orig_dir != current stored direction means flip happened)
             if won:
                 _nn_flip_wins += 1
@@ -4131,7 +4132,7 @@ def nn_get_stats():
     }
 
 
-# ── Scheduled retrain loop (every 6 hours) ───────────────────
+# -- Scheduled retrain loop (every 6 hours) -------------------
 async def _nn_scheduled_retrain_loop():
     """Background task: retrain global + all active pair models every 6h."""
     while True:
@@ -4151,7 +4152,7 @@ if _NN_AVAILABLE:
     _nn_load_global()
     _nn_retrain_global()
 
-# ── END NN MODULE ─────────────────────────────────────────────
+# -- END NN MODULE ---------------------------------------------
 
 
 def _micro_candle_trend_score(pair):
@@ -4182,7 +4183,7 @@ def _micro_candle_trend_score(pair):
     yf_sym    = YAHOO_SYMBOLS.get(real_pair)
     fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
 
-    # Fetch 1m candles — primary source
+    # Fetch 1m candles - primary source
     opens_arr  = []
     closes_arr = []
 
@@ -4293,14 +4294,14 @@ def _micro_candle_trend_score(pair):
 
 
 # ============================================================
-# NON-OTC RESCUE — when signal is flat/weak, use history +
+# NON-OTC RESCUE - when signal is flat/weak, use history +
 # micro-candle (5s/10s/15s green-red ratio) to force a direction
 # ============================================================
 def _rescue_nonOTC_signal(pair: str) -> dict | None:
     """
     Last-resort for non-OTC when generate_signal returns flat/weak.
     Steps:
-      1. Check recent signal history — what direction was winning?
+      1. Check recent signal history - what direction was winning?
       2. Check micro-candle (5s/10s/15s) green/red ratio → pick TF
          with strongest majority (BUY if green > 60%, SELL if red > 60%)
       3. If both agree → return forced signal
@@ -4312,12 +4313,12 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
     real_pair = OTC_TO_REAL.get(pair, pair)
     symbol    = YAHOO_SYMBOLS.get(real_pair)
 
-    # ── 0. Deriv WebSocket — kwanza kabla ya yote ────────────
+    # -- 0. Deriv WebSocket - kwanza kabla ya yote ------------
     # Kama Deriv cache ipo na bado fresh → tumia moja kwa moja
     # Kama cache imepita muda → jaribu fetch mpya (sync via cached data)
     deriv_rescue_dir = None
     deriv_rescue_tf  = None
-    _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)  # non-OTC pair — same kwa non-OTC
+    _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)  # non-OTC pair - same kwa non-OTC
     if _deriv_rescue_pair in DERIV_SYMBOLS:
         try:
             _dc = _deriv_tick_cache.get(_deriv_rescue_pair)
@@ -4357,7 +4358,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
             "_rescued": True,
         }
 
-    # ── 1. History direction ─────────────────────────────────
+    # -- 1. History direction ---------------------------------
     hist_dir = None
     try:
         with get_conn() as conn:
@@ -4377,7 +4378,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
     except Exception as e:
         logging.warning("_rescue history check failed {}: {}".format(pair, e))
 
-    # ── 2. Micro-candle green/red ratio per TF ───────────────
+    # -- 2. Micro-candle green/red ratio per TF ---------------
     # 1m TF → 5s candles, 2m TF → 10s candles, 3m TF → 15s candles
     # Use Yahoo 1m data and bucket into micro-candles
     micro_result = None  # {tf_mins: (direction, support_pct)}
@@ -4410,7 +4411,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         except Exception as e:
             logging.warning("_rescue micro-candle failed {}: {}".format(pair, e))
 
-    # ── 3. Choose best TF from micro_result ─────────────────
+    # -- 3. Choose best TF from micro_result -----------------
     best_tf        = None
     best_dir       = None
     best_support   = 0.0
@@ -4422,15 +4423,15 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
                 best_tf      = tf_mins
                 best_dir     = mdir
 
-    # ── 4. Reconcile history + micro ────────────────────────
+    # -- 4. Reconcile history + micro ------------------------
     final_dir = None
     final_tf  = best_tf or 2
 
     if best_dir and hist_dir:
         if best_dir == hist_dir:
-            final_dir = best_dir   # Both agree — strong
+            final_dir = best_dir   # Both agree - strong
         else:
-            # Disagree — trust micro over history (more recent)
+            # Disagree - trust micro over history (more recent)
             final_dir = best_dir
     elif best_dir:
         final_dir = best_dir
@@ -4458,18 +4459,18 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
         "_rescued": True,
     }
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 
 # ============================================================
-# SAFE SIGNAL WRAPPER — timeout + guaranteed OTC fallback
+# SAFE SIGNAL WRAPPER - timeout + guaranteed OTC fallback
 # ============================================================
-_SIGNAL_TIMEOUT = 12  # seconds — max wait for generate_signal
+_SIGNAL_TIMEOUT = 12  # seconds - max wait for generate_signal
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
     Inatuma ujumbe wa 'Analyzing...' na animation ya dots inayobadilika.
-    Inarudisha (message_obj, stop_event) — piga stop_event.set() ukitaka isimame.
+    Inarudisha (message_obj, stop_event) - piga stop_event.set() ukitaka isimame.
 
     Mfano wa matumizi:
         cm, stop = await animated_analyzing(context.bot, chat, pair)
@@ -4516,7 +4517,7 @@ async def safe_generate_signal(pair: str) -> dict:
       - Hard 20s timeout
       - OTC: always returns a signal (random BUY/SELL fallback if timeout/error)
       - Non-OTC flat/timeout/error: try rescue (history + micro-candles) before
-        giving up — only shows no-signal if rescue also finds nothing
+        giving up - only shows no-signal if rescue also finds nothing
 
     Never hangs. Never returns None.
     """
@@ -4552,7 +4553,7 @@ async def safe_generate_signal(pair: str) -> dict:
             loop.run_in_executor(None, generate_signal, pair),
             timeout=_SIGNAL_TIMEOUT
         )
-        # OTC must NEVER return flat — inject random direction if so
+        # OTC must NEVER return flat - inject random direction if so
         if is_otc and sig.get("flat"):
             forced_dir = random.choice(["BUY", "SELL"])
             forced_tf  = random.choice([1, 2, 3])
@@ -4577,7 +4578,7 @@ async def safe_generate_signal(pair: str) -> dict:
         rescued = _rescue_nonOTC_signal(pair)
         if rescued:
             return rescued
-        return _nonOTC_no_signal("⏱ *No signal available* — market data timed out.")
+        return _nonOTC_no_signal("⏱ *No signal available* - market data timed out.")
 
     except Exception as e:
         logging.warning("generate_signal ERROR for {}: {}".format(pair, e))
@@ -4587,8 +4588,8 @@ async def safe_generate_signal(pair: str) -> dict:
         rescued = _rescue_nonOTC_signal(pair)
         if rescued:
             return rescued
-        return _nonOTC_no_signal("🟡 *No signal available* — please try again.")
-# ─────────────────────────────────────────────────────────────
+        return _nonOTC_no_signal("🟡 *No signal available* - please try again.")
+# -------------------------------------------------------------
 
 
 def generate_signal(pair):
@@ -4596,11 +4597,11 @@ def generate_signal(pair):
     real   = None
     yahoo_available = True
 
-    # News filter — block non-OTC signals during high-impact events
+    # News filter - block non-OTC signals during high-impact events
     if not is_otc and is_filter_on("news"):
         _near_news, _news_name = is_news_time()
         if _near_news:
-            logging.info("NEWS FILTER: blocking signal for {} — {}".format(pair, _news_name))
+            logging.info("NEWS FILTER: blocking signal for {} - {}".format(pair, _news_name))
             return {
                 "direction": "BUY", "pair": pair, "timeframe": 0,
                 "strength": 0, "indicators_agree": 0,
@@ -4608,7 +4609,7 @@ def generate_signal(pair):
                 "confluence": {}, "mtf": None, "flat": True,
                 "patterns": [], "movement_cat": "LOW",
                 "avg_movement": 0.0,
-                "no_signal_reason": "⚠️ High-impact news in {} — signal paused for safety.".format(_news_name),
+                "no_signal_reason": "⚠️ High-impact news in {} - signal paused for safety.".format(_news_name),
             }
 
     if not is_otc:
@@ -4621,28 +4622,28 @@ def generate_signal(pair):
             real = None
             yahoo_available = False
 
-    # ── 1H TREND FILTER (with reversal detection) ────────────
+    # -- 1H TREND FILTER (with reversal detection) ------------
     trend_1h = None
     try:
         trend_1h = _fetch_1h_trend(pair)
     except Exception as e:
         logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
 
-    # ── VWAP TREND ───────────────────────────────────────────
+    # -- VWAP TREND -------------------------------------------
     vwap_data = None
     try:
         vwap_data = _fetch_vwap_trend(pair)
     except Exception as e:
         logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
 
-    # ── MULTI-TIMEFRAME SCORE ─────────────────────────────────
+    # -- MULTI-TIMEFRAME SCORE ---------------------------------
     mtf = None
     try:
         mtf = _fetch_mtf_score(pair)
     except Exception as e:
         logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
 
-    # ── CANDLESTICK PATTERN DETECTION ────────────────────────
+    # -- CANDLESTICK PATTERN DETECTION ------------------------
     pattern_buy_bonus = 0
     pattern_sell_bonus = 0
     detected_patterns = {}
@@ -4674,10 +4675,10 @@ def generate_signal(pair):
         else:
             pattern_sell_bonus += pbonus
 
-    # ── PIP MOVEMENT ANALYSIS ─────────────────────────────────
+    # -- PIP MOVEMENT ANALYSIS ---------------------------------
     avg_movement, movement_cat = _check_pip_movement(pair)
 
-    # ── D: VOLATILITY (ATR) CHECK — dead market filter ────────
+    # -- D: VOLATILITY (ATR) CHECK - dead market filter --------
     atr_pct, is_dead_market = 0.05, False
     if not is_otc and not is_force_pair(pair) and is_filter_on("dead"):
         try:
@@ -4697,7 +4698,7 @@ def generate_signal(pair):
             "no_signal_reason": "🟡 *No signal available*",
         }
 
-    # ── L: FIBONACCI LEVELS ───────────────────────────────────
+    # -- L: FIBONACCI LEVELS -----------------------------------
     fib_buy_bonus = fib_sell_bonus = 0
     fib_level_str = None
     if not is_otc:
@@ -4706,7 +4707,7 @@ def generate_signal(pair):
         except Exception as _e:
             logging.warning("fibonacci check failed {}: {}".format(pair, _e))
 
-    # ── M: PRICE ACTION SCORE ─────────────────────────────────
+    # -- M: PRICE ACTION SCORE ---------------------------------
     pa_buy_bonus = pa_sell_bonus = 0
     pa_trend_str = None
     try:
@@ -4714,7 +4715,7 @@ def generate_signal(pair):
     except Exception as _e:
         logging.warning("price action score failed {}: {}".format(pair, _e))
 
-    # ── DERIV TICK CACHE — read indicators for seconds bonus ──
+    # -- DERIV TICK CACHE - read indicators for seconds bonus --
     import time as _time_gen
     _deriv_cached = _deriv_tick_cache.get(pair)
     _deriv_ind_data = None
@@ -4724,10 +4725,10 @@ def generate_signal(pair):
             _deriv_ind_data = _deriv_cached["data"]
             logging.info("Deriv cache hit for {} (age={:.1f}s)".format(pair, _cache_age))
     # Store in sig dict for bonus block below
-    _sig_deriv_ind = _deriv_ind_data  # may be None — bonus is optional
+    _sig_deriv_ind = _deriv_ind_data  # may be None - bonus is optional
 
     if real:
-        # ── NON-OTC: Real indicators from Yahoo Finance (5m) ──
+        # -- NON-OTC: Real indicators from Yahoo Finance (5m) --
         rsi     = real["rsi"]
         sto     = real["sto"]
         ma_diff = real["ma_diff"]
@@ -4735,17 +4736,17 @@ def generate_signal(pair):
         bb_pos  = real["bb_pos"]
         mom     = real["mom"]
         vol     = real["vol"]
-        # Candle direction from real data — close vs open of last candle
+        # Candle direction from real data - close vs open of last candle
         _raw_dir = real.get("direction")
         if _raw_dir == "BUY":
             candle = 1.0
         elif _raw_dir == "SELL":
             candle = -1.0
         else:
-            # direction_raw is None when indicators conflict — use mom as proxy
+            # direction_raw is None when indicators conflict - use mom as proxy
             candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
     else:
-        # ── OTC: Smart synthetic indicators (session-aware) ────
+        # -- OTC: Smart synthetic indicators (session-aware) ----
         sess  = _get_session()
         ptype = _pair_type(pair)
         if sess["name"] in ("London Open", "NY/London"):
@@ -4781,10 +4782,10 @@ def generate_signal(pair):
         vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
         candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
 
-    # ── BASE SCORING ─────────────────────────────────────────
-    # Non-OTC: halve 5m indicator weights — they are confirmation only.
+    # -- BASE SCORING -----------------------------------------
+    # Non-OTC: halve 5m indicator weights - they are confirmation only.
     # 1H (weight 80) and MTF/VWAP dominate direction for non-OTC.
-    # OTC: keep original weights (no Deriv/Yahoo data — 5m synthetic is all we have).
+    # OTC: keep original weights (no Deriv/Yahoo data - 5m synthetic is all we have).
     _w = 0.5 if not is_otc else 1.0
     b = s = 0
     if rsi < 25:    b += int(25 * _w)
@@ -4819,13 +4820,13 @@ def generate_signal(pair):
         if b > s: b += int(8 * _w)
         else:     s += int(8 * _w)
 
-    # ── RSI DIVERGENCE BONUS ─────────────────────────────────
+    # -- RSI DIVERGENCE BONUS ---------------------------------
     if real and real.get("divergence"):
         div = real["divergence"]
         if div == "BUY":  b += 20
         elif div == "SELL": s += 20
 
-    # ── NON-OTC MULTI-TF REAL CONSENSUS BONUS ────────────────
+    # -- NON-OTC MULTI-TF REAL CONSENSUS BONUS ----------------
     # Reward when 1m + 5m + 15m all point the same way (real data)
     if real and not is_otc and real.get("tf_count", 0) >= 2:
         tv = real.get("tf_buy_votes", 0)
@@ -4838,11 +4839,11 @@ def generate_signal(pair):
             bonus = int((sv / tf_total) * 30)
             s += bonus
         else:
-            # Conflict across timeframes — reduce confidence
+            # Conflict across timeframes - reduce confidence
             b -= 10
             s -= 10
 
-    # ── WILLIAMS FRACTAL BONUS ───────────────────────────────
+    # -- WILLIAMS FRACTAL BONUS -------------------------------
     fractal_sig = None
     fractal_str = 0
     if real and real.get("fractal_signal"):
@@ -4862,25 +4863,25 @@ def generate_signal(pair):
     elif fractal_sig == "SELL":
         s += 15 * fractal_str
 
-    # ── CANDLESTICK PATTERN BONUS ────────────────────────────
+    # -- CANDLESTICK PATTERN BONUS ----------------------------
     b += pattern_buy_bonus
     s += pattern_sell_bonus
 
-    # ── L: FIBONACCI BONUS ───────────────────────────────────
+    # -- L: FIBONACCI BONUS -----------------------------------
     b += fib_buy_bonus
     s += fib_sell_bonus
     if fib_level_str:
         logging.info("FIB {}: {} buy_bonus={} sell_bonus={}".format(
             pair, fib_level_str, fib_buy_bonus, fib_sell_bonus))
 
-    # ── M: PRICE ACTION BONUS ─────────────────────────────────
+    # -- M: PRICE ACTION BONUS ---------------------------------
     b += pa_buy_bonus
     s += pa_sell_bonus
     if pa_trend_str:
         logging.info("PA {}: {} buy={} sell={}".format(
             pair, pa_trend_str, pa_buy_bonus, pa_sell_bonus))
 
-    # ── SESSION BIAS ─────────────────────────────────────────
+    # -- SESSION BIAS -----------------------------------------
     sb, ss = _session_bias()
     b += sb; s += ss
     ptype = _pair_type(pair)
@@ -4895,15 +4896,15 @@ def generate_signal(pair):
         if ma_diff > 0.2: b += 5
         elif ma_diff < -0.2: s += 5
 
-    # ── 1H TREND FILTER BONUS (includes reversal detection) ──
-    # 1H is the primary direction driver — highest weight
+    # -- 1H TREND FILTER BONUS (includes reversal detection) --
+    # 1H is the primary direction driver - highest weight
     _1h_weight = 80 if not is_otc else 45
     if trend_1h == "BUY":
         b += _1h_weight
     elif trend_1h == "SELL":
         s += _1h_weight
 
-    # ── VWAP TREND BONUS ─────────────────────────────────────
+    # -- VWAP TREND BONUS -------------------------------------
     if vwap_data is not None:
         if vwap_data["direction"] == "BUY":
             bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
@@ -4912,7 +4913,7 @@ def generate_signal(pair):
             bonus = 30 if vwap_data["strength"] == "STRONG" else (18 if vwap_data["strength"] == "MODERATE" else 8)
             s += bonus
 
-    # ── MULTI-TIMEFRAME BONUS ────────────────────────────────
+    # -- MULTI-TIMEFRAME BONUS --------------------------------
     # Non-OTC: higher MTF weight (real data) vs OTC (synthetic)
     _mtf_w = 12 if not is_otc else 8
     if mtf and mtf["total"] >= 3:
@@ -4921,7 +4922,7 @@ def generate_signal(pair):
         elif mtf["sell_tfs"] > mtf["buy_tfs"]:
             s += mtf["sell_tfs"] * _mtf_w
 
-    # ── DIRECTION & CONFLUENCE ───────────────────────────────
+    # -- DIRECTION & CONFLUENCE -------------------------------
     direction = "BUY" if b >= s else "SELL"
     indicators_agree = 0
     checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
@@ -4930,17 +4931,17 @@ def generate_signal(pair):
         if direction == "BUY" and buy_c:   indicators_agree += 1
         if direction == "SELL" and sell_c: indicators_agree += 1
 
-    # ── MTF CONFLUENCE COUNT ─────────────────────────────────
+    # -- MTF CONFLUENCE COUNT ---------------------------------
     if mtf and mtf["total"] >= 3:
         if direction == "BUY"  and mtf["buy_tfs"]  > mtf["sell_tfs"]: indicators_agree += mtf["buy_tfs"]
         if direction == "SELL" and mtf["sell_tfs"] > mtf["buy_tfs"]:  indicators_agree += mtf["sell_tfs"]
     if trend_1h == direction:
-        indicators_agree += 3  # Increased from 2 — 1H trend with reversal detection is stronger
+        indicators_agree += 3  # Increased from 2 - 1H trend with reversal detection is stronger
 
-    # ── DERIV SECONDS INDICATOR BONUS (non-OTC only) ─────────
+    # -- DERIV SECONDS INDICATOR BONUS (non-OTC only) ---------
     # Indicators from 5s/10s/15s candles act as bonus confirmation.
-    # They do NOT change direction — only add/reduce score and indicators_agree.
-    # Weight: ~30% of 1H weight — bonus kubwa lakini si msingi.
+    # They do NOT change direction - only add/reduce score and indicators_agree.
+    # Weight: ~30% of 1H weight - bonus kubwa lakini si msingi.
     _deriv_ind = _sig_deriv_ind if not is_otc else None
     if not is_otc and _deriv_ind:
         _sec_agree = 0
@@ -4967,7 +4968,7 @@ def generate_signal(pair):
                 if direction == "BUY" and _ind_ma > 0.1: indicators_agree += 1
                 elif direction == "SELL" and _ind_ma < -0.1: indicators_agree += 1
             elif _ind_dir is not None and _ind_dir != direction:
-                # Seconds oppose direction — slight penalty
+                # Seconds oppose direction - slight penalty
                 indicators_agree = max(0, indicators_agree - 1)
         # Score bonus: sekunde zinakubaliana → b/s bonus
         if _sec_total > 0:
@@ -4977,30 +4978,30 @@ def generate_signal(pair):
             else:                   s += _sec_bonus
             logging.info("Deriv sec indicators {}: agree={}/{} bonus={} dir={}".format(
                 pair, _sec_agree, _sec_total, _sec_bonus, direction))
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
 
-    # ── NON-OTC TF VOTE CONFLUENCE (added here — direction is now known) ──
+    # -- NON-OTC TF VOTE CONFLUENCE (added here - direction is now known) --
     if real and not is_otc and real.get("tf_count", 0) >= 2:
         tv = real.get("tf_buy_votes", 0)
         sv = real.get("tf_sell_votes", 0)
         if direction == "BUY"  and tv > sv: indicators_agree += tv
         if direction == "SELL" and sv > tv: indicators_agree += sv
 
-    # ── PATTERN CONFLUENCE ───────────────────────────────────
-    # If patterns agree with direction — boost indicators_agree
+    # -- PATTERN CONFLUENCE -----------------------------------
+    # If patterns agree with direction - boost indicators_agree
     pattern_agrees = (pattern_buy_bonus > 0 and direction == "BUY") or \
                      (pattern_sell_bonus > 0 and direction == "SELL")
     if pattern_agrees:
         indicators_agree += 2
 
-    # ── CONFLICT CHECK: MTF vs 1H ────────────────────────────
+    # -- CONFLICT CHECK: MTF vs 1H ----------------------------
     if mtf and trend_1h and mtf["total"] >= 3:
         mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
         if mtf_dir != trend_1h:
             direction = "BUY" if b > s else "SELL"
 
-    # ── MINIMUM CONFLUENCE ───────────────────────────────────
-    min_confluence = 4 if not is_otc else 3   # Lowered: was 6/5 — less blocking
+    # -- MINIMUM CONFLUENCE -----------------------------------
+    min_confluence = 4 if not is_otc else 3   # Lowered: was 6/5 - less blocking
     if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
@@ -5017,25 +5018,25 @@ def generate_signal(pair):
                 if direction == "BUY" and buy_c:   indicators_agree += 1
                 if direction == "SELL" and sell_c: indicators_agree += 1
 
-    # ── SIGNAL HISTORY BIAS CHECK ────────────────────────────
-    # If most recent signals share same direction — reinforce decision
+    # -- SIGNAL HISTORY BIAS CHECK ----------------------------
+    # If most recent signals share same direction - reinforce decision
     hist_same, hist_total, hist_pct = _check_signal_history_bias(pair, direction, window=15)
     if hist_total >= 5:
         if hist_pct >= 0.70:
-            # History strongly agrees — add +20 and boost indicators_agree
+            # History strongly agrees - add +20 and boost indicators_agree
             if direction == "BUY":
                 b += 20
             else:
                 s += 20
             indicators_agree += 2
         elif hist_pct <= 0.30:
-            # History strongly disagrees — reduce confidence
+            # History strongly disagrees - reduce confidence
             if direction == "BUY":
                 b -= 15
             else:
                 s -= 15
 
-    # ── STRENGTH CALCULATION ─────────────────────────────────
+    # -- STRENGTH CALCULATION ---------------------------------
     dom = max(b, s); tot = max(b+s, 1)
     mtf_bonus = 0
     if mtf and mtf["total"] >= 3:
@@ -5052,13 +5053,13 @@ def generate_signal(pair):
     # Map 300–500 → 60–99%
     strength = int(60 + (_raw_strength - 300) / 200 * 39)
 
-    # ── TIMEFRAME SELECTION ──────────────────────────────────
+    # -- TIMEFRAME SELECTION ----------------------------------
     if is_otc:
         timeframe = random.choice([1, 1, 2, 2, 3, 3])
     else:
-        # Non-OTC: kagua 1m/2m/3m zote — chagua yenye nguvu zaidi
+        # Non-OTC: kagua 1m/2m/3m zote - chagua yenye nguvu zaidi
         # Kanuni: TF yenye indicators_agree kubwa zaidi + VTE history ndiyo inachaguliwa
-        # Hakuna kushuka chini kwa sababu ya udhaifu — best TF ndiyo inatoka
+        # Hakuna kushuka chini kwa sababu ya udhaifu - best TF ndiyo inatoka
 
         best_vte = get_best_tf_for_session(pair)  # session-aware (London/NY/Asian)
         if best_vte is None:
@@ -5095,16 +5096,16 @@ def generate_signal(pair):
             # 1H trend confirmation bonus
             if trend_1h == direction:
                 _score += 20
-            # ── Deriv cache bonus: kama cached Deriv data inakubaliana na direction ──
+            # -- Deriv cache bonus: kama cached Deriv data inakubaliana na direction --
             _dc_bonus = _deriv_ind_data  # fetched earlier at top of generate_signal
             if _dc_bonus:
                 _dc_key_map = {1: "5_s", 2: "10_s", 3: "15_s"}
                 _dc_trend = _dc_bonus.get(_dc_key_map.get(_tf, ""))
                 if _dc_trend and _dc_trend.get("direction") == direction:
                     _dc_str = _dc_trend.get("strength", 0)
-                    _score += int(_dc_str * 0.6)  # max +60 — Deriv inakuwa na uzito mkubwa
+                    _score += int(_dc_str * 0.6)  # max +60 - Deriv inakuwa na uzito mkubwa
                 elif _dc_trend and _dc_trend.get("direction") not in (None, "FLAT") and _dc_trend["direction"] != direction:
-                    _score -= 20  # Deriv inapinga — punguza score
+                    _score -= 20  # Deriv inapinga - punguza score
             _tf_candidate_scores[_tf] = _score
 
         # Chagua TF yenye score kubwa zaidi
@@ -5115,7 +5116,7 @@ def generate_signal(pair):
         if _tf_candidate_scores[best_tf_chosen] >= _min_scores[best_tf_chosen]:
             timeframe = best_tf_chosen
         else:
-            # Nguvu haitoshi kwa TF yoyote — chagua 3m kama fallback wa mwisho
+            # Nguvu haitoshi kwa TF yoyote - chagua 3m kama fallback wa mwisho
             timeframe = 3
 
         vte_tf = best_vte  # keep vte_tf for downstream filters
@@ -5129,11 +5130,11 @@ def generate_signal(pair):
             {k: round(v, 1) for k, v in _micro_scores.items()}
         ))
 
-    # ── MICRO-CANDLE TREND: imeshughulikiwa ndani ya TF SELECTION block juu ──
-    # ─────────────────────────────────────────────────────────
+    # -- MICRO-CANDLE TREND: imeshughulikiwa ndani ya TF SELECTION block juu --
+    # ---------------------------------------------------------
 
 
-    # ── NON-OTC: ADX Weak-Trend Blocker ─────────────────────
+    # -- NON-OTC: ADX Weak-Trend Blocker ---------------------
     # Block only in genuinely ranging/choppy market.
     # ADX < 14  → always block
     # ADX 14-20 + agree < 4 + no 1H trend + no VTE → block
@@ -5159,17 +5160,17 @@ def generate_signal(pair):
                 "no_signal_reason": "🟡 *Market is ranging – ADX={:.0f}. No clear trend.*".format(_adx_live),
                 "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
             }
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
 
-    # ── NON-OTC: Weak confluence → fuata 1H trend (ilikuwa ina bug ya kupinga 1H) ──
+    # -- NON-OTC: Weak confluence → fuata 1H trend (ilikuwa ina bug ya kupinga 1H) --
     if not is_otc and is_filter_on("confluence") and indicators_agree < 5 and vte_tf is None:
         if trend_1h is not None:
-            direction = trend_1h  # Fuata 1H — si kupingana nayo
+            direction = trend_1h  # Fuata 1H - si kupingana nayo
             timeframe = timeframe if timeframe > 0 else 3
         elif not yahoo_available:
-            timeframe = 3  # No data — use 3m instead of blocking
+            timeframe = 3  # No data - use 3m instead of blocking
 
-    # ── OTC: Random flip/follow logic ────────────────────────
+    # -- OTC: Random flip/follow logic ------------------------
     # Each signal independently decides: follow the market or go against it.
     # Random intervals mean the broker cannot predict the pattern.
     if is_otc:
@@ -5181,8 +5182,8 @@ def generate_signal(pair):
             direction = "SELL" if direction == "BUY" else "BUY"
         _otc_flip_cache[pair] = otc_flip
 
-    # ── 1H CANDLE CONFIRMATION (non-OTC only) ───────────────
-    # OTC always forces a signal — no blocking on 1H confirmation.
+    # -- 1H CANDLE CONFIRMATION (non-OTC only) ---------------
+    # OTC always forces a signal - no blocking on 1H confirmation.
     if not is_otc and is_filter_on("h1confirm") and timeframe <= 2:
         h1_confirmed = _confirm_1h_direction(pair, direction)
         if not h1_confirmed:
@@ -5195,7 +5196,7 @@ def generate_signal(pair):
             if not h1_confirmed:
                 timeframe = 3  # Bump to 3m instead of blocking (timeframe=0)
 
-    # ── SESSION-AWARE BIAS ────────────────────────────────────
+    # -- SESSION-AWARE BIAS ------------------------------------
     session = _get_session()
     bias    = get_signal_bias(pair, window=10, threshold=session["threshold"])
     if bias is not None and trend_1h is None:
@@ -5206,7 +5207,7 @@ def generate_signal(pair):
         if bias == trend_1h:
             direction = trend_1h
 
-    # ── ENFORCE 1H TREND AS HARD FILTER ─────────────────────
+    # -- ENFORCE 1H TREND AS HARD FILTER ---------------------
     if trend_1h == "BUY" and direction == "SELL":
         raw_gap = s - b - 45
         if raw_gap < 35:
@@ -5216,7 +5217,7 @@ def generate_signal(pair):
         if raw_gap < 35:
             direction = "SELL"
 
-    # ── 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) ────────
+    # -- 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) --------
     # If 1H trend is clear but 5m+15m real data strongly disagrees → no signal
     if not is_otc and trend_1h is not None and real is not None and is_filter_on("conflict"):
         tv = real.get("tf_buy_votes", 0)
@@ -5227,8 +5228,8 @@ def generate_signal(pair):
             # Short TFs majority oppose the 1H trend (lowered from 100% to 67%)
             opposition_pct = max(tv, sv) / tf_total
             if opposition_pct >= 0.67 and tf_total >= 2:
-                # 100% of short TFs oppose 1H — market in transition, wait
-                timeframe = 0   # Signal flat — will trigger no-signal in handler
+                # 100% of short TFs oppose 1H - market in transition, wait
+                timeframe = 0   # Signal flat - will trigger no-signal in handler
                 direction = "BUY" if b > s else "SELL"
                 record_signal(pair, direction)
                 return {
@@ -5241,8 +5242,8 @@ def generate_signal(pair):
                     "no_signal_reason": "1H vs short-TF conflict",
                 }
 
-    # ── SIGNAL STABILITY FILTER (non-OTC only) ──────────────
-    # OTC always produces a signal — stability filter does not apply.
+    # -- SIGNAL STABILITY FILTER (non-OTC only) --------------
+    # OTC always produces a signal - stability filter does not apply.
     if not is_otc and is_filter_on("stability") and not _check_signal_stability(pair, direction, window_minutes=5):
         timeframe = 0
         record_signal(pair, direction)
@@ -5256,14 +5257,14 @@ def generate_signal(pair):
             "no_signal_reason": "sudden direction flip detected",
         }
 
-    # ── TREND CONFLUENCE ANALYSIS ────────────────────────────
+    # -- TREND CONFLUENCE ANALYSIS ----------------------------
     confluence = _calc_trend_confluence(trend_1h, vwap_data, mtf, direction)
 
     # Apply reversal candle filter (non-OTC, TF 1m/2m/3m only)
     if not is_otc:
         direction = _apply_reversal_filter(direction, timeframe, pair)
 
-    # ── I: CANDLESTICK CONFIRMATION GATE ─────────────────────
+    # -- I: CANDLESTICK CONFIRMATION GATE ---------------------
     # Check current candle direction on 1m, 2m (proxy), 3m timeframes.
     # If candle opposes signal → bump TF up (safer entry).
     # Prevents entering at worst possible moment.
@@ -5314,9 +5315,9 @@ def generate_signal(pair):
                     # timeframe==3: no bump needed, 3m is most forgiving
         except Exception as _cg_e:
             logging.warning("candle gate {} failed: {}".format(pair, _cg_e))
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
 
-    # ── NEURAL NETWORK FILTER ─────────────────────────────────
+    # -- NEURAL NETWORK FILTER ---------------------------------
     nn_confidence  = None
     nn_used        = False
     nn_feat_arr    = None
@@ -5339,9 +5340,9 @@ def generate_signal(pair):
             if nn_confidence is not None:
                 logging.info("NN Signal: pair={} dir={} conf={:.1%} used={}".format(
                     pair, direction, nn_confidence, nn_used))
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
 
-    # AUTO-REVERSE disabled — signal follows MTF direction only
+    # AUTO-REVERSE disabled - signal follows MTF direction only
 
     record_signal(pair, direction)
     result = {
@@ -5418,7 +5419,7 @@ def _session_header_text():
         sess = _get_session()
         name = sess.get("name", "")
         if not name or name in ("Dead Hours", "Off Hours", ""):
-            return "🔴 *Dead Hours* — low activity"
+            return "🔴 *Dead Hours* - low activity"
         emoji = _SESSION_EMOJIS.get(name, "🕐")
         return "{} *{}*".format(emoji, name)
     except Exception:
@@ -5440,7 +5441,7 @@ def pairs_keyboard():
     Pairs sorted: hot pairs (consecutive_wins >= 3) first within each
     priority group, then by win rate. Max 96 buttons, 3 per row.
     """
-    # Popular non-OTC pairs — always shown first (majors + key minors)
+    # Popular non-OTC pairs - always shown first (majors + key minors)
     _PRIORITY_PAIRS = [
         "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD",
         "NZD/USD", "USD/CAD", "EUR/GBP", "EUR/JPY", "EUR/AUD",
@@ -5457,10 +5458,10 @@ def pairs_keyboard():
     reason = _market_closed_reason()
 
     if closed:
-        # Weekend — OTC only
+        # Weekend - OTC only
         pool = [p for p in ALL_PAIRS if "OTC" in p]
     else:
-        # Weekday — non-OTC only
+        # Weekday - non-OTC only
         pool = [
             p for p in ALL_PAIRS
             if "OTC" not in p and len(p) > 1
@@ -5493,12 +5494,12 @@ def pairs_keyboard():
         return (-(cw >= 3), -wr, -total)
 
     if closed:
-        # OTC — sort by win rate as before
+        # OTC - sort by win rate as before
         known   = sorted([p for p in pool if p in wr_rows and wr_rows[p][1] >= 3], key=_sort_key)
         unknown = sorted([p for p in pool if p not in known], key=_sort_key)
         pairs   = (known + unknown)[:_MAX_BUTTONS]
     else:
-        # Non-OTC — priority pairs first, bonus (exotic) pairs at end
+        # Non-OTC - priority pairs first, bonus (exotic) pairs at end
         priority_in_pool = [p for p in _PRIORITY_PAIRS if p in pool]
         bonus_in_pool    = [p for p in pool if p not in _PRIORITY_PAIRS]
 
@@ -5529,7 +5530,7 @@ def pairs_keyboard():
 
     # Market closed banner
     if closed:
-        banner = "🔒 {} — OTC pairs active 24/7".format(reason)
+        banner = "🔒 {} - OTC pairs active 24/7".format(reason)
         rows.insert(0 if not sess_line else 1, [InlineKeyboardButton(banner, callback_data="noop")])
 
     return InlineKeyboardMarkup(rows)
@@ -5550,7 +5551,7 @@ def otc_mode_keyboard(pair):
     ])
 
 def otc_seconds_keyboard(pair):
-    """Seconds keyboard for OTC — subscribers only."""
+    """Seconds keyboard for OTC - subscribers only."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
         [
@@ -5632,14 +5633,14 @@ def signal_keyboard(pair):
 # ============================================================
 PAYMENT_TEXT = """💰 *UNLOCK EVALON WINNERS BOT*
 
-🥈 *MONTHLY ACCESS — $50*
+🥈 *MONTHLY ACCESS - $50*
 ✅ Unlimited signals for 30 days
-✅ Win rate 90% — 98%
+✅ Win rate 90% - 98%
 ✅ 100+ trading pairs
 
-💎 *LIFETIME ACCESS — $150*
+💎 *LIFETIME ACCESS - $150*
 ✅ Unlimited signals forever
-✅ Win rate 90% — 98%
+✅ Win rate 90% - 98%
 ✅ Free updates forever
 ✅ 100+ trading pairs
 
@@ -5657,7 +5658,7 @@ Send USDT or BUSD via Binance Pay
 
 🔵 *USDT TRC-20 (Tron):*
 `TEUwK1aElmdCeG3n36LDySqSkwobMh37Xf`
-TRC-20 Tron ONLY — wrong network = lost funds
+TRC-20 Tron ONLY - wrong network = lost funds
 
 💠 *Ethereum ERC-20:*
 `0x230badccf11a0de2b8a261ae3f99c07235174d6b`
@@ -5729,14 +5730,14 @@ async def check_channel_and_proceed(update, context):
         if await is_channel_member(context.bot, user_id):
             return True
     except Exception:
-        # Can't check — let them through rather than blocking everyone
+        # Can't check - let them through rather than blocking everyone
         return True
 
     # Pending join request
     if has_join_request(user_id):
         return True
 
-    # Not joined, not requested — show join message
+    # Not joined, not requested - show join message
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_INVITE)],
         [InlineKeyboardButton("✅ I've Requested", callback_data="check_join")],
@@ -5747,7 +5748,7 @@ async def check_channel_and_proceed(update, context):
         "1️⃣ Tap *Join Channel* below\n"
         "2️⃣ Send a join request\n"
         "3️⃣ Tap *I've Requested* to continue\n\n"
-        "_You don't need to wait for approval — just send the request._"
+        "_You don't need to wait for approval - just send the request._"
     )
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -5758,7 +5759,7 @@ async def check_channel_and_proceed(update, context):
 async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Triggered automatically when user sends a join request to the channel.
-    Saves their user_id — bot does NOT approve the request (admin does that).
+    Saves their user_id - bot does NOT approve the request (admin does that).
     """
     user_id = update.chat_join_request.from_user.id
     save_join_request(user_id)
@@ -5771,7 +5772,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import ReplyKeyboardMarkup, KeyboardButton
     user_id = update.effective_user.id
 
-    # DB calls wrapped — bot still responds even if DB is temporarily down
+    # DB calls wrapped - bot still responds even if DB is temporarily down
     try:
         get_user(user_id)
     except Exception as e:
@@ -5787,7 +5788,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Channel membership check — skip if it fails, don't block user
+    # Channel membership check - skip if it fails, don't block user
     try:
         if not await check_channel_and_proceed(update, context):
             return
@@ -5805,7 +5806,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "╔══════════════════════╗\n"
         "     ⚡ EVALON WINNERS BOT\n"
         "╚══════════════════════╝\n\n"
-        "🏆 *Win Rate: 90% — 98%*\n"
+        "🏆 *Win Rate: 90% - 98%*\n"
         "📊 *100+ Trading Pairs*\n"
         "🧠 *AI-Powered Signal Analysis*\n\n"
         "⚠️ _Evalon Bot is AI-powered and may make mistakes. Trade responsibly._\n\n"
@@ -5817,75 +5818,75 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         await update.message.reply_text(
-            "🔧 *EVALON WINNERS BOT — ADMIN PANEL*\n\n"
+            "🔧 *EVALON WINNERS BOT - ADMIN PANEL*\n\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔑 *LICENCE MANAGEMENT*\n"
-            "`/addmonthly` — Generate 1 monthly code\n"
-            "`/addmonthly 5` — Generate 5 monthly codes\n"
-            "`/addlifetime` — Generate 1 lifetime code\n"
-            "`/addlifetime 5` — Generate 5 lifetime codes\n"
-            "`/listlicences` — View all codes (used/unused)\n"
-            "`/revoke 123456` — Remove user licence\n"
-            "`/resultson` — Enable WIN/LOSS result messages\n"
-            "`/resultsoff` — Disable result messages\n"
+            "`/addmonthly` - Generate 1 monthly code\n"
+            "`/addmonthly 5` - Generate 5 monthly codes\n"
+            "`/addlifetime` - Generate 1 lifetime code\n"
+            "`/addlifetime 5` - Generate 5 lifetime codes\n"
+            "`/listlicences` - View all codes (used/unused)\n"
+            "`/revoke 123456` - Remove user licence\n"
+            "`/resultson` - Enable WIN/LOSS result messages\n"
+            "`/resultsoff` - Disable result messages\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "👥 *USER MANAGEMENT*\n"
-            "`/listusers` — View all users & stats\n"
-            "`/totalusers` — Quick user count\n"
-            "`/stats` — Detailed statistics\n"
-            "`/userinfo 123456` — Full details of a user\n"
-            "`/addtrial 123456 5` — Give user extra free signals\n"
-            "`/deleteuser 123456` — Delete user permanently\n"
+            "`/listusers` - View all users & stats\n"
+            "`/totalusers` - Quick user count\n"
+            "`/stats` - Detailed statistics\n"
+            "`/userinfo 123456` - Full details of a user\n"
+            "`/addtrial 123456 5` - Give user extra free signals\n"
+            "`/deleteuser 123456` - Delete user permanently\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🚫 *BLACKLIST*\n"
-            "`/blacklist 123456 reason` — Ban a user\n"
-            "`/unblacklist 123456` — Unban a user\n"
-            "`/listblacklist` — View all banned users\n"
+            "`/blacklist 123456 reason` - Ban a user\n"
+            "`/unblacklist 123456` - Unban a user\n"
+            "`/listblacklist` - View all banned users\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📢 *BROADCAST*\n"
-            "`/broadcast message` — Send to all users\n"
+            "`/broadcast message` - Send to all users\n"
             "_Markdown supported: *bold*, _italic_, `code`_\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🖼 *IMAGES*\n"
-            "`/setimage` — Change BUY/SELL signal images\n"
+            "`/setimage` - Change BUY/SELL signal images\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🗄 *DATABASE*\n"
-            "`/dbcheck` — Check database status\n"
+            "`/dbcheck` - Check database status\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 *PAIR STATS*\n"
-            "`/pairstats` — Win/loss stats for all pairs\n"
+            "`/pairstats` - Win/loss stats for all pairs\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔀 *OTC CONTROL*\n"
-            "`/toggleotc` — Enable or disable OTC pairs\n"
+            "`/toggleotc` - Enable or disable OTC pairs\n"
             "• OTC OFF → show non-OTC pairs only\n"
             "• OTC ON  → all pairs visible (default)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🎛 *SIGNAL FILTERS*\n"
-            "`/filterstatus` — View status of all filters\n"
-            "`/filteroff news` — Disable news block filter\n"
-            "`/filteroff dead` — Disable dead market filter\n"
-            "`/filteroff conflict` — Disable 1H vs short-TF filter\n"
-            "`/filteroff stability` — Disable signal stability filter\n"
-            "`/filteroff confluence` — Disable min confluence filter\n"
-            "`/filteroff h1confirm` — Disable 1H candle gate\n"
-            "`/filteroff micro_trend` — Disable micro-candle trend filter\n"
-            "`/filteroff all` — Disable ALL filters\n"
-            "`/filteron [name|all]` — Enable filter(s)\n"
+            "`/filterstatus` - View status of all filters\n"
+            "`/filteroff news` - Disable news block filter\n"
+            "`/filteroff dead` - Disable dead market filter\n"
+            "`/filteroff conflict` - Disable 1H vs short-TF filter\n"
+            "`/filteroff stability` - Disable signal stability filter\n"
+            "`/filteroff confluence` - Disable min confluence filter\n"
+            "`/filteroff h1confirm` - Disable 1H candle gate\n"
+            "`/filteroff micro_trend` - Disable micro-candle trend filter\n"
+            "`/filteroff all` - Disable ALL filters\n"
+            "`/filteron [name|all]` - Enable filter(s)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔓 *FORCE PAIR*\n"
-            "`/forcepair EURUSD OTC` — bypass flat filter for pair\n"
-            "`/forcepair all` — bypass for all pairs\n"
-            "`/forcepair list` — show forced pairs\n"
-            "`/unforcepair all` — clear all overrides\n"
+            "`/forcepair EURUSD OTC` - bypass flat filter for pair\n"
+            "`/forcepair all` - bypass for all pairs\n"
+            "`/forcepair list` - show forced pairs\n"
+            "`/unforcepair all` - clear all overrides\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🧠 *NEURAL NETWORK*\n"
-            "`/nnstats` — NN status, accuracy & per-pair models\n"
-            "`/nnretrain` — Force NN retrain immediately\n"
+            "`/nnstats` - NN status, accuracy & per-pair models\n"
+            "`/nnretrain` - Force NN retrain immediately\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 *REPORTS*\n"
-            "`/pairreport` — Full pair performance report\n"
+            "`/pairreport` - Full pair performance report\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "`/help` — This menu",
+            "`/help` - This menu",
             parse_mode="Markdown",
             reply_markup=admin_image_keyboard()
         )
@@ -5978,7 +5979,7 @@ async def dbcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• SELL image: {}\n\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🟢 *Database is working correctly.*\n"
-            "_Data is safe on Neon — updates won't delete anything._".format(
+            "_Data is safe on Neon - updates won't delete anything._".format(
                 users_count, licensed_count, users_count - licensed_count, referred_count,
                 licences_count, used_licences, unused_licences,
                 blacklist_count,
@@ -6019,7 +6020,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         inactivity_clear(user_id)
         await q.edit_message_text(
             "⚡ *EVALON WINNERS BOT*\n\n"
-            "🏆 Win Rate: 90% — 98%\n"
+            "🏆 Win Rate: 90% - 98%\n"
             "📊 100+ Trading Pairs\n\n"
             "Choose how you want to get a signal:",
             parse_mode="Markdown",
@@ -6049,7 +6050,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID: return
         context.user_data["awaiting_image"] = "buy"
         await q.edit_message_text(
-            "📈 *Set BUY Image*\n\nSend me the BUY signal image now.\n\n_Forward or send any photo — I will save it._",
+            "📈 *Set BUY Image*\n\nSend me the BUY signal image now.\n\n_Forward or send any photo - I will save it._",
             parse_mode="Markdown"
         )
         return
@@ -6059,7 +6060,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID: return
         context.user_data["awaiting_image"] = "sell"
         await q.edit_message_text(
-            "📉 *Set SELL Image*\n\nSend me the SELL signal image now.\n\n_Forward or send any photo — I will save it._",
+            "📉 *Set SELL Image*\n\nSend me the SELL signal image now.\n\n_Forward or send any photo - I will save it._",
             parse_mode="Markdown"
         )
         return
@@ -6079,7 +6080,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         closed = is_market_closed()
 
-        # Rotating taglines — change every time user opens pair selection
+        # Rotating taglines - change every time user opens pair selection
         if closed:
             taglines = [
                 "🌙 *After-Hours Trading*\nKeep trading even when global markets are closed. Weekend-only pairs available 24/7.",
@@ -6089,8 +6090,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         else:
             taglines = [
-                "🌍 *Real Market Pairs*\nTrade on live market data — EUR/USD, Gold, Oil and more. Real prices, real movement, real results.",
-                "💹 *Live Market Trading*\nOur AI analyzes real-time market data from global exchanges. No simulations — just pure market signals.",
+                "🌍 *Real Market Pairs*\nTrade on live market data - EUR/USD, Gold, Oil and more. Real prices, real movement, real results.",
+                "💹 *Live Market Trading*\nOur AI analyzes real-time market data from global exchanges. No simulations - just pure market signals.",
                 "📡 *Real-Time Market Signals*\nPowered by live market data. Every signal is backed by actual market movement.",
                 "🏦 *Institutional-Grade Pairs*\nThe same pairs traded by banks and hedge funds. Maximum liquidity, highest accuracy.",
             ]
@@ -6112,15 +6113,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data=="bot_pick_pair":
-        # Free trial users cannot use Bot Pick Pair — subscribers only
+        # Free trial users cannot use Bot Pick Pair - subscribers only
         if not is_licensed(user_id):
             await q.edit_message_text(
-                "🔒 *Bot Pick Pair — Subscribers Only*\n\n"
+                "🔒 *Bot Pick Pair - Subscribers Only*\n\n"
                 "This feature is available for licensed subscribers only.\n\n"
                 "Upgrade to get:\n"
                 "✅ Bot-picked best pairs\n"
                 "✅ Unlimited signals\n"
-                "✅ Win rate 90% — 98%",
+                "✅ Win rate 90% - 98%",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
@@ -6132,7 +6133,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         closed = is_market_closed()
 
         if closed:
-            # Market closed — pick from OTC pairs only
+            # Market closed - pick from OTC pairs only
             top5 = get_top5_pairs(otc_only=True)
             if len(top5) < 5:
                 pool = [p for p in ALL_PAIRS if "OTC" in p]
@@ -6143,7 +6144,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                         existing.add(p)
         else:
-            # Market open — pick from non-OTC (live data) first, OTC as fallback
+            # Market open - pick from non-OTC (live data) first, OTC as fallback
             top5 = get_top5_pairs(non_otc_only=True)
             if len(top5) < 5:
                 pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
@@ -6160,7 +6161,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pair  = row["pair"]
             wr    = row.get("win_rate") or 0
             total = row.get("wins", 0) + row.get("losses", 0)
-            label = "📊 {} — {:.0f}% ({})".format(pair, wr, total) if is_admin_user and total > 0 else "📊 {}".format(pair)
+            label = "📊 {} - {:.0f}% ({})".format(pair, wr, total) if is_admin_user and total > 0 else "📊 {}".format(pair)
             try:
                 idx = ALL_PAIRS.index(pair)
             except ValueError:
@@ -6182,7 +6183,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = get_user(user_id)
         licensed = is_licensed(user_id)
         lic_type = u.get("licence_type", "").capitalize() if licensed else "Free Trial"
-        expiry_txt = get_expiry_text(user_id) if licensed else "—"
+        expiry_txt = get_expiry_text(user_id) if licensed else "-"
         free_used = free_signals_used(user_id)
         free_allowed = total_free_allowed(user_id)
         refs = count_referrals(user_id)
@@ -6250,15 +6251,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help_inline":
         await q.edit_message_text(
-            "ℹ️ *EVALON WINNERS BOT — Help*\n\n"
-            "⚡ *Get Signal* — Select a pair and get a BUY/SELL signal\n"
-            "🤖 *Bot Pick Pair* — Bot picks the best pair for you\n"
-            "📊 *My Stats* — View your account status\n"
-            "💎 *Upgrade* — Purchase a monthly or lifetime licence\n\n"
+            "ℹ️ *EVALON WINNERS BOT - Help*\n\n"
+            "⚡ *Get Signal* - Select a pair and get a BUY/SELL signal\n"
+            "🤖 *Bot Pick Pair* - Bot picks the best pair for you\n"
+            "📊 *My Stats* - View your account status\n"
+            "💎 *Upgrade* - Purchase a monthly or lifetime licence\n\n"
             "📌 *How to use:*\n"
             "1. Tap 🏆 EVALON MENU 🏆\n"
             "2. Select Get Signal or Bot Pick Pair\n"
-            "3. Wait for the signal — enter the trade when it appears",
+            "3. Wait for the signal - enter the trade when it appears",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚡ Get Signal", callback_data="choose_pair")],
@@ -6267,7 +6268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── OTC: "Back" button — return to mode selection ───────────
+    # -- OTC: "Back" button - return to mode selection -----------
     if data.startswith("otcback_"):
         idx_str = data[8:]
         pair = PAIR_INDEX.get(idx_str)
@@ -6281,15 +6282,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "⚡ *{}*\n\n"
                 "Choose signal type:\n\n"
-                "⏱ *Seconds* — 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
-                "📊 *Normal* — minute-based signal"
+                "⏱ *Seconds* - 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
+                "📊 *Normal* - minute-based signal"
             ).format(pair),
             parse_mode="Markdown",
             reply_markup=otc_mode_keyboard(pair)
         )
         return
 
-    # ── OTC: "Normal (minutes)" chosen — continue with normal signal flow ─
+    # -- OTC: "Normal (minutes)" chosen - continue with normal signal flow -
     if data.startswith("otc_normal_"):
         idx_str = data[11:]
         pair = PAIR_INDEX.get(idx_str)
@@ -6305,7 +6306,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # --- Always fresh signal — ignore cooldown, generate new one ---
+        # --- Always fresh signal - ignore cooldown, generate new one ---
         check = check_signal_request(user_id, pair)
         clear_user_signal_state(user_id, pair)  # Force fresh always
 
@@ -6315,17 +6316,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend = get_trend_direction(pair)
 
         if check["action"] == "fresh":
-            sig = await safe_generate_signal(pair)  # guaranteed — OTC always signals
+            sig = await safe_generate_signal(pair)  # guaranteed - OTC always signals
             _anim_stop.set()
             direction = sig["direction"]
             timeframe = sig["timeframe"]
             strength  = sig["strength"]
             flip_count = 0
-            # ── Store NN features for VTE feedback later ──
+            # -- Store NN features for VTE feedback later --
             _nn_feat = sig.get("_nn_feat_arr")
             if _nn_feat is not None:
                 nn_store_signal_features(user_id, pair, _nn_feat, sig.get("direction"))
-            # ──────────────────────────────────────────────
+            # ----------------------------------------------
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
@@ -6399,7 +6400,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_INACTIVITY[user_id]["task"] = task
         return
 
-    # ── Non-OTC: Back to mode selection ──────────────────────────────────
+    # -- Non-OTC: Back to mode selection ----------------------------------
     if data.startswith("nonotc_back_"):
         idx_str = data[12:]
         pair = PAIR_INDEX.get(idx_str)
@@ -6411,7 +6412,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Non-OTC: Show manual TF keyboard ──────────────────────────────────
+    # -- Non-OTC: Show manual TF keyboard ----------------------------------
     if data.startswith("nonotc_tf_"):
         idx_str = data[10:]
         pair = PAIR_INDEX.get(idx_str)
@@ -6423,13 +6424,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Non-OTC: Bot decides TF — go straight to signal ───────────────────
+    # -- Non-OTC: Bot decides TF - go straight to signal -------------------
     if data.startswith("nonotc_auto_"):
         # Redirect to sel_ flow by replacing data
         data = "sel_{}".format(data[12:])
         # Fall through to sel_ handler below
 
-    # ── Non-OTC: User chose specific TF ───────────────────────────────────
+    # -- Non-OTC: User chose specific TF -----------------------------------
     if data.startswith("nonotctf_"):
         parts     = data[9:].rsplit("_", 1)
         idx_str   = parts[0]
@@ -6450,19 +6451,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = sig["direction"]
         timeframe = chosen_tf
 
-        # ── Deriv micro-candle: MSINGI wa direction na TF ───────
+        # -- Deriv micro-candle: MSINGI wa direction na TF -------
         # Sekunde (5s/10s/15s) zinaaamua direction na timeframe
         if pair in DERIV_SYMBOLS:
             try:
                 _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
-                logging.info("Deriv best_tf={} dir={} str={} — {}".format(
+                logging.info("Deriv best_tf={} dir={} str={} - {}".format(
                     _best_tf, _micro_dir, _best_str, _best_reason))
                 if _best_tf is not None and _micro_dir is not None:
-                    # Deriv sekunde inaamua — override direction na TF
+                    # Deriv sekunde inaamua - override direction na TF
                     direction = _micro_dir
                     timeframe = _best_tf
                 else:
-                    # Deriv FLAT — angalia nguvu ya MTF kabla ya kutuma signal
+                    # Deriv FLAT - angalia nguvu ya MTF kabla ya kutuma signal
                     _weak_agree = sig.get("indicators_agree", 0) < 4
                     _no_1h      = sig.get("trend_1h") is None
                     if _weak_agree and _no_1h:
@@ -6472,7 +6473,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except: pass
                         _nsm = await context.bot.send_message(
                             chat_id=chat,
-                            text="🟡 *No signal available* — market is unclear right now. Please try again in a few minutes.",
+                            text="🟡 *No signal available* - market is unclear right now. Please try again in a few minutes.",
                             parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup([
                                 [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -6481,14 +6482,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         save_last_bot_msg(user_id, _nsm.message_id)
                         return
                     # Deriv FLAT lakini MTF ina nguvu → tumia MTF direction, chosen_tf
-                    logging.info("Deriv FLAT for {} — MTF strong enough, using MTF direction".format(pair))
+                    logging.info("Deriv FLAT for {} - MTF strong enough, using MTF direction".format(pair))
                     timeframe = chosen_tf
             except Exception as _de:
-                logging.warning("Deriv pick_best_tf error: {} — falling back to MTF".format(_de))
+                logging.warning("Deriv pick_best_tf error: {} - falling back to MTF".format(_de))
                 timeframe = chosen_tf
         else:
-            timeframe = chosen_tf  # Pair haipo Deriv — tumia chosen_tf
-        # ─────────────────────────────────────────────────────
+            timeframe = chosen_tf  # Pair haipo Deriv - tumia chosen_tf
+        # -----------------------------------------------------
 
         save_user_signal_state(user_id, pair, direction, timeframe, 0)
         try: await cm.delete()
@@ -6501,7 +6502,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
         return
 
-    # ── OTC: "Seconds" chosen — show seconds keyboard ──────────────────
+    # -- OTC: "Seconds" chosen - show seconds keyboard ------------------
     if data.startswith("otc_secs_"):
         idx_str = data[9:]
         pair = PAIR_INDEX.get(idx_str)
@@ -6516,12 +6517,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat,
                 text=(
-                    "🔒 *Seconds signals — Subscribers Only*\n\n"
+                    "🔒 *Seconds signals - Subscribers Only*\n\n"
                     "This option is available for licensed subscribers only.\n\n"
                     "Upgrade to unlock:\n"
                     "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
                     "✅ Unlimited signals\n"
-                    "✅ Win rate 90% — 98%"
+                    "✅ Win rate 90% - 98%"
                 ),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
@@ -6540,7 +6541,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── OTC: Seconds timeframe selected — generate seconds signal ────────
+    # -- OTC: Seconds timeframe selected - generate seconds signal --------
     if data.startswith("otctf_"):
         # Format: otctf_{idx}_{seconds}
         rest = data[6:]
@@ -6565,7 +6566,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_licensed(user_id):
             await context.bot.send_message(
                 chat_id=chat,
-                text="🔒 *Seconds signals — Subscribers Only*\n\nUpgrade your plan to unlock this feature.",
+                text="🔒 *Seconds signals - Subscribers Only*\n\nUpgrade your plan to unlock this feature.",
                 parse_mode="Markdown",
                 reply_markup=unlock_keyboard()
             )
@@ -6579,7 +6580,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
-        sig       = await safe_generate_signal(pair)  # OTC — always returns signal
+        sig       = await safe_generate_signal(pair)  # OTC - always returns signal
         _anim_stop.set()
         direction = sig["direction"]
         strength  = sig["strength"]
@@ -6674,7 +6675,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # User can regenerate as many times as needed to get desired timeframe.
         state = get_user_signal_state(user_id, pair)
         press_count = state.get("flip_count", 0) if state else 0
-        expiry_finished = True   # Always treat as fresh — no blocking
+        expiry_finished = True   # Always treat as fresh - no blocking
         clear_user_signal_state(user_id, pair)
 
         # --- Pip-based expiry selection helper (used below) ---
@@ -6692,26 +6693,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if row and row["avg_movement"]:
                     avg_mov = float(row["avg_movement"])
                     if avg_mov >= 0.10:
-                        return 1   # Moves fast — 1m is enough
+                        return 1   # Moves fast - 1m is enough
                     elif avg_mov >= 0.06:
-                        return 2   # Medium movement — 2m
+                        return 2   # Medium movement - 2m
                     else:
-                        return 3   # Slow pair — needs 3m for clear close
+                        return 3   # Slow pair - needs 3m for clear close
                 if row and row["optimal_tf"]:
                     return int(row["optimal_tf"])
             except Exception:
                 pass
             return fallback_tf
 
-        if True:  # Always fresh — regenerate on every tap
+        if True:  # Always fresh - regenerate on every tap
             if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
                 bonus = get_bonus_signals(user_id)
                 refs  = count_referrals(user_id)
-                extra = "\n\n🎁 *You have {} referrals* — invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
+                extra = "\n\n🎁 *You have {} referrals* - invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
                 await context.bot.send_message(
                     chat_id=chat,
                     text="🔒 *UNLOCK FULL ACCESS*\n\nYou have used your *{} free trial signals*.{}\n\n"
-                         "💎 *$150 — LIFETIME ACCESS*\n✅ Unlimited signals forever\n✅ Win rate 90% — 98%\n✅ Free updates forever\n✅ 100+ trading pairs\n\n"
+                         "💎 *$150 - LIFETIME ACCESS*\n✅ Unlimited signals forever\n✅ Win rate 90% - 98%\n✅ Free updates forever\n✅ 100+ trading pairs\n\n"
                          "👇 See payment methods or enter your code:".format(total_free_allowed(user_id), extra),
                     parse_mode="Markdown",
                     reply_markup=unlock_keyboard()
@@ -6737,7 +6738,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     timeout=10.0
                 )
             except asyncio.TimeoutError:
-                logging.warning("MTF timeout for {} — skipping MTF".format(pair))
+                logging.warning("MTF timeout for {} - skipping MTF".format(pair))
                 _mtf_result = None
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
@@ -6747,7 +6748,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = sig["direction"]
         strength  = sig["strength"]
 
-        # ── A: SIGNAL CONFIRMATION DELAY ─────────────────────
+        # -- A: SIGNAL CONFIRMATION DELAY ---------------------
         # Wait 4s and recheck direction before sending to user
         _is_otc_confirm = "OTC" in pair
         try:
@@ -6758,23 +6759,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             logging.warning("_confirm_signal_direction timeout for {}".format(pair))
             # keep original direction
-        # ─────────────────────────────────────────────────────
+        # -----------------------------------------------------
 
-        # ── DERIV SECONDS — MSINGI wa TF na direction kwa non-OTC ──
+        # -- DERIV SECONDS - MSINGI wa TF na direction kwa non-OTC --
         _mtf_cap = None
         _gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
 
         if _gm_is_non_otc and pair in DERIV_SYMBOLS:
             try:
                 _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
-                logging.info("getmore Deriv: pair={} tf={} dir={} str={} — {}".format(
+                logging.info("getmore Deriv: pair={} tf={} dir={} str={} - {}".format(
                     pair, _best_tf, _micro_dir, _best_str, _best_reason))
                 if _best_tf is not None and _micro_dir is not None:
                     # Deriv sekunde inaamua direction na TF
                     direction = _micro_dir
                     timeframe = _best_tf
                 else:
-                    # Deriv FLAT — angalia nguvu ya MTF
+                    # Deriv FLAT - angalia nguvu ya MTF
                     _gm_weak = sig.get("indicators_agree", 0) < 4 and sig.get("trend_1h") is None
                     if _gm_weak:
                         try: await cm.delete()
@@ -6782,7 +6783,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await delete_last_signal(context.bot, chat, user_id)
                         _nsm = await context.bot.send_message(
                             chat_id=chat,
-                            text="🟡 *No signal available* — market is unclear. Try again in a few minutes.",
+                            text="🟡 *No signal available* - market is unclear. Try again in a few minutes.",
                             parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup([
                                 [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
@@ -6790,11 +6791,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         save_last_bot_msg(user_id, _nsm.message_id)
                         return
-                    logging.info("getmore Deriv FLAT for {} — MTF strong, using MTF direction".format(pair))
+                    logging.info("getmore Deriv FLAT for {} - MTF strong, using MTF direction".format(pair))
             except Exception as _de:
-                logging.warning("getmore Deriv failed {}: {} — falling back to MTF".format(pair, _de))
+                logging.warning("getmore Deriv failed {}: {} - falling back to MTF".format(pair, _de))
         elif _gm_is_non_otc:
-            # Pair haipo Deriv — tumia MTF au generate_signal timeframe
+            # Pair haipo Deriv - tumia MTF au generate_signal timeframe
             if _mtf_result and _mtf_result.get("direction") in ("CALL","PUT"):
                 direction = "BUY" if _mtf_result["direction"] == "CALL" else "SELL"
                 _mtf_tf   = _mtf_result["signal_type"]
@@ -6805,7 +6806,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 timeframe = _pick_tf_by_pips(pair, _mtf_tf)
             else:
                 timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
-        # ─────────────────────────────────────────────────────────
+        # ---------------------------------------------------------
 
         # Flat market block
         if sig.get("flat") and sig["timeframe"] == 0:
@@ -6858,7 +6859,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_last_bot_msg(user_id, _nsm.message_id)
             return
 
-        new_flip_count = 0  # Always fresh signal — reset flip count
+        new_flip_count = 0  # Always fresh signal - reset flip count
 
         gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
 
@@ -6902,7 +6903,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=cid,
-                    text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% — 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
+                    text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% - 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
                     parse_mode="Markdown",
                     reply_markup=expired_signal_keyboard()
                 )
@@ -6926,21 +6927,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Auto-routing: wrong pair type for current market hours
         closed = is_market_closed()
         if closed and "OTC" not in pair:
-            # Market closed — non-OTC not available
+            # Market closed - non-OTC not available
             reason = _market_closed_reason()
             await context.bot.send_message(
                 chat_id=chat,
                 text=(
                     "🔒 *Market Closed ({})*\n\n"
                     "This pair is not available right now.\n"
-                    "Please select an *OTC* pair — active 24/7."
+                    "Please select an *OTC* pair - active 24/7."
                 ).format(reason),
                 parse_mode="Markdown",
                 reply_markup=pairs_keyboard()
             )
             return
         if not closed and "OTC" in pair:
-            # Market open — OTC not shown, redirect to non-OTC
+            # Market open - OTC not shown, redirect to non-OTC
             await context.bot.send_message(
                 chat_id=chat,
                 text=(
@@ -6955,7 +6956,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Anti-spam check
         if is_spam(user_id):
             return
-        # User is active — reset inactivity timer (msg_id added later)
+        # User is active - reset inactivity timer (msg_id added later)
         inactivity_reset(user_id, chat)
         # Free trial check
         if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
@@ -6963,14 +6964,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             bonus = get_bonus_signals(user_id)
             refs = count_referrals(user_id)
-            extra = "\n\n🎁 *You have {} referrals* — invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
+            extra = "\n\n🎁 *You have {} referrals* - invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
             await context.bot.send_message(
                 chat_id=chat,
                 text="🔒 *UNLOCK FULL ACCESS*\n\n"
                      "You have used your *{} free trial signals*.{}\n\n"
-                     "💎 *$150 — LIFETIME ACCESS*\n"
+                     "💎 *$150 - LIFETIME ACCESS*\n"
                      "✅ Unlimited signals forever\n"
-                     "✅ Win rate 90% — 98%\n"
+                     "✅ Win rate 90% - 98%\n"
                      "✅ Free updates forever\n"
                      "✅ 100+ trading pairs\n\n"
                      "👇 See payment methods or enter your code:".format(total_free_allowed(user_id), extra),
@@ -6981,18 +6982,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
 
-        # ── OTC: Show seconds keyboard (mtumiaji achague mwenyewe) ───
+        # -- OTC: Show seconds keyboard (mtumiaji achague mwenyewe) ---
         if "OTC" in pair:
             if not is_licensed(user_id):
                 _otcm = await context.bot.send_message(
                     chat_id=chat,
                     text=(
-                        "🔒 *Seconds signals — Subscribers Only*\n\n"
+                        "🔒 *Seconds signals - Subscribers Only*\n\n"
                         "This option is available for licensed subscribers only.\n\n"
                         "Upgrade to unlock:\n"
                         "✅ Seconds signals (3s/5s/10s/15s/30s)\n"
                         "✅ Unlimited signals\n"
-                        "✅ Win rate 90% — 98%"
+                        "✅ Win rate 90% - 98%"
                     ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
@@ -7011,7 +7012,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_last_bot_msg(user_id, _otcm.message_id)
             return
 
-        # ── Non-OTC: Bot decides TF automatically (1m/2m/3m) ────────────────
+        # -- Non-OTC: Bot decides TF automatically (1m/2m/3m) ----------------
         context.user_data["_user_chose_tf"] = False
 
         # Initialize variables for non-OTC auto flow
@@ -7047,7 +7048,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Override with dominant trend if available
             if trend is not None:
                 direction = trend
-            # Non-OTC: no signal if confluence weak — never guess
+            # Non-OTC: no signal if confluence weak - never guess
             elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
                 try: await cm.delete()
                 except: pass
@@ -7077,27 +7078,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
 
-            # ── Deriv micro-candle: MSINGI wa direction na TF ────────
+            # -- Deriv micro-candle: MSINGI wa direction na TF --------
             # Sekunde zinaaamua direction na timeframe kwa non-OTC pairs
             if is_non_otc and pair in DERIV_SYMBOLS:
                 try:
                     _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
-                    logging.info("Deriv non-OTC: best_tf={} dir={} str={} — {}".format(
+                    logging.info("Deriv non-OTC: best_tf={} dir={} str={} - {}".format(
                         _best_tf, _micro_dir, _best_str, _best_reason))
                     if _best_tf is not None and _micro_dir is not None:
                         direction = _micro_dir   # sekunde inaamua direction
                         timeframe = _best_tf     # sekunde inaamua TF
                     else:
-                        # Deriv FLAT — fallback: tumia MTF direction, keep existing timeframe
-                        logging.info("Deriv FLAT for {} (sel_ handler) — falling back to MTF direction".format(pair))
+                        # Deriv FLAT - fallback: tumia MTF direction, keep existing timeframe
+                        logging.info("Deriv FLAT for {} (sel_ handler) - falling back to MTF direction".format(pair))
                         # direction/timeframe already set from safe_generate_signal above
                 except Exception as _de:
-                    logging.warning("Deriv TF confirmation failed {}: {} — falling back to MTF".format(pair, _de))
-                    # Deriv imeshindwa — fallback kwa MTF direction
-            # ─────────────────────────────────────────────────────────
+                    logging.warning("Deriv TF confirmation failed {}: {} - falling back to MTF".format(pair, _de))
+                    # Deriv imeshindwa - fallback kwa MTF direction
+            # ---------------------------------------------------------
 
         else:
-            # Non-fresh check actions (flip/same) — always generate a fresh signal
+            # Non-fresh check actions (flip/same) - always generate a fresh signal
             # instead of using cached/flipped direction. Every request gets real market data.
             sig2       = await safe_generate_signal(pair)
             direction  = sig2["direction"]
@@ -7157,7 +7158,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=(
                         "⏰ *Your session has expired.*\n\n"
                         "🌟 *Join our VIP today and get more accuracy signals!*\n\n"
-                        "✅ Win rate 90% — 98%\n"
+                        "✅ Win rate 90% - 98%\n"
                         "✅ 100+ trading pairs\n"
                         "✅ Unlimited signals\n\n"
                         "_Tap *Start* below to open a fresh chart._"
@@ -7231,12 +7232,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        # ── Force pair bypass flat filter ───────────────────
+        # -- Force pair bypass flat filter -------------------
         if text.startswith("/forcepair"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
                 await update.message.reply_text(
-                    "Usage:\n`/forcepair EURUSD OTC` — force one pair\n`/forcepair all` — force all pairs\n`/forcepair list` — show forced pairs",
+                    "Usage:\n`/forcepair EURUSD OTC` - force one pair\n`/forcepair all` - force all pairs\n`/forcepair list` - show forced pairs",
                     parse_mode="Markdown"
                 )
                 return
@@ -7250,7 +7251,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if arg == "ALL":
                 _FORCE_PAIRS.clear()
                 _FORCE_PAIRS.add("__ALL__")
-                await update.message.reply_text("✅ ALL pairs forced — flat filter bypassed.")
+                await update.message.reply_text("✅ ALL pairs forced - flat filter bypassed.")
                 return
             # Match partial pair name
             matched = [p for p in ALL_PAIRS if arg in p.upper().replace("/","").replace(" ","")]
@@ -7290,7 +7291,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flip_acc = "{:.1%}".format(ns["flip_acc"]) if ns["total_flips"] > 0 else "N/A"
             top_pairs_txt = ""
             for p, samp, acc in ns["top_pairs"]:
-                top_pairs_txt += "  • {} — {} samples, {:.1%} acc\n".format(p, samp, acc)
+                top_pairs_txt += "  • {} - {} samples, {:.1%} acc\n".format(p, samp, acc)
             if not top_pairs_txt:
                 top_pairs_txt = "  _Not enough data yet_\n"
             msg = (
@@ -7318,10 +7319,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
 
-        # ── G: Force NN retrain ──────────────────────────────
+        # -- G: Force NN retrain ------------------------------
         if text=="/nnretrain":
             if not _NN_AVAILABLE:
-                await update.message.reply_text("❌ NN unavailable — scikit-learn not installed.")
+                await update.message.reply_text("❌ NN unavailable - scikit-learn not installed.")
                 return
             await update.message.reply_text("🔄 *NN Retrain* started...", parse_mode="Markdown")
             try:
@@ -7344,7 +7345,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Retrain failed: {}".format(_e))
             return
 
-        # ── H: Pair performance report ───────────────────────
+        # -- H: Pair performance report -----------------------
         if text=="/pairreport":
             await update.message.reply_text("📊 *Generating pair report...*", parse_mode="Markdown")
             try:
@@ -7381,7 +7382,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         rows = cur.fetchall()
 
                 if not rows:
-                    await update.message.reply_text("📭 No pair data yet — need at least 3 trades per pair.")
+                    await update.message.reply_text("📭 No pair data yet - need at least 3 trades per pair.")
                     return
 
                 lines = ["📊 *PAIR PERFORMANCE REPORT*\n━━━━━━━━━━━━━━━━━━"]
@@ -7392,7 +7393,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # NN per-pair accuracy
                     nn_e    = _nn_per_pair.get(r["pair"])
                     nn_acc  = " | 🧠{:.0%}".format(nn_e["acc"]) if nn_e and nn_e.get("acc") else ""
-                    best_s  = r["best_session"] or "—"
+                    best_s  = r["best_session"] or "-"
                     best_tf = "{}m".format(r["best_tf"]) if r["best_tf"] else "{}m".format(r["optimal_tf"])
                     lines.append(
                         "{} *{}* {}\n"
@@ -7429,7 +7430,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s=get_stats()
             m_unused=len(s["m_codes"]); l_unused=len(s["l_codes"])
             await update.message.reply_text(
-                "📊 *EVALON WINNERS BOT — STATS*\n\n"
+                "📊 *EVALON WINNERS BOT - STATS*\n\n"
                 "👤 Total Users: {}\n"
                 "📅 Monthly Licensed: {}\n"
                 "♾️ Lifetime Licensed: {}\n"
@@ -7531,7 +7532,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             msg = "🚫 *BLACKLIST*\n\n"
             for b in bl:
-                msg += "• `{}` — {}\n".format(b["user_id"], b.get("reason",""))
+                msg += "• `{}` - {}\n".format(b["user_id"], b.get("reason",""))
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
         if text.startswith("/userinfo "):
@@ -7545,7 +7546,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bonus = get_bonus_signals(target_id)
                 bl = is_blacklisted(target_id)
                 lic = "✅ {}".format(u.get("licence_type","").capitalize()) if u.get("licensed") else "❌ None"
-                exp = get_expiry_text(target_id) if u.get("licensed") else "—"
+                exp = get_expiry_text(target_id) if u.get("licensed") else "-"
                 await update.message.reply_text(
                     "👤 *USER INFO*\n\n"
                     "🆔 ID: `{}`\n"
@@ -7617,7 +7618,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg  += "{} *{}*\n  ✅ {} | ❌ {} | {}%\n\n".format(bar, r["pair"], r["wins"], r["losses"], rate)
             else:
                 from datetime import datetime as _dt
-                msg = "📊 *PAIR STATS — Today ({})*\n\n".format(_dt.utcnow().strftime("%d %b %Y"))
+                msg = "📊 *PAIR STATS - Today ({})*\n\n".format(_dt.utcnow().strftime("%d %b %Y"))
                 for r in today_stats:
                     total = (r["wins"] or 0) + (r["losses"] or 0)
                     rate  = int((r["wins"] or 0) / max(total, 1) * 100)
@@ -7635,7 +7636,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if new_state:
                 await update.message.reply_text(
                     "✅ *OTC Pairs: ON*\n\n"
-                    "All pairs are now visible — OTC and non-OTC.\n\n"
+                    "All pairs are now visible - OTC and non-OTC.\n\n"
                     "_Use /toggleotc again to disable OTC._",
                     parse_mode="Markdown"
                 )
@@ -7649,7 +7650,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # ── FILTER CONTROL COMMANDS ──────────────────────────
+        # -- FILTER CONTROL COMMANDS --------------------------
         if text == "/filterstatus":
             await update.message.reply_text(
                 "🎛 *SIGNAL FILTERS STATUS*\n\n"
@@ -7668,7 +7669,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "Usage: `/filteroff [name|all]`\n\n"
                     "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
-                    "Or: `/filteroff all` — disable all",
+                    "Or: `/filteroff all` - disable all",
                     parse_mode="Markdown"
                 )
                 return
@@ -7699,7 +7700,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "Usage: `/filteron [name|all]`\n\n"
                     "Names: `news` `dead` `conflict` `stability` `confluence` `h1confirm`\n"
-                    "Or: `/filteron all` — enable all",
+                    "Or: `/filteron all` - enable all",
                     parse_mode="Markdown"
                 )
                 return
@@ -7722,9 +7723,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             return
-        # ─────────────────────────────────────────────────────
+        # -----------------------------------------------------
 
-    # /refer command — user yeyote
+    # /refer command - user yeyote
     if update.message.text and update.message.text.strip() == "/refer":
         user_id2 = update.effective_user.id
         refs = count_referrals(user_id2)
@@ -7743,12 +7744,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔗 Your link:\n`{}`\n\n"
             "👤 People you invited: *{}*\n"
             "{}\n\n"
-            "_Share your link — invite 3+ people and get free bonus signals!_".format(ref_link, refs, status),
+            "_Share your link - invite 3+ people and get free bonus signals!_".format(ref_link, refs, status),
             parse_mode="Markdown"
         )
         return
 
-    # ── Reply Keyboard Button Handlers ────────────────────────
+    # -- Reply Keyboard Button Handlers ------------------------
     # Delete the user's keyboard message immediately to keep chat clean
     try:
         await update.message.delete()
@@ -7763,7 +7764,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lic   = is_licensed(user_id)
         plan  = user.get("licence_type", "").capitalize() if lic else "Free"
 
-        # Use pairs_keyboard() — already handles weekday/weekend + priority sorting
+        # Use pairs_keyboard() - already handles weekday/weekend + priority sorting
         kb = pairs_keyboard()
 
         # Append option buttons at the bottom
@@ -7917,7 +7918,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("📊 No VTE data yet. Bot is still learning.")
                 return
             ranked = get_ranked_forex_pairs()
-            lines = ["📊 *VTE Win Rate Stats — Forex Pairs*\n"]
+            lines = ["📊 *VTE Win Rate Stats - Forex Pairs*\n"]
             for r in rows:
                 tag = ""
                 lines.append("• *{}*{}\n  W:{} L:{} | Rate: {}% | TF: {}m".format(
@@ -7937,7 +7938,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u=get_user(user_id); exp=get_expiry_text(user_id)
             tl="📅 Monthly" if u.get("licence_type")=="monthly" else "♾️ Lifetime"
             await update.message.reply_text(
-                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON WINNERS BOT!\n🏆 Win Rate: 90% — 98%\n🔑 Type: *{}*\n⏳ {}\n\nYou can now use unlimited signals!".format(tl,exp),
+                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON WINNERS BOT!\n🏆 Win Rate: 90% - 98%\n🔑 Type: *{}*\n⏳ {}\n\nYou can now use unlimited signals!".format(tl,exp),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Start Trading Now", callback_data="choose_pair")]])
             )
@@ -7959,7 +7960,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # and skip recording those results (does not affect user signals).
 # ============================================================
 
-# _virtual_trades — DB is source of truth, in-memory dict is runtime cache only
+# _virtual_trades - DB is source of truth, in-memory dict is runtime cache only
 _virtual_trades: dict = {}
 
 def _vt_add_trade(pair, entry_price, direction, expiry, tf_secs, nn_feat=None):
@@ -8065,7 +8066,7 @@ def _vt_calc_atr(pair, period=14):
     """
     Calculate ATR for a pair using Yahoo Finance 5m data.
     Returns ATR as a % of current price, or None on failure.
-    Used to detect flat markets — does NOT block user signals.
+    Used to detect flat markets - does NOT block user signals.
     """
     symbol = YAHOO_SYMBOLS.get(pair)
     if not symbol:
@@ -8167,7 +8168,7 @@ async def _vt_check_results():
                 remaining.append(trade)
                 continue
 
-            # Trade expired — delete from DB
+            # Trade expired - delete from DB
             _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs)
 
             exit_price = _fetch_current_price(pair)
@@ -8177,22 +8178,22 @@ async def _vt_check_results():
             raw_diff = exit_price - entry_price
             movement_pct = abs(raw_diff) / (entry_price + 1e-9) * 100
 
-            # ATR flat-market filter — skip recording, but signal still reached user
+            # ATR flat-market filter - skip recording, but signal still reached user
             atr_pct = _vt_calc_atr(pair)
             if atr_pct is not None and movement_pct < (atr_pct * 0.30):
                 logging.info("VTE FLAT SKIP: {} move={:.5f}% < 30% of ATR {:.5f}%".format(
                     pair, movement_pct, atr_pct))
-                continue   # Skip — flat market, don't corrupt stats
+                continue   # Skip - flat market, don't corrupt stats
 
             won = (raw_diff > 0) if direction == "BUY" else (raw_diff < 0)
 
-            # ── Feed NN with REAL features from signal time ──
+            # -- Feed NN with REAL features from signal time --
             if _NN_AVAILABLE and nn_feat is not None:
                 try:
                     _nn_record_outcome(pair, nn_feat, won)
                 except Exception as _nn_e:
                     logging.warning("VTE→NN feed failed {}: {}".format(pair, _nn_e))
-            # ─────────────────────────────────────────────────
+            # -------------------------------------------------
 
             if pair not in tf_results:
                 tf_results[pair] = {}
@@ -8306,7 +8307,7 @@ async def virtual_trading_engine():
             cycle += 1
             if cycle % 60 == 0:
                 active = sum(len(v) for v in _virtual_trades.values())
-                logging.info("VTE: cycle {} — {} active trades".format(cycle, active))
+                logging.info("VTE: cycle {} - {} active trades".format(cycle, active))
         except Exception as e:
             logging.warning("VTE cycle error: {}".format(e))
         await asyncio.sleep(5)
@@ -8332,9 +8333,9 @@ def get_optimal_tf(pair, fallback=None):
     return fallback
 
 
-# ── NEWS FILTER ─────────────────────────────────────────────
+# -- NEWS FILTER ---------------------------------------------
 # High-impact news events (UTC times, approximate)
-# These repeat weekly/monthly — bot avoids signals ±15 min around them
+# These repeat weekly/monthly - bot avoids signals ±15 min around them
 
 _HIGH_IMPACT_NEWS = [
     # (weekday, hour, minute, description)
@@ -8343,8 +8344,8 @@ _HIGH_IMPACT_NEWS = [
     (4, 13, 30, "US Jobs"),
     (1, 13, 30, "CPI"),           # Varies but often Tue/Wed
     (2, 13, 30, "CPI"),
-    (2, 18, 0,  "FOMC"),          # Fed meetings — Wednesdays ~18:00 UTC
-    (3, 12, 0,  "ECB"),           # ECB — Thursdays ~12:00 UTC
+    (2, 18, 0,  "FOMC"),          # Fed meetings - Wednesdays ~18:00 UTC
+    (3, 12, 0,  "ECB"),           # ECB - Thursdays ~12:00 UTC
     (3, 13, 30, "US GDP"),
     (3, 13, 30, "Unemployment"),
     (4, 13, 30, "PCE"),
@@ -8370,7 +8371,7 @@ def is_news_time():
             # Block before event (±NEWS_BUFFER_MINUTES) AND up to POST_BUFFER after
             if -_NEWS_BUFFER_MINUTES <= diff <= _NEWS_POST_BUFFER:
                 if diff > 0:
-                    return True, "{} (cooling down — {}m after)".format(name, diff)
+                    return True, "{} (cooling down - {}m after)".format(name, diff)
                 return True, name
     except Exception:
         pass
@@ -8380,7 +8381,7 @@ def is_news_time():
 def get_best_tf_for_session(pair):
     """
     Pick best TF (1m/2m/3m) for a pair using 3 data sources:
-    1. signal_outcomes historical win rate + movement per TF (highest weight — real outcomes)
+    1. signal_outcomes historical win rate + movement per TF (highest weight - real outcomes)
     2. tf_session_stats session-specific win rate + movement
     3. pair_stats.optimal_tf fallback
 
@@ -8394,7 +8395,7 @@ def get_best_tf_for_session(pair):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # ── Source 1: signal_outcomes — most accurate (real trade outcomes) ──
+                # -- Source 1: signal_outcomes - most accurate (real trade outcomes) --
                 cur.execute("""
                     SELECT tf_used AS tf_mins,
                            COUNT(*) FILTER (WHERE won=TRUE)::float / NULLIF(COUNT(*), 0) AS win_rate,
@@ -8426,7 +8427,7 @@ def get_best_tf_for_session(pair):
                 """, (pair, sess_name, target_tfs))
                 session_outcome_rows = {int(r["tf_mins"]): r for r in cur.fetchall()}
 
-                # ── Source 2: tf_session_stats ──
+                # -- Source 2: tf_session_stats --
                 cur.execute("""
                     SELECT tf_mins,
                            COALESCE(wins::float / NULLIF(wins+losses,0), 0.0) AS win_rate,
@@ -8438,18 +8439,18 @@ def get_best_tf_for_session(pair):
                 """, (pair, sess_name, target_tfs))
                 tf_rows = {int(r["tf_mins"]): r for r in cur.fetchall()}
 
-                # ── Source 3: pair_stats.optimal_tf ──
+                # -- Source 3: pair_stats.optimal_tf --
                 cur.execute("SELECT optimal_tf FROM pair_stats WHERE pair=%s", (pair,))
                 pair_row = cur.fetchone()
                 pair_optimal = int(pair_row["optimal_tf"]) if pair_row and pair_row["optimal_tf"] else None
 
-        # ── Scoring ──────────────────────────────────────────────
+        # -- Scoring ----------------------------------------------
         tf_scores = {}
         for tf_m in target_tfs:
             score = 0.0
             has_data = False
 
-            # Signal outcomes — overall (30d) — highest weight
+            # Signal outcomes - overall (30d) - highest weight
             if tf_m in outcome_rows:
                 r = outcome_rows[tf_m]
                 wr  = float(r["win_rate"] or 0.5)
@@ -8459,7 +8460,7 @@ def get_best_tf_for_session(pair):
                 score += (wr * 0.60 + mov * 0.25 + conf * 0.15) * 2.5  # weight 2.5x
                 has_data = True
 
-            # Session outcomes (14d) — bonus if session-specific data available
+            # Session outcomes (14d) - bonus if session-specific data available
             if tf_m in session_outcome_rows:
                 r = session_outcome_rows[tf_m]
                 wr  = float(r["win_rate"] or 0.5)
@@ -8521,12 +8522,12 @@ def update_tf_session_stats(pair, tf_mins, session_name, won):
 
 def get_ranked_forex_pairs():
     """
-    Return all forex pairs ranked by VTE win rate (ascending — worst first).
+    Return all forex pairs ranked by VTE win rate (ascending - worst first).
     Only pairs in YAHOO_SYMBOLS with "/" in name (forex only, no BTC/indices).
     Splits into two groups:
       - Group B (normal):     higher win rate pairs
     Returns: {
-            "normal":     [pair, ...],   # rest — normal signal
+            "normal":     [pair, ...],   # rest - normal signal
         "all":        [pair, ...]    # full list worst→best
     }
     """
@@ -8548,7 +8549,7 @@ def get_ranked_forex_pairs():
         logging.warning("get_ranked_forex_pairs failed: {}".format(e))
         ranked = []
 
-    # Pairs not yet in DB go to the end (unknown — treat as normal)
+    # Pairs not yet in DB go to the end (unknown - treat as normal)
     ranked_set = set(ranked)
     unranked = [p for p in forex_pairs if p not in ranked_set]
     all_pairs = ranked + unranked
@@ -8580,12 +8581,12 @@ def _quick_pair_quality_check(pair):
     """
     Fast pre-screen before showing pair to user in Bot Pick.
     Checks:
-      1. ATR volatility — pair must not be dead market
-      2. MTF agreement — at least partial agreement across timeframes
-      3. NN confidence — if model ready, confidence must be >= 55%
+      1. ATR volatility - pair must not be dead market
+      2. MTF agreement - at least partial agreement across timeframes
+      3. NN confidence - if model ready, confidence must be >= 55%
     Returns (passes: bool, reason: str)
     """
-    # OTC pairs — skip heavy checks (no Yahoo data), use NN only
+    # OTC pairs - skip heavy checks (no Yahoo data), use NN only
     is_otc = "OTC" in pair
     if not is_otc:
         # D: Volatility check
@@ -8596,7 +8597,7 @@ def _quick_pair_quality_check(pair):
         except Exception:
             pass
 
-        # Quick MTF check — fetch 5m direction only
+        # Quick MTF check - fetch 5m direction only
         try:
             real_pair = OTC_TO_REAL.get(pair, pair)
             symbol    = YAHOO_SYMBOLS.get(real_pair)
@@ -8614,10 +8615,10 @@ def _quick_pair_quality_check(pair):
     if _NN_AVAILABLE and _nn_global_model is not None:
         try:
             # Build minimal feature array for quick check
-            # Use neutral features — just check if NN thinks pair is tradeable
+            # Use neutral features - just check if NN thinks pair is tradeable
             pair_entry = _nn_per_pair.get(pair)
             if pair_entry and pair_entry.get("samples", 0) >= _NN_MIN_PAIR_SAMPLES:
-                # Pair has its own model — check its accuracy
+                # Pair has its own model - check its accuracy
                 if pair_entry.get("acc", 1.0) < 0.50:
                     return False, "nn_low_acc"
         except Exception:
@@ -8669,7 +8670,7 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
         elif non_otc_only:
             rows = [r for r in rows if "OTC" not in r["pair"]]
 
-        # ── Quality screening — remove flat/dead/low-quality pairs ──
+        # -- Quality screening - remove flat/dead/low-quality pairs --
         screened = []
         skipped  = 0
         for r in rows:
@@ -8680,7 +8681,7 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                 screened.append(r)
             else:
                 skipped += 1
-                logging.info("Bot Pick screening: {} skipped — {}".format(r["pair"], reason))
+                logging.info("Bot Pick screening: {} skipped - {}".format(r["pair"], reason))
 
         # If screening removed too many, fill from broader pool without quality filter
         if len(screened) < 5:
@@ -8705,7 +8706,7 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                 )
             else:
                 fallback_pool = [p for p in ALL_PAIRS if p not in already]
-            # No shuffle for non-OTC — keep priority order
+            # No shuffle for non-OTC - keep priority order
             if not non_otc_only:
                 random.shuffle(fallback_pool)
             for p in fallback_pool:
@@ -8730,7 +8731,7 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
 
 
 # ============================================================
-# ── H: LICENCE EXPIRY WARNING LOOP ──────────────────────────
+# -- H: LICENCE EXPIRY WARNING LOOP --------------------------
 async def _licence_expiry_warning_loop(bot):
     """
     Runs every 12 hours. Sends warning to users whose licence
@@ -8772,7 +8773,7 @@ async def _licence_expiry_warning_loop(bot):
                     logging.warning("Expiry warning failed user={}: {}".format(uid, _e))
         except Exception as e:
             logging.warning("_licence_expiry_warning_loop error: {}".format(e))
-# ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------
 
 
 async def _stats_reset_loop():
@@ -8819,30 +8820,30 @@ async def run_bot():
     ptb_app.add_handler(MessageHandler(filters.PHOTO, message_handler))
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # ── Use async polling (works inside asyncio.run) ──
+    # -- Use async polling (works inside asyncio.run) --
     print("Starting bot polling...")
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     print("Bot polling active.")
 
-    # ── Load pending virtual trades from DB (survive restarts) ─
+    # -- Load pending virtual trades from DB (survive restarts) -
     _vt_load_pending()
     print("Virtual trades loaded from DB.")
 
-    # ── Launch Virtual Trading Engine in background ────────────
+    # -- Launch Virtual Trading Engine in background ------------
     asyncio.create_task(virtual_trading_engine())
     print("Virtual trading engine started.")
 
-    # ── Launch stats reset loop (every 30 minutes) ─────────────
+    # -- Launch stats reset loop (every 30 minutes) -------------
     asyncio.create_task(_stats_reset_loop())
     print("Stats reset loop started.")
 
-    # ── Launch NN scheduled retrain loop (every 6 hours) ───────
+    # -- Launch NN scheduled retrain loop (every 6 hours) -------
     if _NN_AVAILABLE:
         asyncio.create_task(_nn_scheduled_retrain_loop())
         print("NN scheduled retrain loop started.")
 
-    # ── Launch licence expiry warning loop (every 12 hours) ────
+    # -- Launch licence expiry warning loop (every 12 hours) ----
     asyncio.create_task(_licence_expiry_warning_loop(ptb_app.bot))
     print("Licence expiry warning loop started.")
 
@@ -8855,7 +8856,7 @@ def main():
     import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    # ── Open port FIRST before anything else ───────────────────
+    # -- Open port FIRST before anything else -------------------
     # Render requires port to open within a few seconds of startup
     PORT = int(os.environ.get("PORT", 8080))
 
@@ -8875,7 +8876,7 @@ def main():
     t.start()
     print("Port {} open. Starting bot...".format(PORT))
 
-    # ── Now proceed with init and bot startup ──────────────────
+    # -- Now proceed with init and bot startup ------------------
     print("EVALON WINNERS BOT starting...")
     init_db()
     print("Database ready.")
