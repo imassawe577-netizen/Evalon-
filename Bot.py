@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# EVALON BOT - IS RUNNING ✅ (Bot_70_fixed)
 """
 EVALON WINNERS BOT - Telegram Bot v3.1
 Upgraded: Ensemble ML, ADX filter, signal_outcomes, smart expiry, midnight reset
