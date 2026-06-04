@@ -600,8 +600,32 @@ async def select_best_expiry_nonOTC(pair, direction, sig_snapshot,
         # No TF has strong enough evidence
         return (0, "no_tf_support score={:.2f}".format(best_score))
 
+    # Tiebreak: if two TFs within 0.05 points, use VTE session win rate
+    sorted_tfs_2 = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)
+    if len(sorted_tfs_2) > 1 and scores[sorted_tfs_2[0]] - scores[sorted_tfs_2[1]] < 0.05:
+        try:
+            session_name_2 = _get_session().get("name", "Unknown")
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT tf_mins,
+                               wins::float / NULLIF(wins + losses, 0) AS wr
+                        FROM tf_session_stats
+                        WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                    """, (pair, session_name_2))
+                    vte_wr2 = {int(r["tf_mins"]): float(r["wr"])
+                               for r in cur.fetchall() if r["wr"] is not None}
+            best_wr2 = -1.0
+            for tc2 in sorted_tfs_2[:2]:
+                wr2 = vte_wr2.get(tc2, 0.5)
+                if wr2 > best_wr2:
+                    best_wr2 = wr2
+                    best_tf  = tc2
+        except Exception:
+            pass
+
     reason_str = "tf={}m score={:.2f} [1m:{:.2f} 2m:{:.2f} 3m:{:.2f}] | {}".format(
-        best_tf, best_score,
+        best_tf, scores[best_tf],
         scores[1], scores[2], scores[3],
         " / ".join(reasons[best_tf])
     )
@@ -2367,6 +2391,11 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
         nn_feedback_from_vte(user_id, pair, won)
     except Exception as _nn_e:
         logging.warning("NN feedback error: {}".format(_nn_e))
+    # -- TF OUTCOME LEARNING: imarisha smart expiry kwa matokeo halisi --
+    try:
+        update_tf_outcome(pair, timeframe_mins, won)
+    except Exception as _tf_e:
+        logging.warning("TF outcome learning error: {}".format(_tf_e))
     # ------------------------------------------------------------
 
     if not is_results_enabled():
@@ -2772,10 +2801,36 @@ def _price_action_score(pair):
 
 def _check_signal_history_bias(pair, direction, window=15):
     """
-    Check signal history - if recent signals are mostly the same direction,
-    that reinforces the decision.
+    Check signal history bias using ACTUAL WIN RATE per direction, not just count.
+    Fetches win/loss from signal_outcomes table so we reinforce what WORKS.
+    Falls back to direction count if signal_outcomes is empty.
     Returns: (same_count, total, same_pct)
     """
+    try:
+        # Primary: use signal_outcomes (win rate per direction)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT direction, COUNT(*) as total,
+                              SUM(CASE WHEN won THEN 1 ELSE 0 END) as wins
+                       FROM signal_outcomes
+                       WHERE pair=%s
+                       GROUP BY direction""",
+                    (pair,)
+                )
+                rows = cur.fetchall()
+        if rows:
+            dir_stats = {r["direction"]: {"total": int(r["total"]), "wins": int(r["wins"])} for r in rows}
+            d_data = dir_stats.get(direction, {})
+            total = d_data.get("total", 0)
+            wins  = d_data.get("wins", 0)
+            if total >= 5:
+                win_rate = wins / total
+                return wins, total, win_rate
+    except Exception:
+        pass
+
+    # Fallback: direction count from signal_history
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2844,15 +2899,792 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
 # Per-pair OTC flip decision cache (in-memory, reset on restart - fine for OTC)
 _otc_flip_cache: dict = {}
 
+
+# ============================================================
+# SMART NON-OTC EXPIRY SELECTOR
+# Engine ya uchambuzi kamili kwa non-OTC signals (1m/2m/3m).
+#
+# Vipengele vya ziada kuliko OTC:
+#  + ATR (volatility halisi kutoka Yahoo)
+#  + Fibonacci levels
+#  + Price Action (HH/HL/LL/LH)
+#  + Candlestick patterns
+#  + Deriv WebSocket cache (5s/10s/15s micro ticks)
+#  + 1m Yahoo candle micro-trend (halisi zaidi kuliko OTC)
+#
+# Hakuna upendeleo kwa TF yoyote - score halisi inaamua.
+# ============================================================
+
+def _smart_nonOTC_expiry(
+    pair: str,
+    direction: str,
+    rsi: float = 50.0,
+    sto: float = 50.0,
+    ma_diff: float = 0.0,
+    macd: float = 0.0,
+    bb_pos: float = 0.5,
+    mom: float = 0.0,
+    vol: float = 0.5,
+    candle: float = 0.0,
+    trend_1h=None,
+    mtf=None,
+    indicators_agree: int = 0,
+    movement_cat: str = "MEDIUM",
+    atr_pct: float = 0.05,
+    fib_buy_bonus: int = 0,
+    fib_sell_bonus: int = 0,
+    pa_buy_bonus: int = 0,
+    pa_sell_bonus: int = 0,
+    pattern_buy_bonus: int = 0,
+    pattern_sell_bonus: int = 0,
+    deriv_cache=None,
+) -> int:
+    """
+    Chagua TF bora (1/2/3 dakika) kwa non-OTC signal.
+    Inatumia data halisi ya Yahoo, Deriv, Fibonacci, PA na VTE history.
+    Returns: 1, 2, au 3
+    """
+    scores = {1: 0.0, 2: 0.0, 3: 0.0}
+
+    # -------------------------------------------------------
+    # A) VTE LEARNING - matokeo halisi ya nyuma
+    # -------------------------------------------------------
+    try:
+        sess_name = _get_session().get("name", "Unknown")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS wr,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                """, (pair, sess_name))
+                sess_rows = cur.fetchall()
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS wr,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND tf_mins IN (1, 2, 3)
+                """, (pair,))
+                overall_rows = cur.fetchall()
+
+        sess_tfs = {}
+        for r in sess_rows:
+            tf = int(r["tf_mins"])
+            wr = float(r["wr"]) if r["wr"] is not None else 0.5
+            tot = int(r["total"])
+            if tot >= 3:
+                conf = min(1.0, tot / 15.0)
+                bonus = (wr - 0.45) * 80 * conf
+                scores[tf] += bonus
+                sess_tfs.add(tf) if hasattr(sess_tfs, 'add') else sess_tfs.update({tf: True})
+
+        sess_tfs_found = {int(r["tf_mins"]) for r in sess_rows
+                         if r["wr"] is not None and int(r.get("total", 0)) >= 3}
+        for r in overall_rows:
+            tf = int(r["tf_mins"])
+            if tf in sess_tfs_found:
+                continue
+            wr = float(r["wr"]) if r["wr"] is not None else 0.5
+            tot = int(r["total"])
+            if tot >= 5:
+                conf = min(1.0, tot / 20.0)
+                bonus = (wr - 0.45) * 50 * conf
+                scores[tf] += bonus
+
+    except Exception as _e:
+        logging.warning("smart_nonOTC_expiry VTE failed {}: {}".format(pair, _e))
+
+    # -------------------------------------------------------
+    # B) ATR VOLATILITY - kipengele cha kipekee cha non-OTC
+    # ATR ya juu = soko linakimbia haraka → 1m inafaa
+    # ATR ya chini = soko la polepole → 3m ina faida
+    # -------------------------------------------------------
+    atr = float(atr_pct)
+    if atr >= 0.15:
+        # Volatility kali sana - 1m inaweza kukamata swing nzima
+        scores[1] += 22
+        scores[2] += 8
+        scores[3] -= 5
+    elif atr >= 0.08:
+        scores[1] += 10
+        scores[2] += 18
+        scores[3] += 6
+    elif atr >= 0.04:
+        scores[2] += 14
+        scores[3] += 18
+    else:
+        # Soko la kufa - 3m inahitajika kupata harakati ya kutosha
+        scores[1] -= 10
+        scores[2] += 5
+        scores[3] += 22
+
+    # -------------------------------------------------------
+    # C) FIBONACCI LEVELS
+    # Near strong Fib level = kuna reversal/bounce haraka → 1m
+    # Mbali na Fib = harakati inaendelea → 2m/3m
+    # -------------------------------------------------------
+    fib_active = fib_buy_bonus if direction == "BUY" else fib_sell_bonus
+    if fib_active >= 20:
+        # Kiko kwenye Fib 38.2% au 61.8% - reversal kali karibu
+        scores[1] += 20
+        scores[2] += 8
+    elif fib_active >= 12:
+        # Fib 23.6% au 78.6% - bounce ya wastani
+        scores[1] += 10
+        scores[2] += 14
+
+    # -------------------------------------------------------
+    # D) PRICE ACTION (HH/HL/LH/LL)
+    # Trend imara = harakati inaendelea → 1m/2m
+    # Trend dhaifu = subiri uthibitisho → 3m
+    # -------------------------------------------------------
+    pa_active = pa_buy_bonus if direction == "BUY" else pa_sell_bonus
+    if pa_active >= 30:
+        # Strong trend (HH+HL au LL+LH confirmed) + momentum
+        scores[1] += 16
+        scores[2] += 12
+    elif pa_active >= 20:
+        scores[2] += 16
+        scores[3] += 8
+    elif pa_active >= 10:
+        scores[2] += 10
+        scores[3] += 12
+    else:
+        # Hakuna PA trend wazi
+        scores[3] += 10
+
+    # -------------------------------------------------------
+    # E) CANDLESTICK PATTERNS
+    # Pattern kali (engulfing, 3 soldiers) = entry haraka → 1m
+    # Pattern dhaifu = subiri → 2m/3m
+    # -------------------------------------------------------
+    pat_active = pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus
+    if pat_active >= 35:
+        # Engulfing au Three Soldiers/Crows - nguvu kubwa
+        scores[1] += 18
+        scores[2] += 8
+    elif pat_active >= 20:
+        # Hammer, Shooting Star, Doji - wastani
+        scores[1] += 10
+        scores[2] += 14
+    elif pat_active >= 10:
+        scores[2] += 10
+        scores[3] += 8
+
+    # -------------------------------------------------------
+    # F) DERIV WEBSOCKET MICRO-TREND CACHE
+    # 5s micro → 1m, 10s → 2m, 15s → 3m
+    # Data halisi zaidi kuliko Yahoo kwa non-OTC pia
+    # -------------------------------------------------------
+    if deriv_cache:
+        dc_map = {1: "5_s", 2: "10_s", 3: "15_s"}
+        for tf_m, dc_key in dc_map.items():
+            dc_trend = deriv_cache.get(dc_key)
+            if dc_trend:
+                dc_dir = dc_trend.get("direction", "FLAT")
+                dc_str = dc_trend.get("strength", 0)
+                dc_rev = dc_trend.get("reversal", False)
+                if dc_dir == direction and not dc_rev:
+                    # Deriv inakubaliana - bonus kubwa
+                    bonus = dc_str * 0.55  # max ~55 kwa str=100
+                    scores[tf_m] += bonus
+                elif dc_rev:
+                    # Reversal inayokuja - adhabu kwa TF hiyo
+                    scores[tf_m] -= 18
+                elif dc_dir not in ("FLAT", None) and dc_dir != direction:
+                    # Deriv inapinga
+                    scores[tf_m] -= 15
+
+    # -------------------------------------------------------
+    # G) MOMENTUM
+    # -------------------------------------------------------
+    mom_abs = abs(float(mom))
+    if mom_abs >= 0.6:
+        scores[1] += 18
+        scores[2] += 8
+        scores[3] += 2
+    elif mom_abs >= 0.3:
+        scores[1] += 8
+        scores[2] += 16
+        scores[3] += 6
+    else:
+        scores[1] += 2
+        scores[2] += 8
+        scores[3] += 16
+
+    # Candle direction mwisho
+    candle_abs = abs(float(candle))
+    if candle_abs >= 0.8 and (candle > 0) == (direction == "BUY"):
+        scores[1] += 14
+    elif candle_abs >= 0.4 and (candle > 0) == (direction == "BUY"):
+        scores[2] += 10
+    elif candle_abs < 0.3:
+        scores[3] += 10
+
+    # -------------------------------------------------------
+    # H) INDICATORS ALIGNMENT (RSI, Stochastic, BB, MACD, MA)
+    # -------------------------------------------------------
+    ia = int(indicators_agree)
+    if ia >= 10:
+        scores[1] += 22
+        scores[2] += 10
+    elif ia >= 8:
+        scores[1] += 15
+        scores[2] += 16
+    elif ia >= 6:
+        scores[2] += 18
+        scores[3] += 8
+    elif ia >= 4:
+        scores[2] += 10
+        scores[3] += 16
+    else:
+        scores[3] += 20
+
+    # RSI extremes
+    rsi_f = float(rsi)
+    if rsi_f <= 20 or rsi_f >= 80:
+        scores[1] += 16
+    elif rsi_f <= 30 or rsi_f >= 70:
+        scores[1] += 9
+        scores[2] += 5
+    elif 45 <= rsi_f <= 55:
+        scores[2] += 8
+        scores[3] += 6
+
+    # Stochastic extremes
+    sto_f = float(sto)
+    if sto_f <= 15 or sto_f >= 85:
+        scores[1] += 13
+    elif sto_f <= 25 or sto_f >= 75:
+        scores[1] += 7
+        scores[2] += 5
+
+    # Bollinger Bands
+    if bb_pos <= 0.08 or bb_pos >= 0.92:
+        scores[1] += 16
+    elif bb_pos <= 0.20 or bb_pos >= 0.80:
+        scores[1] += 8
+        scores[2] += 6
+    elif 0.40 <= bb_pos <= 0.60:
+        scores[2] += 8
+        scores[3] += 7
+
+    # MACD + MA
+    macd_f = abs(float(macd))
+    ma_f   = abs(float(ma_diff))
+    if macd_f >= 0.5 and ma_f >= 0.4:
+        scores[1] += 12
+        scores[2] += 10
+    elif macd_f >= 0.2 and ma_f >= 0.2:
+        scores[2] += 10
+        scores[3] += 5
+    else:
+        scores[3] += 12
+
+    # -------------------------------------------------------
+    # I) TREND CLARITY (1H + MTF) - uzito mkubwa kwa non-OTC
+    # -------------------------------------------------------
+    if trend_1h == direction:
+        scores[1] += 14
+        scores[2] += 12
+        scores[3] += 6
+    elif trend_1h is not None and trend_1h != direction:
+        # 1H inapinga signal - hatari sana kwa 1m
+        scores[1] -= 20
+        scores[2] -= 8
+        scores[3] += 12
+
+    if mtf and mtf.get("total", 0) >= 3:
+        mtf_dir_tfs = mtf.get("buy_tfs", 0) if direction == "BUY" else mtf.get("sell_tfs", 0)
+        mtf_total   = mtf["total"]
+        mtf_ratio   = mtf_dir_tfs / max(mtf_total, 1)
+        if mtf_ratio >= 0.75:
+            scores[1] += 16
+            scores[2] += 12
+        elif mtf_ratio >= 0.50:
+            scores[2] += 14
+            scores[3] += 6
+        else:
+            scores[1] -= 10
+            scores[3] += 16
+
+    # -------------------------------------------------------
+    # J) YAHOO 1m CANDLE MICRO-TREND (non-OTC specific)
+    # Halisi zaidi kuliko OTC kwa sababu ni data ya kweli
+    # -------------------------------------------------------
+    yf_sym = YAHOO_SYMBOLS.get(pair)
+    if yf_sym:
+        try:
+            df_1m = yf.download(yf_sym, period="1d", interval="1m",
+                                progress=False, auto_adjust=True)
+            if df_1m is not None and len(df_1m) >= 5:
+                c1 = df_1m["Close"].squeeze().astype(float)
+                o1 = df_1m["Open"].squeeze().astype(float)
+                # Last 5 candles
+                bull5 = sum(1 for i in range(-5, 0)
+                            if float(c1.iloc[i]) > float(o1.iloc[i]))
+                bear5 = 5 - bull5
+                micro_dir = "BUY" if bull5 >= bear5 else "SELL"
+                micro_str = max(bull5, bear5) / 5 * 100
+
+                # Last 3 candles (mwelekeo wa hivi karibuni zaidi)
+                bull3 = sum(1 for i in range(-3, 0)
+                            if float(c1.iloc[i]) > float(o1.iloc[i]))
+                bear3 = 3 - bull3
+                micro3_dir = "BUY" if bull3 >= bear3 else "SELL"
+
+                if micro_dir == direction and micro_str >= 80:
+                    # 4/5 au 5/5 candles zinakubaliana - setup nzuri sana kwa 1m
+                    scores[1] += 24
+                    scores[2] += 10
+                elif micro_dir == direction and micro_str >= 60:
+                    # 3/5 candles - wastani
+                    scores[1] += 12
+                    scores[2] += 16
+                elif micro_dir != direction and micro3_dir == direction:
+                    # Micro-trend ilipinga lakini last 3 zimegeuka - 2m bora
+                    scores[2] += 18
+                    scores[3] += 10
+                elif micro_dir != direction:
+                    # Micro inapinga kabisa - 1m ni hatari sana
+                    scores[1] -= 22
+                    scores[2] -= 8
+                    scores[3] += 18
+
+                logging.info("NONOTC EXPIRY micro1m {}: dir={} str={:.0f}% last3={} → 1m:{:.1f} 2m:{:.1f} 3m:{:.1f}".format(
+                    pair, micro_dir, micro_str, micro3_dir,
+                    scores[1], scores[2], scores[3]))
+        except Exception as _ye:
+            logging.warning("smart_nonOTC micro1m failed {}: {}".format(pair, _ye))
+
+    # -------------------------------------------------------
+    # FINAL DECISION — pure score, hakuna upendeleo
+    # -------------------------------------------------------
+    # Normalize scores: bring minimum to zero
+    min_s = min(scores.values())
+    if min_s < 0:
+        for tf in scores:
+            scores[tf] -= min_s
+
+    best_tf = max(scores, key=lambda t: scores[t])
+
+    # Tie-breaking: if top two are within 3 points, pick the one
+    # whose VTE win rate is higher; if no VTE data, keep highest scorer.
+    sorted_tfs = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)
+    top_score  = scores[sorted_tfs[0]]
+    second     = scores[sorted_tfs[1]] if len(sorted_tfs) > 1 else 0
+    if top_score - second < 3.0:
+        # Too close - consult VTE win rate for tiebreak
+        try:
+            sess_name = _get_session().get("name", "Unknown")
+            vte_wr = {}
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT tf_mins,
+                               wins::float / NULLIF(wins + losses, 0) AS wr
+                        FROM tf_session_stats
+                        WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                    """, (pair, sess_name))
+                    for r in cur.fetchall():
+                        if r["wr"] is not None:
+                            vte_wr[int(r["tf_mins"])] = float(r["wr"])
+            tie_candidates = sorted_tfs[:2]
+            # Among tie candidates, pick the one with better VTE win rate
+            best_wr  = -1.0
+            best_tie = best_tf
+            for tc in tie_candidates:
+                wr = vte_wr.get(tc, 0.5)
+                if wr > best_wr:
+                    best_wr  = wr
+                    best_tie = tc
+            best_tf = best_tie
+        except Exception:
+            pass  # keep best_tf from score
+
+    logging.info("NONOTC EXPIRY SELECT {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → {}m [ia={} atr={:.3f} fib={} pa={} pat={}]".format(
+        pair, direction, scores[1], scores[2], scores[3], best_tf,
+        indicators_agree, atr_pct, fib_active, pa_active, pat_active))
+
+    return best_tf
+
+
+# ============================================================
+# SMART EXPIRY SELECTOR  (OTC + non-OTC)
+# Inachagua TF bora (1m/2m/3m) kwa uchambuzi, si random.
+#
+# Vipengele vya uchambuzi:
+#  A) VTE learning  – matokeo halisi ya nyuma kwa pair/session
+#  B) Momentum      – nguvu ya harakati ya soko sasa hivi
+#  C) Volatility    – ATR / avg_movement (HIGH→1m, LOW→3m)
+#  D) Indicators    – RSI, MACD, Stochastic, BB, MA alignment
+#  E) Trend clarity – nguvu ya trend ya 1H na MTF
+#  F) Real pair data– kwa OTC: chagua mapped real pair data
+#
+# Kila TF inapata score 0–100.  TF yenye score kubwa zaidi inachaguliwa.
+# Hakuna upendeleo kwa TF yoyote — score ndiyo inayoamua.
+# ============================================================
+
+def _smart_otc_expiry(
+    pair: str,
+    direction: str,
+    rsi: float = 50.0,
+    sto: float = 50.0,
+    ma_diff: float = 0.0,
+    macd: float = 0.0,
+    bb_pos: float = 0.5,
+    mom: float = 0.0,
+    vol: float = 0.5,
+    candle: float = 0.0,
+    trend_1h=None,
+    mtf=None,
+    indicators_agree: int = 0,
+    movement_cat: str = "MEDIUM",
+) -> int:
+    """
+    Chagua TF bora (1/2/3 dakika) kwa kila signal kwa mantiki halisi.
+    Inafanya kazi kwa OTC na non-OTC signals.
+    Returns: 1, 2, au 3
+    """
+
+    scores = {1: 0.0, 2: 0.0, 3: 0.0}
+
+    # -------------------------------------------------------
+    # A) VTE LEARNING – matokeo ya nyuma ya kila TF kwa pair/session
+    # -------------------------------------------------------
+    try:
+        sess_name = _get_session().get("name", "Unknown")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Session-specific
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS wr,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                """, (pair, sess_name))
+                sess_rows = cur.fetchall()
+                # Overall (fallback)
+                cur.execute("""
+                    SELECT tf_mins,
+                           wins::float / NULLIF(wins + losses, 0) AS wr,
+                           (wins + losses) AS total
+                    FROM tf_session_stats
+                    WHERE pair = %s AND tf_mins IN (1, 2, 3)
+                """, (pair,))
+                overall_rows = cur.fetchall()
+
+        # Session-specific (uzito 1.0)
+        for r in sess_rows:
+            tf = int(r["tf_mins"])
+            wr = float(r["wr"]) if r["wr"] is not None else 0.5
+            tot = int(r["total"])
+            if tot >= 3:
+                # Win rate 0.5 = neutral. Normalise to [-30, +40] score
+                conf = min(1.0, tot / 15.0)
+                vte_bonus = (wr - 0.45) * 80 * conf
+                scores[tf] += vte_bonus
+                logging.info("EXPIRY VTE session {}: tf={}m wr={:.0f}% ({}) bonus={:.1f}".format(
+                    pair, tf, wr * 100, tot, vte_bonus))
+
+        # Overall (uzito 0.6 – punguza kwa session haijulikani)
+        sess_tfs_found = {int(r["tf_mins"]) for r in sess_rows if r["wr"] is not None}
+        for r in overall_rows:
+            tf = int(r["tf_mins"])
+            if tf in sess_tfs_found:
+                continue  # Session data tayari ipo - usirudie
+            wr = float(r["wr"]) if r["wr"] is not None else 0.5
+            tot = int(r["total"])
+            if tot >= 5:
+                conf = min(1.0, tot / 20.0)
+                vte_bonus = (wr - 0.45) * 50 * conf
+                scores[tf] += vte_bonus
+
+    except Exception as _e:
+        logging.warning("smart_expiry VTE failed {}: {}".format(pair, _e))
+
+    # -------------------------------------------------------
+    # B) MOMENTUM ANALYSIS
+    # Momentum kubwa = market inakimbia haraka → 1m inafaa
+    # Momentum ndogo / neutral = subiri kidogo → 2m au 3m
+    # -------------------------------------------------------
+    mom_abs = abs(float(mom))
+    if mom_abs >= 0.6:
+        # Momentum kali sana - 1m ina nafasi nzuri kuona mwisho wa swing
+        scores[1] += 18
+        scores[2] += 8
+        scores[3] += 2
+    elif mom_abs >= 0.3:
+        # Momentum ya kati - 2m balanced
+        scores[1] += 8
+        scores[2] += 15
+        scores[3] += 6
+    else:
+        # Momentum dhaifu - soko linaenda polepole, 3m inasaidia
+        scores[1] += 3
+        scores[2] += 8
+        scores[3] += 16
+
+    # Candle confirmation ya direction (last candle nguvu gani)
+    candle_abs = abs(float(candle))
+    if candle_abs >= 0.8 and (candle > 0) == (direction == "BUY"):
+        # Candle kubwa inayokwenda direction - 1m setup nzuri
+        scores[1] += 14
+    elif candle_abs >= 0.4 and (candle > 0) == (direction == "BUY"):
+        scores[2] += 10
+    elif candle_abs < 0.3:
+        # Candle ndogo - soko linasita, 3m ina faida ya kusubiri uthibitisho
+        scores[3] += 10
+
+    # -------------------------------------------------------
+    # C) VOLATILITY / MOVEMENT CATEGORY
+    # HIGH movement → 1m signal inaweza kufika mapema
+    # MEDIUM         → 2m balanced
+    # LOW            → 3m inahitajika kwa harakati ndogo
+    # -------------------------------------------------------
+    if movement_cat == "HIGH":
+        scores[1] += 20
+        scores[2] += 8
+        scores[3] -= 5
+    elif movement_cat == "MEDIUM":
+        scores[1] += 5
+        scores[2] += 18
+        scores[3] += 8
+    else:  # LOW
+        scores[1] -= 5
+        scores[2] += 8
+        scores[3] += 22
+
+    # -------------------------------------------------------
+    # D) INDICATORS ALIGNMENT
+    # indicators_agree = idadi ya viashiria vinavyokubali direction
+    # Zaidi ya 8 = strong setup → 1m ina nguvu
+    # 5-8 = moderate → 2m
+    # Chini ya 5 = weak → 3m (ina margin ya ziada)
+    # -------------------------------------------------------
+    ia = int(indicators_agree)
+    if ia >= 10:
+        scores[1] += 22
+        scores[2] += 10
+    elif ia >= 8:
+        scores[1] += 14
+        scores[2] += 16
+    elif ia >= 6:
+        scores[2] += 18
+        scores[3] += 8
+    elif ia >= 4:
+        scores[2] += 10
+        scores[3] += 16
+    else:
+        scores[3] += 20
+
+    # RSI extremes: near oversold/overbought → reversal kali → 1m inafaa
+    rsi_f = float(rsi)
+    if rsi_f <= 20 or rsi_f >= 80:
+        scores[1] += 15
+    elif rsi_f <= 30 or rsi_f >= 70:
+        scores[1] += 8
+        scores[2] += 5
+    elif 45 <= rsi_f <= 55:
+        # RSI neutral - soko si katika hali ya extreme → 2m/3m bora
+        scores[2] += 8
+        scores[3] += 6
+
+    # Stochastic extremes
+    sto_f = float(sto)
+    if sto_f <= 15 or sto_f >= 85:
+        scores[1] += 12
+    elif sto_f <= 25 or sto_f >= 75:
+        scores[1] += 6
+        scores[2] += 4
+
+    # Bollinger Bands: bb_pos karibu na edge → reversal karibu → 1m
+    if bb_pos <= 0.08 or bb_pos >= 0.92:
+        scores[1] += 16
+    elif bb_pos <= 0.20 or bb_pos >= 0.80:
+        scores[1] += 8
+        scores[2] += 5
+    elif 0.40 <= bb_pos <= 0.60:
+        # Middle of BB - trend inaendelea → 2m/3m bora
+        scores[2] += 8
+        scores[3] += 6
+
+    # MACD na MA diff alignment
+    macd_f = abs(float(macd))
+    ma_f   = abs(float(ma_diff))
+    if macd_f >= 0.5 and ma_f >= 0.4:
+        # Indicators nguvu sana - trend imara → 1m/2m
+        scores[1] += 12
+        scores[2] += 10
+    elif macd_f >= 0.2 and ma_f >= 0.2:
+        scores[2] += 10
+        scores[3] += 5
+    else:
+        # Indicators dhaifu - subiri zaidi → 3m
+        scores[3] += 12
+
+    # -------------------------------------------------------
+    # E) TREND CLARITY (1H + MTF)
+    # Trend imara ya 1H na MTF → 1m/2m inaweza kufanya kazi
+    # Hakuna trend / conflicted → 3m ina margin
+    # -------------------------------------------------------
+    if trend_1h == direction:
+        # 1H trend inaunga mkono direction - setup nzuri
+        scores[1] += 12
+        scores[2] += 10
+        scores[3] += 5
+    elif trend_1h is not None and trend_1h != direction:
+        # 1H trend inapinga - hatari → 3m ina muda zaidi kuvumilia
+        scores[1] -= 15
+        scores[2] -= 5
+        scores[3] += 10
+
+    if mtf and mtf.get("total", 0) >= 3:
+        mtf_dir_tfs = mtf.get("buy_tfs", 0) if direction == "BUY" else mtf.get("sell_tfs", 0)
+        mtf_total   = mtf["total"]
+        mtf_ratio   = mtf_dir_tfs / max(mtf_total, 1)
+        if mtf_ratio >= 0.75:
+            # MTF nyingi zinakubaliana - trend imara → 1m/2m
+            scores[1] += 14
+            scores[2] += 10
+        elif mtf_ratio >= 0.50:
+            scores[2] += 12
+            scores[3] += 6
+        else:
+            # MTF mixed - subiri → 3m
+            scores[1] -= 8
+            scores[3] += 14
+
+    # -------------------------------------------------------
+    # F) OTC-SPECIFIC: mapped real pair micro-trend
+    # Kama OTC pair ina mapped real pair, tumia 1m candle direction
+    # -------------------------------------------------------
+    if "OTC" in pair:
+        real_p = OTC_TO_REAL.get(pair)
+        if real_p:
+            yf_sym = YAHOO_SYMBOLS.get(real_p)
+            if yf_sym:
+                try:
+                    df_1m = yf.download(yf_sym, period="1d", interval="1m",
+                                        progress=False, auto_adjust=True)
+                    if df_1m is not None and len(df_1m) >= 5:
+                        c1 = df_1m["Close"].squeeze().astype(float)
+                        o1 = df_1m["Open"].squeeze().astype(float)
+                        # Count last 5 candles direction
+                        bull5 = sum(1 for i in range(-5, 0)
+                                    if float(c1.iloc[i]) > float(o1.iloc[i]))
+                        bear5 = 5 - bull5
+                        micro_dir = "BUY" if bull5 >= bear5 else "SELL"
+                        micro_str = max(bull5, bear5) / 5 * 100  # 60-100
+
+                        # 1m TF: kalamu nyeusi - kunahitaji micro trend kukubaliana
+                        if micro_dir == direction and micro_str >= 80:
+                            scores[1] += 20
+                            scores[2] += 8
+                        elif micro_dir == direction and micro_str >= 60:
+                            scores[1] += 10
+                            scores[2] += 14
+                        elif micro_dir != direction:
+                            # Micro inapinga - 1m ni hatari, 3m ina muda zaidi
+                            scores[1] -= 18
+                            scores[2] -= 6
+                            scores[3] += 15
+                        logging.info("EXPIRY OTC micro {}: dir={} str={:.0f}% → 1m:{:.1f} 2m:{:.1f} 3m:{:.1f}".format(
+                            pair, micro_dir, micro_str, scores[1], scores[2], scores[3]))
+                except Exception as _oe:
+                    logging.warning("smart_expiry OTC micro failed {}: {}".format(pair, _oe))
+
+    # -------------------------------------------------------
+    # FINAL DECISION — pure score, hakuna upendeleo wa TF yoyote
+    # -------------------------------------------------------
+    # Normalize ili hakuna TF iwe na advantage ya awali
+    min_s  = min(scores.values())
+    if min_s < 0:
+        for tf in scores:
+            scores[tf] -= min_s  # Shift all to ≥ 0
+
+    best_tf = max(scores, key=lambda t: scores[t])
+
+    # Tiebreak via VTE session win rate (within 3 points)
+    sorted_tfs = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)
+    top_score  = scores[sorted_tfs[0]]
+    second     = scores[sorted_tfs[1]] if len(sorted_tfs) > 1 else 0
+    if top_score - second < 3.0:
+        try:
+            sess_name = _get_session().get("name", "Unknown")
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT tf_mins,
+                               wins::float / NULLIF(wins + losses, 0) AS wr
+                        FROM tf_session_stats
+                        WHERE pair = %s AND session = %s AND tf_mins IN (1, 2, 3)
+                    """, (pair, sess_name))
+                    vte_wr = {int(r["tf_mins"]): float(r["wr"])
+                              for r in cur.fetchall() if r["wr"] is not None}
+            tie_candidates = sorted_tfs[:2]
+            best_wr = -1.0
+            for tc in tie_candidates:
+                wr = vte_wr.get(tc, 0.5)
+                if wr > best_wr:
+                    best_wr = wr
+                    best_tf = tc
+        except Exception:
+            pass  # keep best_tf from score
+
+    logging.info("EXPIRY SELECT {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → {}m".format(
+        pair, direction, scores[1], scores[2], scores[3], best_tf))
+
+    return best_tf
+
+
+def update_tf_outcome(pair: str, tf_mins: int, won: bool):
+    """
+    Hifadhi matokeo ya TF (win/loss) kwa pair na session katika DB.
+    Inaitwa na VTE feedback handler.
+    Huimarisha _smart_otc_expiry kujifunza na kuboresha uchaguzi wa TF.
+    """
+    try:
+        sess_name = _get_session().get("name", "Unknown")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if won:
+                    cur.execute("""
+                        INSERT INTO tf_session_stats (pair, session, tf_mins, wins, losses)
+                        VALUES (%s, %s, %s, 1, 0)
+                        ON CONFLICT (pair, session, tf_mins) DO UPDATE
+                            SET wins = tf_session_stats.wins + 1
+                    """, (pair, sess_name, tf_mins))
+                else:
+                    cur.execute("""
+                        INSERT INTO tf_session_stats (pair, session, tf_mins, wins, losses)
+                        VALUES (%s, %s, %s, 0, 1)
+                        ON CONFLICT (pair, session, tf_mins) DO UPDATE
+                            SET losses = tf_session_stats.losses + 1
+                    """, (pair, sess_name, tf_mins))
+            conn.commit()
+        logging.info("TF outcome updated: {} tf={}m {} session={}".format(
+            pair, tf_mins, "WIN" if won else "LOSS", sess_name))
+    except Exception as e:
+        logging.warning("update_tf_outcome failed {}: {}".format(pair, e))
+
 async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
     """Send a non-OTC signal - simple clean caption."""
     ib          = direction == "BUY"
     arrow       = "Up 🟢" if ib else "Down 🔴"
-    strength    = sig.get("strength", 70)
-    # Ensure strength is in % format (60–99)
-    if isinstance(strength, int) and strength > 100:
-        strength = int(60 + (strength - 300) / 200 * 39)
-    strength = max(60, min(99, int(strength)))
+    strength    = sig.get("strength", 200)
+    # Strength ni range 90–450. Legacy values (>500 au <90) zinahesabiwa upya.
+    if isinstance(strength, int) and strength > 450:
+        # Legacy old formula (300-500) → map to 90-450
+        strength = int(90 + (min(500, max(300, strength)) - 300) / 200 * 360)
+    elif isinstance(strength, int) and strength < 90:
+        # Legacy 35-97 → map to 90-450
+        strength = int(90 + (max(35, min(97, strength)) - 35) / 62 * 360)
+    strength = max(90, min(450, int(strength)))
     caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(
         pair, arrow, timeframe, strength)
     kb  = nonotc_signal_keyboard(pair, timeframe)
@@ -3329,11 +4161,13 @@ def run_mtf_signal_engine(pair):
 def build_mtf_caption(pair, direction, sig_type, tf_labels, trend_score, near=False):
     """Simple signal caption - clean na wazi."""
     arrow = "Up 🟢" if direction == "CALL" else "Down 🔴"
-    strength_pct = int(max(60, min(99, trend_score)))
+    # trend_score ni 0-100; map to 90-450
+    strength_pct = int(90 + (max(0, min(100, trend_score)) / 100) * 360)
+    strength_pct = max(90, min(450, strength_pct))
     return (
         "*{}* {}\n"
         "🕐 In *{}* min\n"
-        "📊 Signal strength: {}%"
+        "📊 Signal strength: {}"
     ).format(pair, arrow, sig_type, strength_pct)
 
 # -- END MTF ENGINE -------------------------------------------
@@ -3608,9 +4442,10 @@ def _nn_features_from_signal(sig_dict, rsi, sto, ma_diff, macd, bb_pos, mom, vol
         ia          = min(1.0, float(sig_dict.get("indicators_agree", 0)) / 20.0)
         session_num = _nn_session_num()
         is_otc_num  = 1.0 if sig_dict.get("is_otc", False) else 0.0
-        # Strength: normalize 300–500 range to -1.0–1.0
-        raw_str     = float(sig_dict.get("strength", 400))
-        str_norm    = max(-1.0, min(1.0, (raw_str - 400) / 100.0))
+        # Strength: normalize range 90–450 to -1.0–1.0
+        # midpoint = 270, range = 360 → (val - 270) / 180
+        raw_str  = float(sig_dict.get("strength", 270))
+        str_norm = max(-1.0, min(1.0, (raw_str - 270) / 180.0))
 
         feat = np.array([[
             (rsi - 50) / 50.0,
@@ -4349,7 +5184,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         logging.info("RESCUE nonOTC {} via Deriv: dir={} tf={}m".format(pair, deriv_rescue_dir, _rescue_tf_final))
         return {
             "direction": deriv_rescue_dir, "pair": pair, "timeframe": _rescue_tf_final,
-            "strength": min(99, 60 + int((_best_str_r / 100) * 39)),
+            "strength": int(90 + (_best_str_r / 100) * 360),
             "indicators_agree": 4,
             "trend_1h": deriv_rescue_dir, "vwap_data": None, "confluence": {},
             "mtf": None, "flat": False, "patterns": {},
@@ -4451,7 +5286,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
 
     return {
         "direction": final_dir, "pair": pair, "timeframe": final_tf,
-        "strength": max(300, int(best_support * 5)),
+        "strength": max(90, min(450, int(90 + (best_support / 100) * 360))),
         "indicators_agree": 3,
         "trend_1h": hist_dir, "vwap_data": None, "confluence": {},
         "mtf": None, "flat": False, "patterns": {},
@@ -4526,11 +5361,38 @@ async def safe_generate_signal(pair: str) -> dict:
     loop   = asyncio.get_event_loop()
 
     def _otc_fallback():
-        forced_dir = random.choice(["BUY", "SELL"])
-        forced_tf  = random.choice([1, 2, 3])
+        # Smart fallback: tumia trend_1h au history badala ya random
+        _fb_dir = None
+        try:
+            _fb_dir = _fetch_1h_trend(pair)
+        except Exception:
+            pass
+        if _fb_dir is None:
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT direction FROM signal_history WHERE pair=%s "
+                            "ORDER BY created_at DESC LIMIT 10", (pair,))
+                        rows = cur.fetchall()
+                if rows:
+                    dirs = [r["direction"] for r in rows]
+                    _fb_dir = max(set(dirs), key=dirs.count)
+            except Exception:
+                pass
+        if _fb_dir is None:
+            _fb_dir = "BUY"  # neutral default - last resort only
+        _fb_tf = _smart_otc_expiry(
+            pair, _fb_dir,
+            rsi=50.0, sto=50.0, ma_diff=0.0, macd=0.0,
+            bb_pos=0.5, mom=0.0, vol=0.5, candle=0,
+            trend_1h=_fb_dir, mtf=None,
+            indicators_agree=3,
+            movement_cat="MEDIUM",
+        )
         return {
-            "direction": forced_dir, "pair": pair, "timeframe": forced_tf,
-            "strength": random.randint(300, 500), "indicators_agree": 3,
+            "direction": _fb_dir, "pair": pair, "timeframe": _fb_tf,
+            "strength": 180, "indicators_agree": 3,
             "trend_1h": None, "vwap_data": None, "confluence": {},
             "mtf": None, "flat": False, "patterns": {},
             "movement_cat": "MEDIUM", "avg_movement": 0.08,
@@ -4554,16 +5416,28 @@ async def safe_generate_signal(pair: str) -> dict:
             loop.run_in_executor(None, generate_signal, pair),
             timeout=_SIGNAL_TIMEOUT
         )
-        # OTC must NEVER return flat - inject random direction if so
+        # OTC must NEVER return flat - use smart direction/tf if so
         if is_otc and sig.get("flat"):
-            forced_dir = random.choice(["BUY", "SELL"])
-            forced_tf  = random.choice([1, 2, 3])
+            _r1h = None
+            try:
+                _r1h = _fetch_1h_trend(pair)
+            except Exception:
+                pass
+            forced_dir = _r1h or sig.get("direction") or "BUY"
+            forced_tf  = _smart_otc_expiry(
+                pair, forced_dir,
+                rsi=50.0, sto=50.0, ma_diff=0.0, macd=0.0,
+                bb_pos=0.5, mom=0.0, vol=0.5, candle=0,
+                trend_1h=_r1h, mtf=None,
+                indicators_agree=3,
+                movement_cat="MEDIUM",
+            )
             sig["direction"]        = forced_dir
             sig["timeframe"]        = forced_tf
             sig["flat"]             = False
             sig["no_signal_reason"] = ""
-            sig["strength"]         = random.randint(300, 500)
-            logging.info("OTC FORCE SIGNAL (flat rescued): {} → {} {}m".format(pair, forced_dir, forced_tf))
+            sig["strength"]         = 180
+            logging.info("OTC SMART FORCE (flat rescued): {} → {} {}m".format(pair, forced_dir, forced_tf))
         # Non-OTC flat → try rescue before giving up
         if not is_otc and sig.get("flat"):
             rescued = _rescue_nonOTC_signal(pair)
@@ -4747,41 +5621,67 @@ def generate_signal(pair):
             # direction_raw is None when indicators conflict - use mom as proxy
             candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
     else:
-        # -- OTC: Smart synthetic indicators (session-aware) ----
-        sess  = _get_session()
-        ptype = _pair_type(pair)
-        if sess["name"] in ("London Open", "NY/London"):
-            rsi_w = [20, 18, 24, 18, 20]
-        elif sess["name"] in ("Asian", "Dead Hours"):
-            rsi_w = [10, 20, 40, 20, 10]
-        else:
-            rsi_w = [15, 20, 30, 20, 15]
+        # -- OTC: Tumia data halisi ya real pair (kama EUR/USD kwa EUR/USD OTC) --
+        # Hii ni bora zaidi kuliko random - indicators zinaakisi hali halisi ya soko
+        real_p_otc = OTC_TO_REAL.get(pair)
+        real_otc_ind = None
+        if real_p_otc:
+            try:
+                real_otc_ind = _fetch_real_indicators_mtf(real_p_otc)
+            except Exception:
+                pass
 
-        # If 1H trend is clear, bias synthetic data to match it
-        if trend_1h == "BUY":
-            rsi_w = [25, 20, 25, 18, 12]
-        elif trend_1h == "SELL":
-            rsi_w = [12, 18, 25, 20, 25]
-
-        rsi_zone = random.choices(
-            ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
-        rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
-               "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
-               "overbought": random.uniform(72,92)}[rsi_zone]
-        sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
-               "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
-               "overbought": random.uniform(75,95)}[rsi_zone]
-        if sess["name"] in ("London Open", "NY Session"):
-            ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
+        if real_otc_ind:
+            # Tumia data halisi ya real pair - bora zaidi
+            rsi     = real_otc_ind["rsi"]
+            sto     = real_otc_ind["sto"]
+            ma_diff = real_otc_ind["ma_diff"]
+            macd    = real_otc_ind["macd"]
+            bb_pos  = real_otc_ind["bb_pos"]
+            mom     = real_otc_ind["mom"]
+            vol     = real_otc_ind["vol"]
+            _raw_dir_otc = real_otc_ind.get("direction")
+            if _raw_dir_otc == "BUY":
+                candle = 1.0
+            elif _raw_dir_otc == "SELL":
+                candle = -1.0
+            else:
+                candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
         else:
-            ma_diff = random.uniform(-0.4, 0.4)
-        if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
-        if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
-        macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
-        bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
-        mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
-        vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
-        candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
+            # Fallback: session-aware synthetic (bado ni bora kuliko pure random)
+            sess  = _get_session()
+            ptype = _pair_type(pair)
+            # Bias synthetic kwa 1H trend kama ipo
+            if trend_1h == "BUY":
+                rsi_w = [25, 20, 25, 18, 12]
+            elif trend_1h == "SELL":
+                rsi_w = [12, 18, 25, 20, 25]
+            elif sess["name"] in ("London Open", "NY/London"):
+                rsi_w = [20, 18, 24, 18, 20]
+            elif sess["name"] in ("Asian", "Dead Hours"):
+                rsi_w = [10, 20, 40, 20, 10]
+            else:
+                rsi_w = [15, 20, 30, 20, 15]
+
+            rsi_zone = random.choices(
+                ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
+            rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
+                   "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
+                   "overbought": random.uniform(72,92)}[rsi_zone]
+            sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
+                   "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
+                   "overbought": random.uniform(75,95)}[rsi_zone]
+            if sess["name"] in ("London Open", "NY Session"):
+                ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
+            else:
+                ma_diff = random.uniform(-0.4, 0.4)
+            if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
+            if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
+            macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
+            bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
+            mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
+            vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
+            candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
 
     # -- BASE SCORING -----------------------------------------
     # Non-OTC: halve 5m indicator weights - they are confirmation only.
@@ -5019,108 +5919,88 @@ def generate_signal(pair):
                 if direction == "BUY" and buy_c:   indicators_agree += 1
                 if direction == "SELL" and sell_c: indicators_agree += 1
 
-    # -- SIGNAL HISTORY BIAS CHECK ----------------------------
-    # If most recent signals share same direction - reinforce decision
+    # -- SIGNAL HISTORY WIN-RATE BIAS CHECK -------------------
+    # Tumia win rate halisi, si idadi ya direction tu
     hist_same, hist_total, hist_pct = _check_signal_history_bias(pair, direction, window=15)
     if hist_total >= 5:
-        if hist_pct >= 0.70:
-            # History strongly agrees - add +20 and boost indicators_agree
+        if hist_pct >= 0.65:
+            # Win rate nzuri - imarisha direction hii
             if direction == "BUY":
-                b += 20
+                b += int((hist_pct - 0.5) * 30)  # +4.5 hadi +15
             else:
-                s += 20
-            indicators_agree += 2
-        elif hist_pct <= 0.30:
-            # History strongly disagrees - reduce confidence
+                s += int((hist_pct - 0.5) * 30)
+            indicators_agree += 1
+        elif hist_pct < 0.40:
+            # Win rate mbaya - punguza score ya direction hii
             if direction == "BUY":
-                b -= 15
+                b -= 10
             else:
-                s -= 15
+                s -= 10
 
-    # -- STRENGTH CALCULATION ---------------------------------
-    dom = max(b, s); tot = max(b+s, 1)
+    # -- STRENGTH CALCULATION (HALISI 0-100) ------------------
+    # Formula ya kweli: inategemea indicators_agree, mtf, trend_1h, win_rate ya historia
+    # Haijaongezwa bandia - 40 = dhaifu, 90+ = nguvu sana
+    dom = max(b, s); tot = max(b + s, 1)
+    base_score = int((dom / tot) * 100)            # 50–100 (dominant side ratio)
+
+    # Indicator alignment bonus (max +20)
+    ia_bonus = min(20, indicators_agree * 2)
+
+    # MTF bonus (max +15)
     mtf_bonus = 0
     if mtf and mtf["total"] >= 3:
         agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
-        mtf_bonus = int((agreeing / mtf["total"]) * 45)
-    trend_bonus = 20 if trend_1h == direction else 0
-    pattern_bonus_str = min(30, pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus)
-    hist_bonus_str = int(hist_pct * 20) if hist_total >= 5 else 0
+        mtf_bonus = int((agreeing / mtf["total"]) * 15)
 
-    # Strength formula: base 280 + bonuses (max 500) → convert to 60–99%
-    _raw_strength = min(500, max(300, 280 + indicators_agree*25 + int((dom/tot)*100)
-                            + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
-                            ))
-    # Map 300–500 → 60–99%
-    strength = int(60 + (_raw_strength - 300) / 200 * 39)
+    # 1H trend agreement (max +10)
+    trend_bonus = 10 if trend_1h == direction else (0 if trend_1h is None else -10)
+
+    # Pattern bonus (max +8)
+    pattern_bonus_str = min(8, (pattern_buy_bonus if direction == "BUY" else pattern_sell_bonus) // 5)
+
+    # Historical win rate bonus (max +7, penalty if poor)
+    hist_bonus_str = 0
+    if hist_total >= 5:
+        if hist_pct >= 0.65:
+            hist_bonus_str = int((hist_pct - 0.5) * 14)  # 0.65→2, 1.0→7
+        elif hist_pct < 0.40:
+            hist_bonus_str = -5  # Penalize direction with poor win history
+
+    raw_strength = base_score + ia_bonus + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str
+    # Clamp internal score 35–97, then map to display range 90–450
+    raw_clamped = max(35, min(97, raw_strength))
+    # Map: 35→90, 97→450  (linear)
+    strength = int(90 + (raw_clamped - 35) / (97 - 35) * (450 - 90))
 
     # -- TIMEFRAME SELECTION ----------------------------------
     if is_otc:
-        timeframe = random.choice([1, 1, 2, 2, 3, 3])
+        # Smart OTC TF selection: uchambuzi wa kweli, si random
+        timeframe = _smart_otc_expiry(
+            pair, direction,
+            rsi=rsi, sto=sto, ma_diff=ma_diff, macd=macd,
+            bb_pos=bb_pos, mom=mom, vol=vol, candle=candle,
+            trend_1h=trend_1h, mtf=mtf,
+            indicators_agree=indicators_agree,
+            movement_cat=movement_cat,
+        )
     else:
-        # Non-OTC: kagua 1m/2m/3m zote - chagua yenye nguvu zaidi
-        # Kanuni: TF yenye indicators_agree kubwa zaidi + VTE history ndiyo inachaguliwa
-        # Hakuna kushuka chini kwa sababu ya udhaifu - best TF ndiyo inatoka
-
-        best_vte = get_best_tf_for_session(pair)  # session-aware (London/NY/Asian)
-        if best_vte is None:
-            best_vte = get_optimal_tf(pair)       # overall VTE learned TF
-
-        # Score kila TF: VTE history + indicators_agree + micro support
-        _tf_candidate_scores = {}
-
-        # Fetch micro support kwa kila TF
-        _micro_scores = {}
-        try:
-            _micro_tmp = _micro_candle_trend_score(pair)
-            if _micro_tmp:
-                for _st in [1, 2, 3]:
-                    _r = _micro_tmp.get(str(_st))
-                    if _r and _r["direction"] == direction:
-                        _micro_scores[_st] = _r["support"]
-                    else:
-                        _micro_scores[_st] = 0.0
-        except Exception:
-            _micro_scores = {1: 0.0, 2: 0.0, 3: 0.0}
-
-        for _tf in [1, 2, 3]:
-            _score = 0
-            # VTE history bonus
-            if best_vte == _tf:
-                _score += 30
-            # indicators_agree contribution per TF
-            _ia_thresholds = {1: 8, 2: 7, 3: 6}
-            if indicators_agree >= _ia_thresholds[_tf]:
-                _score += indicators_agree * 5
-            # Micro support bonus (Yahoo proxy)
-            _score += _micro_scores.get(_tf, 0.0) * 0.5
-            # 1H trend confirmation bonus
-            if trend_1h == direction:
-                _score += 20
-            # -- Deriv cache bonus: kama cached Deriv data inakubaliana na direction --
-            _dc_bonus = _deriv_ind_data  # fetched earlier at top of generate_signal
-            if _dc_bonus:
-                _dc_key_map = {1: "5_s", 2: "10_s", 3: "15_s"}
-                _dc_trend = _dc_bonus.get(_dc_key_map.get(_tf, ""))
-                if _dc_trend and _dc_trend.get("direction") == direction:
-                    _dc_str = _dc_trend.get("strength", 0)
-                    _score += int(_dc_str * 0.6)  # max +60 - Deriv inakuwa na uzito mkubwa
-                elif _dc_trend and _dc_trend.get("direction") not in (None, "FLAT") and _dc_trend["direction"] != direction:
-                    _score -= 20  # Deriv inapinga - punguza score
-            _tf_candidate_scores[_tf] = _score
-
-        # Chagua TF yenye score kubwa zaidi
-        best_tf_chosen = max(_tf_candidate_scores, key=_tf_candidate_scores.get)
-
-        # Angalia kama TF iliyochaguliwa ina nguvu ya kutosha
-        _min_scores = {1: 40, 2: 35, 3: 30}
-        if _tf_candidate_scores[best_tf_chosen] >= _min_scores[best_tf_chosen]:
-            timeframe = best_tf_chosen
-        else:
-            # Nguvu haitoshi kwa TF yoyote - chagua 3m kama fallback wa mwisho
-            timeframe = 3
-
-        vte_tf = best_vte  # keep vte_tf for downstream filters
+        # Non-OTC: tumia _smart_nonOTC_expiry - engine yenye uchambuzi kamili
+        # Inatumia vipengele vyote: VTE, momentum, ATR, RSI, BB, MACD,
+        # Fibonacci, PA, patterns, Deriv cache, 1H trend, MTF
+        timeframe = _smart_nonOTC_expiry(
+            pair, direction,
+            rsi=rsi, sto=sto, ma_diff=ma_diff, macd=macd,
+            bb_pos=bb_pos, mom=mom, vol=vol, candle=candle,
+            trend_1h=trend_1h, mtf=mtf,
+            indicators_agree=indicators_agree,
+            movement_cat=movement_cat,
+            atr_pct=atr_pct,
+            fib_buy_bonus=fib_buy_bonus, fib_sell_bonus=fib_sell_bonus,
+            pa_buy_bonus=pa_buy_bonus, pa_sell_bonus=pa_sell_bonus,
+            pattern_buy_bonus=pattern_buy_bonus, pattern_sell_bonus=pattern_sell_bonus,
+            deriv_cache=_deriv_ind_data,
+        )
+        vte_tf = timeframe  # keep vte_tf for downstream filters
 
         logging.info("TF SELECTION {}: scores=1m:{:.0f} 2m:{:.0f} 3m:{:.0f} → chosen={}m ia={} micro={}".format(
             pair,
@@ -5170,18 +6050,6 @@ def generate_signal(pair):
             timeframe = timeframe if timeframe > 0 else 3
         elif not yahoo_available:
             timeframe = 3  # No data - use 3m instead of blocking
-
-    # -- OTC: Random flip/follow logic ------------------------
-    # Each signal independently decides: follow the market or go against it.
-    # Random intervals mean the broker cannot predict the pattern.
-    if is_otc:
-        otc_flip = random.choices(
-            ["follow", "oppose"],
-            weights=[45, 55]
-        )[0]
-        if otc_flip == "oppose":
-            direction = "SELL" if direction == "BUY" else "BUY"
-        _otc_flip_cache[pair] = otc_flip
 
     # -- 1H CANDLE CONFIRMATION (non-OTC only) ---------------
     # OTC always forces a signal - no blocking on 1H confirmation.
@@ -6361,14 +7229,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif check["action"] == "flip":
             direction  = check["direction"]
             timeframe  = random.choice([1, 2, 3])
-            strength   = random.randint(200, 500)
+            strength   = random.randint(120, 300)
             flip_count = 1
         else:
             state_s    = get_user_signal_state(user_id, pair)
             flip_count = state_s["flip_count"] + 1 if state_s else 2
             direction  = check["direction"]
             timeframe  = random.choice([1, 2, 3])
-            strength   = random.randint(200, 500)
+            strength   = random.randint(120, 300)
 
         save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None)
         if check["action"] != "fresh":
@@ -6875,10 +7743,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
         arrow = "Up 🟢" if ib else "Down 🔴"
-        _str  = sig.get("strength", 70)
-        if isinstance(_str, int) and _str > 100:
-            _str = int(60 + (_str - 300) / 200 * 39)
-        _str = max(60, min(99, int(_str)))
+        _str  = sig.get("strength", 200)
+        if isinstance(_str, int) and _str > 450:
+            _str = int(90 + (min(500, max(300, _str)) - 300) / 200 * 360)
+        elif isinstance(_str, int) and _str < 90:
+            _str = int(90 + (max(35, min(97, _str)) - 35) / 62 * 360)
+        _str = max(90, min(450, int(_str)))
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
@@ -7120,10 +7990,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
         arrow = "Up 🟢" if ib else "Down 🔴"
-        _str2 = sig.get("strength", 70)
-        if isinstance(_str2, int) and _str2 > 100:
-            _str2 = int(60 + (_str2 - 300) / 200 * 39)
-        _str2 = max(60, min(99, int(_str2)))
+        _str2 = sig.get("strength", 200)
+        if isinstance(_str2, int) and _str2 > 450:
+            _str2 = int(90 + (min(500, max(300, _str2)) - 300) / 200 * 360)
+        elif isinstance(_str2, int) and _str2 < 90:
+            _str2 = int(90 + (max(35, min(97, _str2)) - 35) / 62 * 360)
+        _str2 = max(90, min(450, int(_str2)))
         if not is_licensed(user_id): use_free_signal(user_id)
         try: await cm.delete()
         except: pass
@@ -8689,11 +9561,16 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
             already = {r["pair"] for r in screened}
             # Non-OTC fallback: priority pairs first, then exotics
             _PRIORITY_NONOTC = [
+                # Tier 1: Major forex pairs (highest liquidity + data quality)
                 "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD",
-                "NZD/USD", "USD/CAD", "EUR/GBP", "EUR/JPY", "EUR/AUD",
-                "EUR/CAD", "EUR/CHF", "GBP/JPY", "GBP/AUD", "GBP/CAD",
-                "GBP/CHF", "AUD/JPY", "AUD/CAD", "AUD/CHF", "CHF/JPY",
-                "CAD/JPY", "CAD/CHF", "USD/MXN",
+                "NZD/USD", "USD/CAD",
+                # Tier 2: Major crosses
+                "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
+                "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
+                # Tier 3: Minor crosses
+                "AUD/JPY", "AUD/CAD", "AUD/CHF", "CHF/JPY",
+                "CAD/JPY", "CAD/CHF", "NZD/JPY", "USD/MXN",
+                # Tier 4: Indices (last - less reliable data for 1m/2m/3m)
                 "US100", "SP500", "US30", "GER40", "UK100",
             ]
             if otc_only:
@@ -8847,6 +9724,21 @@ async def run_bot():
     # -- Launch licence expiry warning loop (every 12 hours) ----
     asyncio.create_task(_licence_expiry_warning_loop(ptb_app.bot))
     print("Licence expiry warning loop started.")
+
+    # Self-ping keepalive - prevents Render free instance spin down
+    async def _keepalive_ping():
+        import aiohttp
+        url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/") or "http://localhost:{}".format(os.environ.get("PORT", 8080))
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await session.get(url + "/health", timeout=aiohttp.ClientTimeout(total=10))
+            except Exception:
+                pass
+            await asyncio.sleep(600)  # ping every 10 minutes
+
+    asyncio.create_task(_keepalive_ping())
+    print("Keepalive ping started.")
 
     # Keepalive
     while True:
