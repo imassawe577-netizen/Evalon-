@@ -2130,6 +2130,7 @@ def save_last_bot_msg(user_id, msg_id):
 # ============================================================
 # ANTI-SPAM
 # ============================================================
+SPAM_SECONDS = 3  # Minimum seconds between signal requests
 LAST_SIGNAL_TIME = {}  # in-memory cache only
 
 def is_spam(user_id):
@@ -9320,8 +9321,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Non-fresh check actions (flip/same) - always generate a fresh signal
             # instead of using cached/flipped direction. Every request gets real market data.
             sig2       = await safe_generate_signal(pair)
+            _anim_stop.set()
             direction  = sig2["direction"]
-            timeframe  = sig2["timeframe"] if sig2["timeframe"] > 0 else sig["timeframe"]
+            timeframe  = sig2["timeframe"] if sig2["timeframe"] > 0 else 1
             strength   = sig2["strength"]
             flip_count = 0
             sig        = sig2  # use fresh sig for display details
