@@ -1122,6 +1122,45 @@ def init_db():
                     ON signal_combo_stats (pair, direction, tf_mins, setup_cluster);
                 CREATE INDEX IF NOT EXISTS idx_combo_lookup
                     ON signal_combo_stats (pair, setup_cluster);
+
+                -- v50: trend_fingerprint_results - mfumo mpya wa kujifunza
+                -- Hifadhi fingerprint ya kila signal + outcomes za 1m/2m/3m + movement
+                CREATE TABLE IF NOT EXISTS trend_fingerprint_results (
+                    id            SERIAL PRIMARY KEY,
+                    pair          TEXT NOT NULL,
+                    -- Fingerprint ya trend (indicators za wakati wa signal)
+                    rsi           DOUBLE PRECISION DEFAULT NULL,
+                    bb_pos        DOUBLE PRECISION DEFAULT NULL,
+                    macd          DOUBLE PRECISION DEFAULT NULL,
+                    mom           DOUBLE PRECISION DEFAULT NULL,
+                    atr_pct       DOUBLE PRECISION DEFAULT NULL,
+                    trend_1h      TEXT DEFAULT NULL,
+                    -- Deriv micro-trends (5s/10s/15s)
+                    d5s_dir       TEXT DEFAULT NULL,
+                    d5s_str       DOUBLE PRECISION DEFAULT NULL,
+                    d10s_dir      TEXT DEFAULT NULL,
+                    d10s_str      DOUBLE PRECISION DEFAULT NULL,
+                    d15s_dir      TEXT DEFAULT NULL,
+                    d15s_str      DOUBLE PRECISION DEFAULT NULL,
+                    -- Signal iliyotolewa
+                    signal_dir    TEXT NOT NULL,
+                    entry_price   DOUBLE PRECISION NOT NULL,
+                    created_at    TIMESTAMP DEFAULT NOW(),
+                    -- Outcomes za 1m, 2m, 3m
+                    won_1m        BOOLEAN DEFAULT NULL,
+                    won_2m        BOOLEAN DEFAULT NULL,
+                    won_3m        BOOLEAN DEFAULT NULL,
+                    -- Movement (pips%) kwa kila TF - jinsi bei ilienda mbali
+                    move_1m       DOUBLE PRECISION DEFAULT NULL,
+                    move_2m       DOUBLE PRECISION DEFAULT NULL,
+                    move_3m       DOUBLE PRECISION DEFAULT NULL,
+                    -- Exit prices
+                    exit_1m       DOUBLE PRECISION DEFAULT NULL,
+                    exit_2m       DOUBLE PRECISION DEFAULT NULL,
+                    exit_3m       DOUBLE PRECISION DEFAULT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tfr_pair ON trend_fingerprint_results (pair, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tfr_rsi ON trend_fingerprint_results (pair, rsi, bb_pos);
             """)
 
         conn.commit()
@@ -7446,6 +7485,38 @@ def generate_signal(pair):
 
     # AUTO-REVERSE disabled - signal follows MTF direction only
 
+    # -- v50: FINGERPRINT LEARNING - chagua combo bora kutoka historia halisi --
+    # Non-OTC tu. Kama historia inasema direction/TF tofauti na iliyochaguliwa,
+    # badilisha. Inazingatia movement ya bei, si win/loss tu.
+    if not is_otc and timeframe > 0:
+        try:
+            # Deriv directions kutoka cache
+            _d5  = _d10 = _d15 = None
+            if _micro_htf:
+                _d5  = _micro_htf.get("5_s",  {}).get("direction")
+                _d10 = _micro_htf.get("10_s", {}).get("direction")
+                _d15 = _micro_htf.get("15_s", {}).get("direction")
+
+            best_combo = get_best_combo_from_fingerprint(
+                pair=pair, rsi=rsi, bb_pos=bb_pos, macd=macd,
+                mom=mom, atr_pct=atr_pct, trend_1h=trend_1h,
+                d5s_dir=_d5, d10s_dir=_d10, d15s_dir=_d15,
+                min_samples=5
+            )
+            if best_combo is not None:
+                fp_dir = best_combo["direction"]
+                fp_tf  = best_combo["tf_mins"]
+                fp_wr  = best_combo["win_rate"]
+                fp_mov = best_combo["avg_movement"]
+                logging.info("FP_OVERRIDE {}: dir {} → {} tf {} → {}m wr={:.0f}% move={:.4f}%".format(
+                    pair, direction, fp_dir, timeframe, fp_tf,
+                    fp_wr * 100, fp_mov))
+                direction = fp_dir
+                timeframe = fp_tf
+        except Exception as _fp_e:
+            logging.warning("fingerprint combo select failed {}: {}".format(pair, _fp_e))
+    # ---------------------------------------------------------
+
     record_signal(pair, direction,
                   rsi=rsi, macd=macd, bb_pos=bb_pos, sto=sto,
                   ma_diff=ma_diff, mom=mom, atr_pct=atr_pct,
@@ -8284,14 +8355,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                         existing.add(p)
         else:
-            # Market open - pick from non-OTC (live data) first, OTC as fallback
+            # Market open - pick from non-OTC major/popular/minor pairs only
             top5 = get_top5_pairs(non_otc_only=True)
             if len(top5) < 5:
-                pool = [p for p in ALL_PAIRS if "OTC" not in p and "/" in p and "BTC" not in p]
-                random.shuffle(pool)
+                _allowed = [
+                    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","NZD/USD","USD/CAD",
+                    "EUR/GBP","EUR/JPY","EUR/AUD","EUR/CAD","EUR/CHF",
+                    "GBP/JPY","GBP/AUD","GBP/CAD","GBP/CHF",
+                    "AUD/JPY","AUD/CAD","AUD/CHF","AUD/NZD",
+                    "NZD/JPY","NZD/CAD","NZD/CHF",
+                    "CHF/JPY","CAD/JPY","CAD/CHF","EUR/NZD","GBP/NZD","USD/MXN",
+                ]
                 existing = {r["pair"] for r in top5}
-                for p in pool:
-                    if p not in existing and len(top5) < 5:
+                for p in _allowed:
+                    if p not in existing and len(top5) < 5 and p in ALL_PAIRS:
                         top5.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
                         existing.add(p)
 
@@ -9182,7 +9259,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=sig.get("no_signal_reason") or "🟡 *No signal available*",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
                     ])
                 )
                 save_last_bot_msg(user_id, _nsm.message_id)
@@ -10106,6 +10183,339 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # and skip recording those results (does not affect user signals).
 # ============================================================
 
+# ============================================================
+# v50: TREND FINGERPRINT LEARNING ENGINE
+# Hifadhi fingerprint ya kila signal, fuatilia 1m/2m/3m zote,
+# hifadhi movement halisi, chagua combo bora kwa signal ijayo.
+# ============================================================
+
+# Major + popular + minor pairs zinazofuatiliwa na background scanner
+_BG_SCAN_PAIRS = [
+    # Majors
+    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","NZD/USD","USD/CAD",
+    # Popular crosses
+    "EUR/GBP","EUR/JPY","EUR/AUD","EUR/CAD","EUR/CHF",
+    "GBP/JPY","GBP/AUD","GBP/CAD","GBP/CHF",
+    # Minor crosses
+    "AUD/JPY","AUD/CAD","AUD/CHF","AUD/NZD",
+    "NZD/JPY","NZD/CAD","NZD/CHF",
+    "CHF/JPY","CAD/JPY","CAD/CHF","EUR/NZD","GBP/NZD","USD/MXN",
+]
+
+# In-memory store ya fingerprint trades zinazongoja outcomes
+# {fingerprint_id: {entry_price, direction, expiry_1m, expiry_2m, expiry_3m, ...}}
+_fp_pending: dict = {}
+
+
+def _save_fingerprint(pair, signal_dir, entry_price,
+                      rsi=None, bb_pos=None, macd=None, mom=None, atr_pct=None,
+                      trend_1h=None, d5s_dir=None, d5s_str=None,
+                      d10s_dir=None, d10s_str=None, d15s_dir=None, d15s_str=None):
+    """
+    Hifadhi fingerprint ya signal kwenye trend_fingerprint_results.
+    Returns: id ya row (tumia kwa update ya outcomes baadaye)
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO trend_fingerprint_results
+                        (pair, rsi, bb_pos, macd, mom, atr_pct, trend_1h,
+                         d5s_dir, d5s_str, d10s_dir, d10s_str, d15s_dir, d15s_str,
+                         signal_dir, entry_price, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                    RETURNING id
+                """, (pair, rsi, bb_pos, macd, mom, atr_pct, trend_1h,
+                      d5s_dir, d5s_str, d10s_dir, d10s_str, d15s_dir, d15s_str,
+                      signal_dir, entry_price))
+                row = cur.fetchone()
+            conn.commit()
+        return row["id"] if row else None
+    except Exception as e:
+        logging.warning("_save_fingerprint failed {}: {}".format(pair, e))
+        return None
+
+
+def _update_fingerprint_outcome(fp_id, tf_mins, won, movement_pct, exit_price):
+    """
+    Sasisha outcome ya TF moja (1m, 2m, au 3m) kwa fingerprint.
+    """
+    col_won  = "won_{}m".format(tf_mins)
+    col_move = "move_{}m".format(tf_mins)
+    col_exit = "exit_{}m".format(tf_mins)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE trend_fingerprint_results
+                    SET {won} = %s, {move} = %s, {exit} = %s
+                    WHERE id = %s
+                """.format(won=col_won, move=col_move, exit=col_exit),
+                (won, movement_pct, exit_price, fp_id))
+            conn.commit()
+    except Exception as e:
+        logging.warning("_update_fingerprint_outcome failed id={}: {}".format(fp_id, e))
+
+
+def get_best_combo_from_fingerprint(pair, rsi=50.0, bb_pos=0.5, macd=0.0,
+                                     mom=0.0, atr_pct=0.05, trend_1h=None,
+                                     d5s_dir=None, d10s_dir=None, d15s_dir=None,
+                                     min_samples=5):
+    """
+    Uliza DB: "Fingerprint inayofanana na hii — bei ilienda wapi kwa nguvu
+    zaidi na iliwin wapi kwa uhakika zaidi?"
+
+    Inaangalia zote 6: BUY 1m, BUY 2m, BUY 3m, SELL 1m, SELL 2m, SELL 3m
+    Bila kujali indicators zilisema nini — inaangalia movement halisi ya bei.
+
+    Fuzzy match: RSI ±12, BB ±0.15
+
+    Scoring kwa kila combo:
+      - Win rate (uzito 50%)
+      - Average movement ya winners (uzito 50%) — movement kubwa = ushindi imara
+      Combo yenye score kubwa zaidi ndiyo inachaguliwa.
+
+    Returns dict au None:
+      {direction, tf_mins, win_rate, avg_movement, sample_n, score}
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                results = {}
+
+                for tf_m in [1, 2, 3]:
+                    won_col  = "won_{}m".format(tf_m)
+                    move_col = "move_{}m".format(tf_m)
+
+                    # Angalia zote mbili: BUY na SELL kwa TF hii
+                    cur.execute("""
+                        SELECT
+                            signal_dir,
+                            COUNT(*) AS total,
+                            SUM(CASE WHEN {won} = TRUE THEN 1 ELSE 0 END) AS wins,
+                            AVG(CASE WHEN {won} = TRUE THEN {move} ELSE NULL END) AS avg_move_win
+                        FROM trend_fingerprint_results
+                        WHERE pair = %s
+                          AND {won} IS NOT NULL
+                          AND ABS(rsi - %s) <= 12
+                          AND ABS(bb_pos - %s) <= 0.15
+                          AND created_at >= NOW() - INTERVAL '30 days'
+                        GROUP BY signal_dir
+                        HAVING COUNT(*) >= %s
+                    """.format(won=won_col, move=move_col),
+                    (pair, float(rsi), float(bb_pos), min_samples))
+
+                    for r in cur.fetchall():
+                        direction = str(r["signal_dir"])
+                        total     = int(r["total"])
+                        wins      = int(r["wins"])
+                        wr        = wins / total if total > 0 else 0.0
+                        avg_move  = float(r["avg_move_win"] or 0.0)
+
+                        # Score: win rate (50%) + movement imara (50%)
+                        # movement normalized: 0.10% = full score
+                        move_score = min(1.0, avg_move / 0.10)
+                        score = wr * 0.50 + move_score * 0.50
+
+                        key = (direction, tf_m)
+                        results[key] = {
+                            "direction":    direction,
+                            "tf_mins":      tf_m,
+                            "win_rate":     wr,
+                            "avg_movement": avg_move,
+                            "sample_n":     total,
+                            "score":        score,
+                        }
+
+        if not results:
+            return None
+
+        # Chagua combo yenye score kubwa zaidi kati ya zote 6
+        best = max(results.values(), key=lambda x: x["score"])
+
+        # Minimum: win_rate lazima iwe > 50% na sample za kutosha
+        if best["win_rate"] <= 0.50:
+            return None
+
+        logging.info("FP_BEST {}: dir={} tf={}m wr={:.0f}% move={:.4f}% n={} score={:.3f}".format(
+            pair, best["direction"], best["tf_mins"],
+            best["win_rate"] * 100, best["avg_movement"],
+            best["sample_n"], best["score"]))
+
+        return best
+
+    except Exception as e:
+        logging.warning("get_best_combo_from_fingerprint failed {}: {}".format(pair, e))
+        return None
+
+
+# ============================================================
+# BACKGROUND SCANNER - kila sekunde 10, non-OTC tu, soko wazi
+# ============================================================
+
+# In-memory store ya bg scan fingerprints zinazongoja outcomes
+# {fp_id: {pair, direction, entry, expiry_1m, expiry_2m, expiry_3m}}
+_bg_fp_pending: dict = {}
+
+
+async def _bg_scan_and_learn():
+    """
+    Background scanner: kila sekunde 10, scan major/popular/minor pairs,
+    weka fingerprint + virtual trades 1m/2m/3m sambamba.
+    Inaendelea wakati wote soko liko wazi (non-OTC hours).
+    """
+    now = time.time()
+
+    for pair in _BG_SCAN_PAIRS:
+        try:
+            # Pata indicators za sasa
+            real_pair = OTC_TO_REAL.get(pair, pair)
+            yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+            if not yf_sym:
+                continue
+
+            # Pata bei ya sasa
+            entry_price = _fetch_current_price(pair)
+            if entry_price is None:
+                continue
+
+            # Pata indicators haraka (tumia cache kama ipo)
+            ind = _fetch_real_indicators(pair)
+            if ind is None:
+                continue
+
+            rsi_v    = ind.get("rsi", 50.0)
+            bb_pos_v = ind.get("bb_pos", 0.5)
+            macd_v   = ind.get("macd", 0.0)
+            mom_v    = ind.get("mom", 0.0)
+            atr_v    = ind.get("atr", 0.05) if "atr" in ind else 0.05
+            dir_v    = ind.get("direction")
+
+            if dir_v is None:
+                continue  # Hakuna direction wazi — skip
+
+            # Trend 1H (tumia cache kama ipo — si kila scan)
+            trend_1h_v = None
+            try:
+                trend_1h_v = _fetch_1h_trend(pair)
+            except Exception:
+                pass
+
+            # Deriv micro-trends (tumia cache)
+            d5s_dir = d5s_str = d10s_dir = d10s_str = d15s_dir = d15s_str = None
+            try:
+                cached = _deriv_tick_cache.get(pair)
+                if cached and (time.time() - cached.get("ts", 0)) < _DERIV_CACHE_TTL:
+                    data = cached["data"]
+                    for secs, dkey in [(5,"5_s"),(10,"10_s"),(15,"15_s")]:
+                        t = data.get(dkey, {})
+                        if secs == 5:
+                            d5s_dir = t.get("direction"); d5s_str = t.get("strength")
+                        elif secs == 10:
+                            d10s_dir = t.get("direction"); d10s_str = t.get("strength")
+                        else:
+                            d15s_dir = t.get("direction"); d15s_str = t.get("strength")
+            except Exception:
+                pass
+
+            # Hifadhi fingerprint
+            fp_id = _save_fingerprint(
+                pair=pair, signal_dir=dir_v, entry_price=entry_price,
+                rsi=rsi_v, bb_pos=bb_pos_v, macd=macd_v, mom=mom_v,
+                atr_pct=atr_v, trend_1h=trend_1h_v,
+                d5s_dir=d5s_dir, d5s_str=d5s_str,
+                d10s_dir=d10s_dir, d10s_str=d10s_str,
+                d15s_dir=d15s_dir, d15s_str=d15s_str
+            )
+
+            if fp_id is None:
+                continue
+
+            # Hifadhi kwenye memory ili tuangalie outcomes baadaye
+            _bg_fp_pending[fp_id] = {
+                "pair":      pair,
+                "direction": dir_v,
+                "entry":     entry_price,
+                "expiry_1m": now + 60,
+                "expiry_2m": now + 120,
+                "expiry_3m": now + 180,
+                "done_1m":   False,
+                "done_2m":   False,
+                "done_3m":   False,
+            }
+
+        except Exception as e:
+            logging.warning("bg_scan pair {} failed: {}".format(pair, e))
+            continue
+
+
+async def _bg_check_fingerprint_outcomes():
+    """
+    Angalia fingerprints zilizopita expiry, hifadhi outcomes.
+    Inaitwa kila sekunde 10 sambamba na _bg_scan_and_learn().
+    """
+    now = time.time()
+    done_ids = []
+
+    for fp_id, trade in list(_bg_fp_pending.items()):
+        pair      = trade["pair"]
+        direction = trade["direction"]
+        entry     = trade["entry"]
+
+        for tf_m, exp_key, done_key in [
+            (1, "expiry_1m", "done_1m"),
+            (2, "expiry_2m", "done_2m"),
+            (3, "expiry_3m", "done_3m"),
+        ]:
+            if trade[done_key]:
+                continue
+            if now < trade[exp_key]:
+                continue
+
+            # Expiry imefika — angalia bei ya sasa
+            exit_price = _fetch_current_price(pair)
+            if exit_price is None:
+                trade[done_key] = True
+                continue
+
+            raw_diff     = exit_price - entry
+            movement_pct = abs(raw_diff) / (entry + 1e-9) * 100
+            won          = (raw_diff > 0) if direction == "BUY" else (raw_diff < 0)
+
+            _update_fingerprint_outcome(fp_id, tf_m, won, movement_pct, exit_price)
+            trade[done_key] = True
+
+            logging.info("FP_OUTCOME: {} id={} {}m dir={} {} move={:.4f}%".format(
+                pair, fp_id, tf_m, direction, "WIN" if won else "LOSS", movement_pct))
+
+        # Kama zote 3 zimekamilika — ondoa kutoka memory
+        if trade["done_1m"] and trade["done_2m"] and trade["done_3m"]:
+            done_ids.append(fp_id)
+
+    for fp_id in done_ids:
+        _bg_fp_pending.pop(fp_id, None)
+
+
+async def background_learning_engine():
+    """
+    Main loop ya background learning.
+    Kila sekunde 10:
+      - Scan pairs na hifadhi fingerprints (soko wazi tu)
+      - Angalia outcomes za fingerprints zilizopita
+    """
+    logging.info("Background Learning Engine v50 starting...")
+    while True:
+        try:
+            if not is_market_closed():
+                await _bg_scan_and_learn()
+            await _bg_check_fingerprint_outcomes()
+        except Exception as e:
+            logging.warning("background_learning_engine error: {}".format(e))
+        await asyncio.sleep(10)
+
+
+# ============================================================
+
 # _virtual_trades - DB is source of truth, in-memory dict is runtime cache only
 _virtual_trades: dict = {}
 
@@ -10775,12 +11185,27 @@ def _quick_pair_quality_check(pair):
 
 def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
-    Return top 5 pairs by win rate with quality screening:
-    - Must not be flat/dead market (ATR check)
-    - Must have clear MTF direction
-    - NN model accuracy must be acceptable
-    Only returns pairs that exist in ALL_PAIRS.
+    Return top 5 pairs by win rate — major/popular/minor forex only (non-OTC).
+    Exotic pairs, indices, and illiquid pairs are excluded from Bot Top Picks.
+    Chagua bora zaidi hata kama win rate ni chini ya 50%.
     """
+    # Orodha inayoruhusiwa kwa Bot Top Picks (non-OTC)
+    # Tier 1: Majors, Tier 2: Popular crosses, Tier 3: Minor crosses
+    _ALLOWED_NONOTC = [
+        # Tier 1 - Majors
+        "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+        "AUD/USD", "NZD/USD", "USD/CAD",
+        # Tier 2 - Popular crosses
+        "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
+        "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
+        # Tier 3 - Minor crosses
+        "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
+        "NZD/JPY", "NZD/CAD", "NZD/CHF",
+        "CHF/JPY", "CAD/JPY", "CAD/CHF",
+        "EUR/NZD", "GBP/NZD", "USD/MXN",
+    ]
+    _ALLOWED_NONOTC_SET = set(_ALLOWED_NONOTC)
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -10791,9 +11216,10 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                     WHERE (wins_today + losses_today) >= 3
                       AND DATE(updated_at) = CURRENT_DATE
                     ORDER BY win_rate DESC, wins_today DESC
-                    LIMIT 30
+                    LIMIT 50
                 """)
                 rows = [dict(r) for r in cur.fetchall()]
+
         # Fallback to all-time if no today data
         if not rows:
             with get_conn() as conn:
@@ -10802,21 +11228,22 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                         SELECT pair, wins, losses,
                                ROUND(wins::numeric / NULLIF(wins+losses,0) * 100, 1) AS win_rate
                         FROM pair_stats
-                        WHERE (wins + losses) >= 5
+                        WHERE (wins + losses) >= 3
                         ORDER BY win_rate DESC, wins DESC
-                        LIMIT 30
+                        LIMIT 50
                     """)
                     rows = [dict(r) for r in cur.fetchall()]
 
-        # Filter to only pairs in ALL_PAIRS
-        valid = {p for p in ALL_PAIRS}
+        valid = set(ALL_PAIRS)
         rows = [r for r in rows if r["pair"] in valid]
+
         if otc_only:
             rows = [r for r in rows if "OTC" in r["pair"]]
         elif non_otc_only:
-            rows = [r for r in rows if "OTC" not in r["pair"]]
+            # Non-OTC: restrict to allowed list only (majors/popular/minor)
+            rows = [r for r in rows if r["pair"] in _ALLOWED_NONOTC_SET]
 
-        # -- Quality screening - remove flat/dead/low-quality pairs --
+        # Quality screening - skip flat/dead pairs
         screened = []
         skipped  = 0
         for r in rows:
@@ -10829,50 +11256,29 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
                 skipped += 1
                 logging.info("Bot Pick screening: {} skipped - {}".format(r["pair"], reason))
 
-        # If screening removed too many, fill from broader pool without quality filter
+        # Fallback: fill remaining slots from allowed pool (ordered by tier)
+        # Chagua bora zaidi hata kama data haina win rate nzuri
         if len(screened) < 5:
             already = {r["pair"] for r in screened}
-            # Non-OTC fallback: priority pairs first, then exotics
-            _PRIORITY_NONOTC = [
-                # Tier 1: Major forex pairs (highest liquidity + data quality)
-                "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-                "AUD/USD", "NZD/USD", "USD/CAD",
-                # Tier 2: Popular crosses
-                "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
-                "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
-                # Tier 3: Minor crosses
-                "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
-                "NZD/JPY", "NZD/CAD", "NZD/CHF",
-                "CHF/JPY", "CAD/JPY", "CAD/CHF",
-                "EUR/NZD", "GBP/NZD", "USD/MXN",
-                # Tier 4: Indices (last - less reliable data for 1m/2m/3m)
-                "US100", "SP500", "US30", "GER40", "UK100",
-                "JPN225", "AUS200", "CAC 40", "SMI 20", "E35EUR",
-            ]
             if otc_only:
                 fallback_pool = [p for p in ALL_PAIRS if "OTC" in p and p not in already]
+                random.shuffle(fallback_pool)
             elif non_otc_only:
-                # Priority pairs first, then remaining non-OTC
-                fallback_pool = (
-                    [p for p in _PRIORITY_NONOTC if p not in already] +
-                    [p for p in ALL_PAIRS if "OTC" not in p and "/" in p
-                     and p not in already and p not in _PRIORITY_NONOTC]
-                )
+                # Tier order: majors first, then popular, then minor
+                fallback_pool = [p for p in _ALLOWED_NONOTC if p not in already]
             else:
                 fallback_pool = [p for p in ALL_PAIRS if p not in already]
-            # No shuffle for non-OTC - keep priority order
-            if not non_otc_only:
                 random.shuffle(fallback_pool)
+
             for p in fallback_pool:
                 if len(screened) >= 5:
                     break
-                # Only light check for fallback (no heavy MTF)
                 _, is_dead = _check_volatility(p) if "OTC" not in p else (0.05, False)
                 if not is_dead:
                     screened.append({"pair": p, "wins": 0, "losses": 0, "win_rate": 0})
 
         if skipped > 0:
-            logging.info("Bot Pick: screened {} pairs, skipped {} flat/low-quality".format(
+            logging.info("Bot Pick: screened {} pairs, skipped {} flat".format(
                 len(screened), skipped))
 
         return screened[:5]
@@ -10987,6 +11393,10 @@ async def run_bot():
     # -- Launch Virtual Trading Engine in background ------------
     asyncio.create_task(virtual_trading_engine())
     print("Virtual trading engine started.")
+
+    # -- Launch Background Learning Engine (v50) ---------------
+    asyncio.create_task(background_learning_engine())
+    print("Background learning engine started.")
 
     # -- Launch stats reset loop (every 30 minutes) -------------
     asyncio.create_task(_stats_reset_loop())
