@@ -1120,6 +1120,13 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (user_id, msg_type)
                 );
+                CREATE TABLE IF NOT EXISTS user_msg_stack (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    msg_id BIGINT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_msg_stack_user_id ON user_msg_stack (user_id);
                 CREATE TABLE IF NOT EXISTS last_signal_time (
                     user_id BIGINT PRIMARY KEY,
                     signal_time DOUBLE PRECISION NOT NULL
@@ -2128,6 +2135,15 @@ def inactivity_reset(user_id, chat_id, msg_id=None):
 def inactivity_clear(user_id):
     """Remove all tracking for user (after cleanup or fresh start)."""
     USER_INACTIVITY.pop(user_id, None)
+    # Also clear message stack so expired sessions start fresh
+    USER_MSG_STACK.pop(user_id, None)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM user_msg_stack WHERE user_id=%s", (user_id,))
+            conn.commit()
+    except Exception:
+        pass
 
 def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
@@ -2136,9 +2152,58 @@ def inactivity_get_msgs(user_id):
 # DB is source of truth - in-memory dicts are cache only
 LAST_SIGNAL_MSG = {}
 LAST_BOT_MSG    = {}
+# Stack of ALL bot message IDs per user - used for full chat cleanup
+USER_MSG_STACK  = {}  # user_id -> [msg_id, ...]
+
+def push_msg_id(user_id, msg_id):
+    """Push a message ID onto the user's message stack (DB + in-memory)."""
+    if msg_id is None:
+        return
+    try:
+        USER_MSG_STACK.setdefault(user_id, []).append(msg_id)
+    except Exception:
+        pass
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_msg_stack (user_id, msg_id) VALUES (%s, %s)",
+                    (user_id, msg_id)
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+def _pop_all_msg_ids(user_id):
+    """Pop all message IDs from the user's stack (DB + in-memory). Returns list."""
+    ids = list(USER_MSG_STACK.pop(user_id, []))
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_msg_stack WHERE user_id=%s RETURNING msg_id",
+                    (user_id,)
+                )
+                rows = cur.fetchall()
+            conn.commit()
+        for r in rows:
+            mid = r["msg_id"]
+            if mid not in ids:
+                ids.append(mid)
+    except Exception:
+        pass
+    return ids
 
 async def delete_last_signal(bot, chat_id, user_id):
-    """Delete previous signal AND last bot message AND analyzing message if exists."""
+    """Delete ALL previous bot messages for this user (full stack clean)."""
+    # 1. Delete from new stack
+    all_ids = _pop_all_msg_ids(user_id)
+    for msg_id in all_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+    # 2. Also clear old last_msg_store for backward compat
     for msg_type in ["signal", "bot", "analyzing"]:
         msg_id = None
         try:
@@ -2153,10 +2218,9 @@ async def delete_last_signal(bot, chat_id, user_id):
             if row:
                 msg_id = row["msg_id"]
         except Exception:
-            # fallback to in-memory
             store = LAST_SIGNAL_MSG if msg_type == "signal" else LAST_BOT_MSG
             msg_id = store.pop(user_id, None)
-        if msg_id:
+        if msg_id and msg_id not in all_ids:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception:
@@ -2168,6 +2232,7 @@ LAST_ANALYZING_MSG = {}
 def save_analyzing_msg(user_id, msg_id):
     """Save analyzing message ID so it can be deleted when next pair is selected."""
     LAST_ANALYZING_MSG[user_id] = msg_id
+    push_msg_id(user_id, msg_id)  # add to full stack
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2206,6 +2271,7 @@ async def delete_analyzing_msg(bot, chat_id, user_id):
 
 def save_last_signal_msg(user_id, msg_id):
     LAST_SIGNAL_MSG[user_id] = msg_id  # in-memory cache
+    push_msg_id(user_id, msg_id)  # add to full stack
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2221,6 +2287,7 @@ def save_last_signal_msg(user_id, msg_id):
 
 def save_last_bot_msg(user_id, msg_id):
     LAST_BOT_MSG[user_id] = msg_id  # in-memory cache
+    push_msg_id(user_id, msg_id)  # add to full stack
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -3903,6 +3970,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
             try:
                 sent = await bot.send_message(chat_id=chat_id, text=result_text,
                                               parse_mode="Markdown")
+                push_msg_id(user_id, sent.message_id)
                 with get_conn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -4421,11 +4489,11 @@ def _check_signal_stability(pair, proposed_direction, window_minutes=5):
                 cur.execute(
                     """SELECT direction FROM signal_history
                        WHERE pair=%s AND created_at >= %s
-                       ORDER BY created_at DESC LIMIT 10""",
+                       ORDER BY created_at DESC LIMIT 5""",
                     (pair, cutoff)
                 )
                 rows = cur.fetchall()
-        if not rows or len(rows) < 3:
+        if not rows or len(rows) < 2:
             return True   # Not enough history - allow signal
 
         directions = [r["direction"] for r in rows]
@@ -7677,7 +7745,7 @@ def generate_signal(pair):
 
     # -- SIGNAL STABILITY FILTER (non-OTC only) --------------
     # OTC always produces a signal - stability filter does not apply.
-    if not is_otc and is_filter_on("stability") and not _check_signal_stability(pair, direction, window_minutes=5):
+    if not is_otc and is_filter_on("stability") and not _check_signal_stability(pair, direction, window_minutes=2):
         timeframe = 0
         record_signal(pair, direction)
         return {
@@ -8841,9 +8909,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pair:
             await context.bot.send_message(chat_id=chat, text="❌ Pair not found.", reply_markup=pairs_keyboard())
             return
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
-        await context.bot.send_message(
+        _m = await context.bot.send_message(
             chat_id=chat,
             text=(
                 "⚡ *{}*\n\n"
@@ -8854,6 +8923,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=otc_mode_keyboard(pair)
         )
+        push_msg_id(user_id, _m.message_id)
         return
 
     # -- OTC: "Normal (minutes)" chosen - continue with normal signal flow -
@@ -8869,6 +8939,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_spam(user_id):
             return
         inactivity_reset(user_id, chat)
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
 
@@ -8877,9 +8948,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_user_signal_state(user_id, pair)  # Force fresh always
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
+        if cm: push_msg_id(user_id, cm.message_id)
         is_non_otc = False  # pair is OTC
-        entry_price = None
-        trend = get_trend_direction(pair)
         direction = "BUY"; timeframe = 1; strength = 180; flip_count = 0; sig = None
 
         try:
@@ -8947,13 +9017,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ *Signal unavailable* — please try again.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx_str))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
             return
         finally:
             _anim_stop.set()
+            try:
+                if cm: await cm.delete()
+            except: pass
 
         save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None)
         if check["action"] != "fresh":
@@ -9029,66 +9102,84 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Only "user chose from keyboard" sets _user_chose_tf=True in sel_ handler
         # After signal is sent once, subsequent Get More = auto
         _user_chose_tf = context.user_data.pop("_user_chose_tf", False)
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
-        mark_pair_active(pair)
-        sig, _from_cache = await safe_generate_signal_cached(pair)
-        if _from_cache:
-            logging.info("PREFETCH HIT nonotctf {}: signal served from cache".format(pair))
-        _anim_stop.set()
-        direction = sig["direction"]
-        timeframe = chosen_tf
+        if cm: push_msg_id(user_id, cm.message_id)
 
-        # -- Deriv micro-candle: MSINGI wa direction na TF -------
-        # Sekunde (5s/10s/15s) zinaaamua direction na timeframe
-        if pair in DERIV_SYMBOLS:
-            try:
-                _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
-                logging.info("Deriv best_tf={} dir={} str={} - {}".format(
-                    _best_tf, _micro_dir, _best_str, _best_reason))
-                if _best_tf is not None and _micro_dir is not None:
-                    # Deriv sekunde inaamua - override direction na TF
-                    direction = _micro_dir
-                    timeframe = _best_tf
-                else:
-                    # Deriv FLAT - angalia nguvu ya MTF kabla ya kutuma signal
-                    _weak_agree = sig.get("indicators_agree", 0) < 4
-                    _no_1h      = sig.get("trend_1h") is None
-                    if _weak_agree and _no_1h:
-                        # Deriv FLAT + MTF dhaifu + hakuna 1H trend → no signal
-                        _anim_stop.set()
-                        try: await cm.delete()
-                        except: pass
-                        _nsm = await context.bot.send_message(
-                            chat_id=chat,
-                            text="🟡 *No signal available* - market is unclear right now. Please try again in a few minutes.",
-                            parse_mode="Markdown",
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
-                            ])
-                        )
-                        save_last_bot_msg(user_id, _nsm.message_id)
-                        return
-                    # Deriv FLAT lakini MTF ina nguvu → tumia MTF direction, chosen_tf
-                    logging.info("Deriv FLAT for {} - MTF strong enough, using MTF direction".format(pair))
+        try:
+            mark_pair_active(pair)
+            sig, _from_cache = await safe_generate_signal_cached(pair)
+            if _from_cache:
+                logging.info("PREFETCH HIT nonotctf {}: signal served from cache".format(pair))
+            _anim_stop.set()
+            direction = sig["direction"]
+            timeframe = chosen_tf
+
+            # -- Deriv micro-candle: MSINGI wa direction na TF -------
+            # Sekunde (5s/10s/15s) zinaaamua direction na timeframe
+            if pair in DERIV_SYMBOLS:
+                try:
+                    _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
+                    logging.info("Deriv best_tf={} dir={} str={} - {}".format(
+                        _best_tf, _micro_dir, _best_str, _best_reason))
+                    if _best_tf is not None and _micro_dir is not None:
+                        # Deriv sekunde inaamua - override direction na TF
+                        direction = _micro_dir
+                        timeframe = _best_tf
+                    else:
+                        # Deriv FLAT - angalia nguvu ya MTF kabla ya kutuma signal
+                        _weak_agree = sig.get("indicators_agree", 0) < 4
+                        _no_1h      = sig.get("trend_1h") is None
+                        if _weak_agree and _no_1h:
+                            # Deriv FLAT + MTF dhaifu + hakuna 1H trend → no signal
+                            await delete_last_signal(context.bot, chat, user_id)
+                            _nsm = await context.bot.send_message(
+                                chat_id=chat,
+                                text="🟡 *No signal available* - market is unclear right now. Please try again in a few minutes.",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                                ])
+                            )
+                            save_last_bot_msg(user_id, _nsm.message_id)
+                            return
+                        # Deriv FLAT lakini MTF ina nguvu → tumia MTF direction, chosen_tf
+                        logging.info("Deriv FLAT for {} - MTF strong enough, using MTF direction".format(pair))
+                        timeframe = chosen_tf
+                except Exception as _de:
+                    logging.warning("Deriv pick_best_tf error: {} - falling back to MTF".format(_de))
                     timeframe = chosen_tf
-            except Exception as _de:
-                logging.warning("Deriv pick_best_tf error: {} - falling back to MTF".format(_de))
-                timeframe = chosen_tf
-        else:
-            timeframe = chosen_tf  # Pair haipo Deriv - tumia chosen_tf
-        # -----------------------------------------------------
+            else:
+                timeframe = chosen_tf  # Pair haipo Deriv - tumia chosen_tf
+            # -----------------------------------------------------
 
-        save_user_signal_state(user_id, pair, direction, timeframe, 0)
-        try: await cm.delete()
-        except: pass
-        context.user_data["_nonotc_sig"]   = sig
-        context.user_data["_nonotc_dir"]   = direction
-        context.user_data["_nonotc_tf"]    = timeframe
-        context.user_data["_nonotc_pair"]  = pair
-        context.user_data["_nonotc_idx"]   = idx_str
-        await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
+            save_user_signal_state(user_id, pair, direction, timeframe, 0)
+            context.user_data["_nonotc_sig"]   = sig
+            context.user_data["_nonotc_dir"]   = direction
+            context.user_data["_nonotc_tf"]    = timeframe
+            context.user_data["_nonotc_pair"]  = pair
+            context.user_data["_nonotc_idx"]   = idx_str
+            await _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str)
+
+        except Exception as _nntf_err:
+            logging.warning("nonotctf_ signal failed {}: {}".format(pair, _nntf_err))
+            await delete_last_signal(context.bot, chat, user_id)
+            _nsm = await context.bot.send_message(
+                chat_id=chat,
+                text="⚠️ *Signal unavailable* — please try again.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                ])
+            )
+            save_last_bot_msg(user_id, _nsm.message_id)
+        finally:
+            _anim_stop.set()
+            try:
+                if cm: await cm.delete()
+            except: pass
         return
 
     # -- OTC: "Seconds" chosen - show seconds keyboard ------------------
@@ -9098,12 +9189,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pair:
             await context.bot.send_message(chat_id=chat, text="❌ Pair not found.", reply_markup=pairs_keyboard())
             return
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
 
         # Non-subscribers: show seconds keyboard but notify it is subscribers only
         if not is_licensed(user_id):
-            await context.bot.send_message(
+            _m = await context.bot.send_message(
                 chat_id=chat,
                 text=(
                     "🔒 *Seconds signals - Subscribers Only*\n\n"
@@ -9119,15 +9211,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔙 Back", callback_data="otcback_{}".format(idx_str))],
                 ])
             )
+            push_msg_id(user_id, _m.message_id)
             return
 
         # Subscribers: show seconds keyboard
-        await context.bot.send_message(
+        _m = await context.bot.send_message(
             chat_id=chat,
             text="⏱ *{}*\n\nChoose signal duration:".format(pair),
             parse_mode="Markdown",
             reply_markup=otc_seconds_keyboard(pair)
         )
+        push_msg_id(user_id, _m.message_id)
         return
 
     # -- OTC: Seconds timeframe selected - generate seconds signal --------
@@ -9164,72 +9258,89 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         inactivity_reset(user_id, chat)
 
+        await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
+        if cm: push_msg_id(user_id, cm.message_id)
 
-        sig       = await safe_generate_signal(pair)  # OTC - always returns signal
-        _anim_stop.set()
-        direction = sig["direction"]
-        strength  = sig["strength"]
+        try:
+            sig       = await safe_generate_signal(pair)  # OTC - always returns signal
+            _anim_stop.set()
+            direction = sig["direction"]
+            strength  = sig["strength"]
 
-        trend_dir = get_trend_direction(pair)
-        if trend_dir is not None:
-            direction = trend_dir
-        elif sig.get("indicators_agree", 7) < 4 and "OTC" not in pair:
-            try: await cm.delete()
-            except: pass
+            trend_dir = get_trend_direction(pair)
+            if trend_dir is not None:
+                direction = trend_dir
+            elif sig.get("indicators_agree", 7) < 4 and "OTC" not in pair:
+                await delete_last_signal(context.bot, chat, user_id)
+                _nsm = await context.bot.send_message(
+                    chat_id=chat,
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                    ])
+                )
+                save_last_bot_msg(user_id, _nsm.message_id)
+                return
+
+            # timeframe in DB: chosen_secs (store as-is; signal_keyboard uses pair only)
+            # Use 1 minute minimum for DB schema (last_timeframe column), but track seconds in caption
+            save_user_signal_state(user_id, pair, direction, 1, 0)
+
+            ib    = direction == "BUY"
+            img   = get_buy_image() if ib else get_sell_image()
+            arrow = "Up 🟢" if ib else "Down 🔴"
+            await delete_last_signal(context.bot, chat, user_id)
+
+            cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%".format(pair, arrow, chosen_secs, strength)
+            sent_msg = await context.bot.send_photo(
+                chat_id=chat,
+                photo=img,
+                caption=cap,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
+                                          callback_data="otctf_{}_{}".format(idx_str, chosen_secs))],
+                ])
+            )
+            save_last_signal_msg(user_id, sent_msg.message_id)
+            inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
+
+            async def _inact_otcs(uid, cid):
+                await asyncio.sleep(INACTIVITY_MINUTES * 60)
+                for mid in inactivity_get_msgs(uid):
+                    try: await context.bot.delete_message(chat_id=cid, message_id=mid)
+                    except: pass
+                inactivity_clear(uid)
+                try:
+                    await context.bot.send_message(chat_id=cid,
+                        text="⏰ *Your session has expired.*\n\n_Tap Start below to open a fresh session._",
+                        parse_mode="Markdown", reply_markup=expired_signal_keyboard())
+                except: pass
+            task = asyncio.create_task(_inact_otcs(user_id, chat))
+            USER_INACTIVITY[user_id]["task"] = task
+
+        except Exception as _otctf_err:
+            logging.warning("otctf_ signal failed {}: {}".format(pair, _otctf_err))
             await delete_last_signal(context.bot, chat, user_id)
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
+                text="⚠️ *Signal unavailable* — please try again.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="otctf_{}_{}".format(idx_str, chosen_secs))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
-        # timeframe in DB: chosen_secs (store as-is; signal_keyboard uses pair only)
-        # Use 1 minute minimum for DB schema (last_timeframe column), but track seconds in caption
-        save_user_signal_state(user_id, pair, direction, 1, 0)
-
-        ib    = direction == "BUY"
-        img   = get_buy_image() if ib else get_sell_image()
-        arrow = "Up 🟢" if ib else "Down 🔴"
-        try: await cm.delete()
-        except: pass
-        await delete_last_signal(context.bot, chat, user_id)
-
-        cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%".format(pair, arrow, chosen_secs, strength)
-        sent_msg = await context.bot.send_photo(
-            chat_id=chat,
-            photo=img,
-            caption=cap,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Get More ({}s)".format(chosen_secs),
-                                      callback_data="otctf_{}_{}".format(idx_str, chosen_secs))],
-            ])
-        )
-        save_last_signal_msg(user_id, sent_msg.message_id)
-        inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
-
-        async def _inact_otcs(uid, cid):
-            await asyncio.sleep(INACTIVITY_MINUTES * 60)
-            for mid in inactivity_get_msgs(uid):
-                try: await context.bot.delete_message(chat_id=cid, message_id=mid)
-                except: pass
-            inactivity_clear(uid)
+        finally:
+            _anim_stop.set()
             try:
-                await context.bot.send_message(chat_id=cid,
-                    text="⏰ *Your session has expired.*\n\n_Tap Start below to open a fresh session._",
-                    parse_mode="Markdown", reply_markup=expired_signal_keyboard())
+                if cm: await cm.delete()
             except: pass
-        task = asyncio.create_task(_inact_otcs(user_id, chat))
-        USER_INACTIVITY[user_id]["task"] = task
         return
 
     if data.startswith("getmore_"):
@@ -9245,6 +9356,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Anti-spam
         if is_spam(user_id):
             return
+
+        # Delete ALL previous bot messages for clean chart
+        await delete_last_signal(context.bot, chat, user_id)
 
         # Delete result message if present
         try:
@@ -9315,6 +9429,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_user_signal_state(user_id, pair)
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
+        if cm: push_msg_id(user_id, cm.message_id)
 
         _is_non_otc_pair = "OTC" not in pair and pair in YAHOO_SYMBOLS
         _mtf_result = None
@@ -9332,177 +9447,186 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as _e:
                 logging.warning("MTF pre-check failed {}: {}".format(pair, _e))
 
-        sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
-        _anim_stop.set()
-        direction = sig["direction"]
-        strength  = sig["strength"]
-
-        # -- A: SIGNAL CONFIRMATION DELAY ---------------------
-        # Wait 4s and recheck direction before sending to user
-        _is_otc_confirm = "OTC" in pair
         try:
-            direction = await asyncio.wait_for(
-                _confirm_signal_direction(pair, direction, _is_otc_confirm),
-                timeout=6.0
-            )
-        except asyncio.TimeoutError:
-            logging.warning("_confirm_signal_direction timeout for {}".format(pair))
-            # keep original direction
-        # -----------------------------------------------------
+            sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
+            _anim_stop.set()
+            direction = sig["direction"]
+            strength  = sig["strength"]
 
-        # -- DERIV SECONDS - MSINGI wa TF na direction kwa non-OTC --
-        _mtf_cap = None
-        _gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-
-        if _gm_is_non_otc and pair in DERIV_SYMBOLS:
+            # -- A: SIGNAL CONFIRMATION DELAY ---------------------
+            # Wait 4s and recheck direction before sending to user
+            _is_otc_confirm = "OTC" in pair
             try:
-                _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
-                logging.info("getmore Deriv: pair={} tf={} dir={} str={} - {}".format(
-                    pair, _best_tf, _micro_dir, _best_str, _best_reason))
-                if _best_tf is not None and _micro_dir is not None:
-                    # Deriv sekunde inaamua direction na TF
-                    direction = _micro_dir
-                    timeframe = _best_tf
-                else:
-                    # Deriv FLAT - angalia nguvu ya MTF
-                    _gm_weak = sig.get("indicators_agree", 0) < 4 and sig.get("trend_1h") is None
-                    if _gm_weak:
-                        try: await cm.delete()
-                        except: pass
-                        await delete_last_signal(context.bot, chat, user_id)
-                        _nsm = await context.bot.send_message(
-                            chat_id=chat,
-                            text="🟡 *No signal available* - market is unclear. Try again in a few minutes.",
-                            parse_mode="Markdown",
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
-                            ])
-                        )
-                        save_last_bot_msg(user_id, _nsm.message_id)
-                        return
-                    logging.info("getmore Deriv FLAT for {} - MTF strong, using MTF direction".format(pair))
-            except Exception as _de:
-                logging.warning("getmore Deriv failed {}: {} - falling back to MTF".format(pair, _de))
-        elif _gm_is_non_otc:
-            # Pair haipo Deriv - tumia MTF au generate_signal timeframe
-            if _mtf_result and _mtf_result.get("direction") in ("CALL","PUT"):
-                direction = "BUY" if _mtf_result["direction"] == "CALL" else "SELL"
-                _mtf_tf   = _mtf_result["signal_type"]
-                _mtf_cap  = build_mtf_caption(
-                    pair, _mtf_result["direction"], _mtf_tf,
-                    _mtf_result["tf_labels"], _mtf_result["trend_score"],
-                    _mtf_result["near"])
-                timeframe = _pick_tf_by_pips(pair, _mtf_tf)
-            else:
-                timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
-        # ---------------------------------------------------------
+                direction = await asyncio.wait_for(
+                    _confirm_signal_direction(pair, direction, _is_otc_confirm),
+                    timeout=6.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning("_confirm_signal_direction timeout for {}".format(pair))
+                # keep original direction
+            # -----------------------------------------------------
 
-        # Flat market block
-        if sig.get("flat") and sig["timeframe"] == 0:
-            try: await cm.delete()
-            except: pass
+            # -- DERIV SECONDS - MSINGI wa TF na direction kwa non-OTC --
+            _mtf_cap = None
+            _gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+
+            if _gm_is_non_otc and pair in DERIV_SYMBOLS:
+                try:
+                    _best_tf, _best_str, _micro_dir, _best_reason = await pick_best_tf_deriv(pair)
+                    logging.info("getmore Deriv: pair={} tf={} dir={} str={} - {}".format(
+                        pair, _best_tf, _micro_dir, _best_str, _best_reason))
+                    if _best_tf is not None and _micro_dir is not None:
+                        # Deriv sekunde inaamua direction na TF
+                        direction = _micro_dir
+                        timeframe = _best_tf
+                    else:
+                        # Deriv FLAT - angalia nguvu ya MTF
+                        _gm_weak = sig.get("indicators_agree", 0) < 4 and sig.get("trend_1h") is None
+                        if _gm_weak:
+                            await delete_last_signal(context.bot, chat, user_id)
+                            _nsm = await context.bot.send_message(
+                                chat_id=chat,
+                                text="🟡 *No signal available* - market is unclear. Try again in a few minutes.",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                                ])
+                            )
+                            save_last_bot_msg(user_id, _nsm.message_id)
+                            return
+                        logging.info("getmore Deriv FLAT for {} - MTF strong, using MTF direction".format(pair))
+                except Exception as _de:
+                    logging.warning("getmore Deriv failed {}: {} - falling back to MTF".format(pair, _de))
+            elif _gm_is_non_otc:
+                # Pair haipo Deriv - tumia MTF au generate_signal timeframe
+                if _mtf_result and _mtf_result.get("direction") in ("CALL","PUT"):
+                    direction = "BUY" if _mtf_result["direction"] == "CALL" else "SELL"
+                    _mtf_tf   = _mtf_result["signal_type"]
+                    _mtf_cap  = build_mtf_caption(
+                        pair, _mtf_result["direction"], _mtf_tf,
+                        _mtf_result["tf_labels"], _mtf_result["trend_score"],
+                        _mtf_result["near"])
+                    timeframe = _pick_tf_by_pips(pair, _mtf_tf)
+                else:
+                    timeframe = _pick_tf_by_pips(pair, sig["timeframe"])
+            # ---------------------------------------------------------
+
+            # Flat market block
+            if sig.get("flat") and sig["timeframe"] == 0:
+                await delete_last_signal(context.bot, chat, user_id)
+                msg = sig.get("no_signal_reason") or "🟡 *No signal available*"
+                _nsm = await context.bot.send_message(
+                    chat_id=chat,
+                    text=msg,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
+                    ])
+                )
+                save_last_bot_msg(user_id, _nsm.message_id)
+                return
+
+            # Trend validation
+            trend_dir = get_trend_direction(pair)
+            gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
+            if trend_dir is not None:
+                direction = trend_dir
+            elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 4):
+                await delete_last_signal(context.bot, chat, user_id)
+                _nsm = await context.bot.send_message(
+                    chat_id=chat,
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                    ])
+                )
+                save_last_bot_msg(user_id, _nsm.message_id)
+                return
+            elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
+                await delete_last_signal(context.bot, chat, user_id)
+                _nsm = await context.bot.send_message(
+                    chat_id=chat,
+                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
+                    ])
+                )
+                save_last_bot_msg(user_id, _nsm.message_id)
+                return
+
+            new_flip_count = 0  # Always fresh signal - reset flip count
+
+            gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+
+            save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
+
+            # For non-OTC: capture entry price at signal time
+            gm_entry_price = None
+            if gm_is_non_otc:
+                gm_entry_price = _fetch_current_price(pair)
+                save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count, entry_price=gm_entry_price)
+
+            ib    = direction == "BUY"
+            img   = get_buy_image() if ib else get_sell_image()
+            arrow = "Up 🟢" if ib else "Down 🔴"
+            _str  = sig.get("strength", 200)
+            if isinstance(_str, int) and _str > 450:
+                _str = int(90 + (min(500, max(300, _str)) - 300) / 200 * 360)
+            elif isinstance(_str, int) and _str < 90:
+                _str = int(90 + (max(35, min(97, _str)) - 35) / 62 * 360)
+            _str = max(90, min(450, int(_str)))
+            if not is_licensed(user_id): use_free_signal(user_id)
             await delete_last_signal(context.bot, chat, user_id)
-            msg = sig.get("no_signal_reason") or "🟡 *No signal available*"
+            cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str)
+            sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
+            save_last_signal_msg(user_id, sent_msg.message_id)
+
+            if gm_is_non_otc and gm_entry_price is not None:
+                asyncio.create_task(
+                    schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
+                )
+
+            inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
+
+            async def inactivity_expire_gm(uid, cid):
+                await asyncio.sleep(INACTIVITY_MINUTES * 60)
+                msg_ids = inactivity_get_msgs(uid)
+                for mid in msg_ids:
+                    try: await context.bot.delete_message(chat_id=cid, message_id=mid)
+                    except: pass
+                inactivity_clear(uid)
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% - 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
+                        parse_mode="Markdown",
+                        reply_markup=expired_signal_keyboard()
+                    )
+                except Exception as e:
+                    logging.warning("inactivity_expire send failed: {}".format(e))
+
+            task = asyncio.create_task(inactivity_expire_gm(user_id, chat))
+            USER_INACTIVITY[user_id]["task"] = task
+
+        except Exception as _gm_err:
+            logging.warning("getmore_ signal failed {}: {}".format(pair, _gm_err))
+            await delete_last_signal(context.bot, chat, user_id)
             _nsm = await context.bot.send_message(
                 chat_id=chat,
-                text=msg,
+                text="⚠️ *Signal unavailable* — please try again.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx_str))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
-        # Trend validation
-        trend_dir = get_trend_direction(pair)
-        gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
-        if trend_dir is not None:
-            direction = trend_dir
-        elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 4):
-            try: await cm.delete()
-            except: pass
-            await delete_last_signal(context.bot, chat, user_id)
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-        elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
-            try: await cm.delete()
-            except: pass
-            await delete_last_signal(context.bot, chat, user_id)
-            _nsm = await context.bot.send_message(
-                chat_id=chat,
-                text=sig.get("no_signal_reason") or "🟡 *No signal available*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
-                ])
-            )
-            save_last_bot_msg(user_id, _nsm.message_id)
-            return
-
-        new_flip_count = 0  # Always fresh signal - reset flip count
-
-        gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-
-        save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
-
-        # For non-OTC: capture entry price at signal time
-        gm_entry_price = None
-        if gm_is_non_otc:
-            gm_entry_price = _fetch_current_price(pair)
-            save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count, entry_price=gm_entry_price)
-
-        ib    = direction == "BUY"
-        img   = get_buy_image() if ib else get_sell_image()
-        arrow = "Up 🟢" if ib else "Down 🔴"
-        _str  = sig.get("strength", 200)
-        if isinstance(_str, int) and _str > 450:
-            _str = int(90 + (min(500, max(300, _str)) - 300) / 200 * 360)
-        elif isinstance(_str, int) and _str < 90:
-            _str = int(90 + (max(35, min(97, _str)) - 35) / 62 * 360)
-        _str = max(90, min(450, int(_str)))
-        if not is_licensed(user_id): use_free_signal(user_id)
-        try: await cm.delete()
-        except: pass
-        await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str)
-        sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
-        save_last_signal_msg(user_id, sent_msg.message_id)
-
-        if gm_is_non_otc and gm_entry_price is not None:
-            asyncio.create_task(
-                schedule_result_check(context.bot, chat, user_id, pair, direction, timeframe, gm_entry_price)
-            )
-
-        inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
-
-        async def inactivity_expire_gm(uid, cid):
-            await asyncio.sleep(INACTIVITY_MINUTES * 60)
-            msg_ids = inactivity_get_msgs(uid)
-            for mid in msg_ids:
-                try: await context.bot.delete_message(chat_id=cid, message_id=mid)
-                except: pass
-            inactivity_clear(uid)
+        finally:
+            _anim_stop.set()
             try:
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text="⏰ *Your session has expired.*\n\n🌟 *Join our VIP today!*\n\n✅ Win rate 90% - 98%\n✅ 100+ trading pairs\n✅ Unlimited signals\n\n_Tap *Start* below to open a fresh chart._",
-                    parse_mode="Markdown",
-                    reply_markup=expired_signal_keyboard()
-                )
-            except Exception as e:
-                logging.warning("inactivity_expire send failed: {}".format(e))
-
-        task = asyncio.create_task(inactivity_expire_gm(user_id, chat))
-        USER_INACTIVITY[user_id]["task"] = task
+                if cm: await cm.delete()
+            except: pass
         return
 
     if data.startswith("sel_"):
@@ -9517,6 +9641,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         # Auto-routing: wrong pair type for current market hours
         closed = is_market_closed()
+        await delete_last_signal(context.bot, chat, user_id)
         if closed and "OTC" not in pair:
             # Market closed - non-OTC not available
             reason = _market_closed_reason()
@@ -9575,6 +9700,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # -- OTC: Show seconds keyboard (mtumiaji achague mwenyewe) ---
         if "OTC" in pair:
+            await delete_last_signal(context.bot, chat, user_id)
             if not is_licensed(user_id):
                 _otcm = await context.bot.send_message(
                     chat_id=chat,
@@ -9622,6 +9748,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _anim_stop.set()  # hakuna animation - tayari imekamilika
         else:
             cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
+            if cm: push_msg_id(user_id, cm.message_id)
 
         # v53 FIX: Hifadhi variables hapa - zitumike nje ya try block pia
         direction  = "BUY"
@@ -9716,7 +9843,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ *Signal unavailable* — please try again in a moment.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))]
+                    [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(idx))]
                 ])
             )
             save_last_bot_msg(user_id, _nsm.message_id)
@@ -9724,6 +9851,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             # v53 FIX: Hakikisha animation imesimama DAIMA - hata kama kuna return au exception
             _anim_stop.set()
+            try:
+                if cm: await cm.delete()
+            except: pass
 
         # Save state with updated flip_count
         # entry_price was already captured at signal request time (above)
