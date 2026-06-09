@@ -3777,90 +3777,145 @@ def get_cooldown_remaining(user_id, pair):
 
 async def schedule_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price):
     """
-    Wait for candle to expire, add 5s buffer for candle to fully close,
-    then check price once and send result.
+    v53: Multi-TF outcome learning.
+
+    Badala ya kuangalia TF moja tu iliyotumwa, sasa tunaangalia TF zote 3
+    (1m, 2m, 3m) kwa wakati mmoja. Hii inafundisha mfumo kujua:
+      - TF gani ilishinda ZAIDI kwa setup hii?
+      - Kama trend ya 2m BUY ilionekana, je 1m/3m zingelishinda pia?
+
+    Mpangilio:
+      - Hifadhi entry_price
+      - Baada ya dakika 1: pata exit → record TF=1 outcome
+      - Baada ya dakika 2: pata exit → record TF=2 outcome
+      - Baada ya dakika 3: pata exit → record TF=3 outcome
+      - Tuma result kwa mtumiaji baada ya TF yao (timeframe_mins) kuisha
     """
-    # Wait for candle expiry + 5 second buffer
-    await asyncio.sleep(timeframe_mins * 60 + 5)
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT result_sent, entry_price FROM user_signal_state WHERE user_id=%s AND pair=%s",
-                    (user_id, pair)
-                )
-                row = cur.fetchone()
-        if not row or row["result_sent"]:
-            return
-        db_entry = row.get("entry_price")
-        if db_entry is not None:
-            entry_price = float(db_entry)
-    except Exception as e:
-        logging.warning("schedule_result_check state check failed: {}".format(e))
-        return
-
     if entry_price is None:
         return
 
-    # Fetch exit price - retry up to 3 times with 3s gap if API fails
-    exit_price = None
-    for _ in range(3):
-        exit_price = _fetch_current_price(pair)
-        if exit_price is not None:
+    # Anza kuhifadhi entry_price mara moja (wakati signal ilitumwa)
+    _ep = entry_price
+
+    async def _get_exit():
+        for _ in range(3):
+            p = _fetch_current_price(pair)
+            if p is not None:
+                return p
+            await asyncio.sleep(3)
+        return None
+
+    def _record_tf_outcome(tf, exit_p):
+        """Hifadhi matokeo ya TF moja kwenye DB."""
+        if exit_p is None or _ep is None:
+            return
+        diff = exit_p - _ep
+        if abs(diff) < 1e-8:
+            return  # Harakati ndogo sana - skip
+        won = (diff > 0) if direction == "BUY" else (diff < 0)
+        try:
+            session = _get_session().get("name", "Unknown")
+        except Exception:
+            session = "Unknown"
+        # 1. tf_session_stats — msingi wa VTE history
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    col = "wins" if won else "losses"
+                    cur.execute("""
+                        INSERT INTO tf_session_stats (pair, session, tf_mins, wins, losses)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (pair, session, tf_mins) DO UPDATE
+                            SET {} = tf_session_stats.{} + 1
+                    """.format(col, col), (pair, session, tf, 1 if won else 0, 0 if won else 1))
+                conn.commit()
+        except Exception as _e:
+            logging.warning("multi_tf_outcome tf_session_stats tf={} {}: {}".format(tf, pair, _e))
+        # 2. signal_combo_stats — fingerprint learning
+        try:
+            update_signal_combo_stats(pair=pair, direction=direction, tf_mins=tf,
+                                      won=won, session=session)
+        except Exception as _e:
+            logging.warning("multi_tf_outcome combo_stats tf={} {}: {}".format(tf, pair, _e))
+        # 3. update_pair_stats — global pair win rate
+        try:
+            if tf == timeframe_mins:  # Hifadhi pair stats mara moja tu (TF iliyotumwa)
+                update_pair_stats(pair, won)
+        except Exception as _e:
+            logging.warning("multi_tf_outcome pair_stats tf={} {}: {}".format(tf, pair, _e))
+        logging.info("MULTI_TF_OUTCOME {}: dir={} tf={}m entry={:.5f} exit={:.5f} won={}".format(
+            pair, direction, tf, _ep, exit_p, won))
+
+    # ── Angalia outcome kwa kila TF baada ya muda wake ──────────────────
+    result_sent = False
+
+    for check_tf in [1, 2, 3]:
+        # Subiri hadi muda wa TF hii uishe (relative kwa dakika iliyopita)
+        # Kama timeframe_mins=2: dakika 1 → check tf=1, dakika 2 → check tf=2 na tuma result
+        await asyncio.sleep(60)  # kila loop = dakika 1
+
+        # Angalia kama result imeshatumwa (mtumiaji aliomba upya n.k.)
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT result_sent, entry_price FROM user_signal_state "
+                        "WHERE user_id=%s AND pair=%s", (user_id, pair))
+                    row = cur.fetchone()
+            if row and row.get("entry_price") is not None:
+                _ep2 = float(row["entry_price"])
+                # entry_price ilibadilika = signal mpya ilitumwa, acha
+                if abs(_ep2 - _ep) > 1e-6:
+                    logging.info("MULTI_TF_OUTCOME {}: entry changed, stopping tracking".format(pair))
+                    return
+        except Exception:
+            pass
+
+        exit_p = await _get_exit()
+        _record_tf_outcome(check_tf, exit_p)
+
+        # Tuma result kwa mtumiaji baada ya TF yao kuisha
+        if check_tf == timeframe_mins and not result_sent:
+            result_sent = True
+            if exit_p is None or _ep is None:
+                continue
+            diff = exit_p - _ep
+            if abs(diff) < 1e-8:
+                continue
+            won_user = (diff > 0) if direction == "BUY" else (diff < 0)
+
+            # NN feedback
+            try:
+                nn_feedback_from_vte(user_id, pair, won_user)
+            except Exception as _nn_e:
+                logging.warning("NN feedback error: {}".format(_nn_e))
+
+            if not is_results_enabled():
+                continue
+            if "OTC" in pair:
+                continue
+
+            result_text = (
+                "🏆 *EVALON WINNERS BOT {}* TF {}M - *WON* ✅".format(pair, timeframe_mins)
+                if won_user else
+                "💔 *EVALON WINNERS BOT {}* TF {}M - *LOSS* ❌".format(pair, timeframe_mins)
+            )
+            try:
+                sent = await bot.send_message(chat_id=chat_id, text=result_text,
+                                              parse_mode="Markdown")
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE user_signal_state SET result_sent=TRUE, result_msg_id=%s "
+                            "WHERE user_id=%s AND pair=%s",
+                            (sent.message_id, user_id, pair))
+                    conn.commit()
+            except Exception as e:
+                logging.warning("schedule_result_check send failed: {}".format(e))
+
+        # Kama tumeshacheki TF zote 3, toka
+        if check_tf == 3:
             break
-        await asyncio.sleep(3)
-
-    if exit_price is None:
-        return
-
-    price_diff = exit_price - entry_price
-    if abs(price_diff) < 0.000001:
-        return  # No movement - skip
-
-    if direction == "BUY":
-        won = price_diff > 0
-    else:
-        won = price_diff < 0
-
-    if won:
-        result_text = "🏆 *EVALON WINNERS BOT {}* TF {}M - *WON* ✅".format(pair, timeframe_mins)
-    else:
-        result_text = "💔 *EVALON WINNERS BOT {}* TF {}M - *LOSS* ❌".format(pair, timeframe_mins)
-
-    # -- NN FEEDBACK: feed trade outcome back to neural network --
-    try:
-        nn_feedback_from_vte(user_id, pair, won)
-    except Exception as _nn_e:
-        logging.warning("NN feedback error: {}".format(_nn_e))
-    # -- TF OUTCOME LEARNING: imarisha smart expiry kwa matokeo halisi --
-    try:
-        update_tf_outcome(pair, timeframe_mins, won)
-    except Exception as _tf_e:
-        logging.warning("TF outcome learning error: {}".format(_tf_e))
-    # ------------------------------------------------------------
-
-    if not is_results_enabled():
-        update_pair_stats(pair, won)
-        return
-
-    # OTC pairs - update stats internally but don't send result to user
-    if "OTC" in pair:
-        update_pair_stats(pair, won)
-        return
-
-    try:
-        sent = await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE user_signal_state SET result_sent=TRUE, result_msg_id=%s WHERE user_id=%s AND pair=%s",
-                    (sent.message_id, user_id, pair)
-                )
-            conn.commit()
-        update_pair_stats(pair, won)
-    except Exception as e:
-        logging.warning("schedule_result_check send failed: {}".format(e))
 
 def check_signal_request(user_id, pair):
     """
@@ -6677,30 +6732,22 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
 # ============================================================
 # SAFE SIGNAL WRAPPER - timeout + guaranteed OTC fallback
 # ============================================================
-_SIGNAL_TIMEOUT = 12  # seconds - max wait for generate_signal
+_SIGNAL_TIMEOUT = 18  # seconds - increased: yfinance+finnhub fallback inachukua muda zaidi
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
     Inatuma ujumbe wa 'Analyzing...' na animation ya dots inayobadilika.
-    Inarudisha (message_obj, stop_event) - piga stop_event.set() ukitaka isimame.
-
-    Mfano wa matumizi:
-        cm, stop = await animated_analyzing(context.bot, chat, pair)
-        sig = await safe_generate_signal(pair)
-        stop.set()
-        try: await cm.delete()
-        except: pass
+    v53: Haizunguki milele — inacheza frames mara moja tu, kisha inasimama.
+    Inarudisha (message_obj, stop_event).
     """
     frames = [
-        "🔵 *Analyzing {}*".format(pair),
-        "🔵 *Analyzing {}.*".format(pair),
         "🔵 *Analyzing {}...*".format(pair),
-        "🔵 *Analyzing {}...* ↪️".format(pair),
-        "🟣 *Processing {}...* ✨".format(pair),
         "🟣 *Processing {}...* 🔍".format(pair),
         "🔵 *Checking indicators {}...* ⏳".format(pair),
-        "🔵 *Checking indicators {}* 🏆".format(pair),
+        "🟢 *Almost ready {}...* ✅".format(pair),
     ]
+    _MAX_FRAMES = len(frames)  # cheza mara moja tu, bila loop
+
     stop_event = asyncio.Event()
     try:
         cm = await bot.send_message(chat_id=chat_id, text=frames[0], parse_mode="Markdown")
@@ -6708,16 +6755,16 @@ async def animated_analyzing(bot, chat_id, pair: str):
         return None, stop_event
 
     async def _animate():
-        i = 1
-        while not stop_event.is_set():
-            await asyncio.sleep(1.2)
+        for i in range(1, _MAX_FRAMES):
+            await asyncio.sleep(1.5)
             if stop_event.is_set():
-                break
+                return
             try:
-                await cm.edit_text(frames[i % len(frames)], parse_mode="Markdown")
+                await cm.edit_text(frames[i], parse_mode="Markdown")
             except Exception:
-                break
-            i += 1
+                return
+        # Frames zimeisha — signal bado haija. Simama bila loop.
+        # stop_event itawashwa na finally block ndani ya handler.
 
     asyncio.create_task(_animate())
     return cm, stop_event
@@ -9558,19 +9605,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # -- Non-OTC: Bot decides TF automatically (1m/2m/3m) ----------------
         context.user_data["_user_chose_tf"] = False
-
-        # -- v52: PREFETCH — fetch pair aliyoichagua tu, kila sekunde --
-        # Pair ya zamani itaisha TTL yake (dakika 10) na kufutwa auto.
-        # Pair mpya inaingia active list mara moja.
         mark_pair_active(pair)
 
-        # Initialize variables for non-OTC auto flow
+        # Initialize variables
         is_non_otc  = True
         entry_price = None
         trend       = get_trend_direction(pair)
         check       = check_signal_request(user_id, pair)
         clear_user_signal_state(user_id, pair)
-        cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
+
+        # v53: Kama cache ipo, ruka animation kabisa — tuma signal mara moja.
+        # Animation inaonyeshwa tu kama tunahitaji kufetch upya (cache miss).
+        _cache_warm = is_signal_prefetched(pair)
+        if _cache_warm:
+            cm, _anim_stop = None, asyncio.Event()
+            _anim_stop.set()  # hakuna animation - tayari imekamilika
+        else:
+            cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
         # v53 FIX: Hifadhi variables hapa - zitumike nje ya try block pia
         direction  = "BUY"
@@ -10829,7 +10880,7 @@ async def _bg_check_fingerprint_outcomes():
 # SIGNAL PRE-FETCH CACHE (v52)
 # ============================================================
 _signal_prefetch_cache: dict = {}
-_PREFETCH_TTL = 30  # sekunde 30 - baada ya hapo signal ni stale
+_PREFETCH_TTL = 55  # sekunde 55 — karibu dakika 1 kabla haijawa stale
 
 _prefetch_active_pairs: dict = {}   # pair → last_used unix timestamp
 _PREFETCH_ACTIVE_TTL  = 600         # sekunde 600 = dakika 10
@@ -10915,13 +10966,21 @@ async def signal_prefetch_engine():
 
 
 async def safe_generate_signal_cached(pair: str) -> tuple:
-    """Tumia cache kama ipo na fresh, vinginevyo fetch upya."""
+    """
+    v53: Cache hit → rudisha mara moja (karibu 0ms).
+    Cache miss → fetch upya (inaweza kuchukua sekunde kadhaa).
+    """
     cached = get_prefetched_signal(pair)
     if cached is not None:
         return cached, True
     sig = await safe_generate_signal(pair)
     set_prefetched_signal(pair, sig)
     return sig, False
+
+
+def is_signal_prefetched(pair: str) -> bool:
+    """Angalia kama signal ya pair ipo kwenye cache na bado fresh."""
+    return get_prefetched_signal(pair) is not None
 
 
 async def background_learning_engine():
