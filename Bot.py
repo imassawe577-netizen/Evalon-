@@ -1,8 +1,68 @@
 #!/usr/bin/env python3
-# EVALON BOT - IS RUNNING ✅ (Bot_v50)
+# EVALON BOT - IS RUNNING ✅ (Bot_v53)
 """
-EVALON WINNERS BOT - Telegram Bot v3.7
-Upgraded: v50 - Historical Learning Engine (Setup-Combo Intelligence)
+EVALON WINNERS BOT - Telegram Bot v3.9
+Upgraded: v53 - Unified TF Scoring Pipeline (No Blind Overrides)
+
+MABORESHO MAKUU (v53):
+  - TATIZO LILILOKUWEPO (v52 na nyuma):
+    * Mfumo ulikuwa na "blind overrides" — baada ya _smart_nonOTC_expiry
+      kufanya uchambuzi kamili na kuchagua TF bora, downstream gates
+      (h1confirm, candle_gate, fingerprint) ziliweza kubadilisha TF hiyo
+      bila kujua scores kamili za smart expiry. Matokeo: TF iliyochaguliwa
+      mwishowe ingeweza kuwa tofauti kabisa na ile iliyoamuliwa na data.
+    * Fingerprint combo ilikuwa "hard override" — ikibadilisha TF moja kwa
+      moja bila kujali kama smart expiry ilipiga 1m=200pts vs 3m=10pts.
+
+  - SULUHISHO (v53 Unified Pipeline):
+    * _smart_nonOTC_expiry inarudisha (leading_tf, scores_dict) badala ya
+      TF moja tu. Scores kamili za sections A0/A/A2/B/C/D/E/F/G/H/I/J/K
+      zinahifadhiwa kwenye _pipeline_scores dict.
+    * Gates zote (h1confirm, candle_gate, fingerprint) zinaongeza au
+      kupunguza points kwenye _pipeline_scores moja kwa moja.
+    * Hatua ya mwisho: max(_pipeline_scores) inaamua TF — mara moja tu,
+      baada ya gates zote kukamilika.
+    * Matokeo: TF ya mwisho ni maamuzi ya pamoja ya ENGINE + GATES,
+      si maamuzi ya engine iliyoathiriwa na override za blind.
+
+  - UWEZO MPYA:
+    * Kama 1m ilikuwa na score ya 250 na 3m ilikuwa 80 kwenye smart expiry,
+      h1confirm/candle_gate/fingerprint lazima zitoe penalties/bonuses za
+      nguvu kubwa sana ndio kubadilisha chaguo — si penalty ya 30pts tu.
+    * Fingerprint ni score adjustment (max +60pts) badala ya hard override.
+      Direction override bado inafanya kazi kama wr >= 65%.
+    * Log mpya "TF PIPELINE FINAL" inaonyesha scores za mwisho + TF
+      iliyochaguliwa baada ya kila gate.
+
+  - HAKUNA MABADILIKO KWA OTC: _smart_otc_expiry bado inafanya kazi
+    kwa njia yake — haikuwa na tatizo hili.
+
+MABORESHO MAKUU (v52):
+  - _smart_nonOTC_expiry section F (Deriv micro) imebadilishwa kabisa:
+    * Awali: majority vote ya direction kati ya 5s/10s/15s
+    * Sasa: kila TF (5s→1m, 10s→2m, 15s→3m) inajipima indicators ZAKE:
+      RSI, MACD, EMA diff, BB position, Momentum, Stochastic
+      TF yenye indicator alignment bora zaidi ndiyo inayopata score kubwa
+      na inashinda kuchaguliwa - hakuna vote, hakuna majority.
+  - Gap check (v51) imefutwa: best_tf daima inachaguliwa bila threshold
+  - Micro consensus gate (v51) imefutwa: replaced na per-TF indicator scoring
+  - ADX block imefutwa kabisa: ADX ni scoring factor tu, haizuii signal
+  - 1H vs short-TF conflict block imefutwa: 1H ni bonus kwenye b/s score,
+    haizuii signal - 5s/10s/15s indicators ndiyo zinazoamua TF
+
+MABORESHO MAKUU (v51):
+  - _smart_nonOTC_expiry(): imeongezwa CONVICTION CHECK:
+    * Gap check: best TF lazima iwe na gap >= 12pts dhidi ya 2nd best.
+      Gap ndogo = TF zote zinafanana = market haina uamuzi = rudisha 0 (no signal)
+    * Micro consensus gate: lazima >= 2/3 ya Deriv 5s/10s/15s TFs zikubaliane
+      na direction ya signal. Hazikubaliani = market inagombana = rudisha 0
+  - _smart_otc_expiry(): sawa - gap check >= 10pts (OTC data ni synthetic)
+  - generate_signal(): kama smart expiry inarudisha 0 → no_signal mara moja,
+    siendi downstream filters ambazo zinaweza kulazimisha TF.
+  - Weak confluence fallback imesahihishwa: haiwezi tena kulazimisha TF=3
+    pale ambapo smart expiry ilikata signal (timeframe=0).
+  - Matokeo: "no signal" itatokea mara nyingi zaidi kwa hali za ranging/conflicted.
+    Signals zitakazotoka zitakuwa na TF iliyochaguliwa kwa uhakika wa data.
 
 MABORESHO MAKUU (v50):
   - signal_combo_stats TABLE: hifadhi wins/losses kwa kila combo
@@ -1900,6 +1960,11 @@ def set_bot_setting(key, value):
         conn.commit()
 
 
+def is_results_enabled():
+    """Returns True kama WIN/LOSS result messages zimewashwa (default: on)."""
+    return get_bot_setting("results_enabled", "on") == "on"
+
+
 def upsert_user_profile(user_id, first_name=None, last_name=None, username=None):
     """Save or update user display name and username for admin lookup."""
     try:
@@ -2073,8 +2138,8 @@ LAST_SIGNAL_MSG = {}
 LAST_BOT_MSG    = {}
 
 async def delete_last_signal(bot, chat_id, user_id):
-    """Delete previous signal AND last bot message if exists."""
-    for msg_type in ["signal", "bot"]:
+    """Delete previous signal AND last bot message AND analyzing message if exists."""
+    for msg_type in ["signal", "bot", "analyzing"]:
         msg_id = None
         try:
             with get_conn() as conn:
@@ -2096,6 +2161,48 @@ async def delete_last_signal(bot, chat_id, user_id):
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception:
                 pass
+
+# In-memory store for analyzing messages (fast access)
+LAST_ANALYZING_MSG = {}
+
+def save_analyzing_msg(user_id, msg_id):
+    """Save analyzing message ID so it can be deleted when next pair is selected."""
+    LAST_ANALYZING_MSG[user_id] = msg_id
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO last_msg_store (user_id, msg_type, msg_id, updated_at) "
+                    "VALUES (%s, 'analyzing', %s, NOW()) "
+                    "ON CONFLICT (user_id, msg_type) DO UPDATE SET msg_id=%s, updated_at=NOW()",
+                    (user_id, msg_id, msg_id)
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+async def delete_analyzing_msg(bot, chat_id, user_id):
+    """Delete the last analyzing message for this user (if any)."""
+    msg_id = LAST_ANALYZING_MSG.pop(user_id, None)
+    if not msg_id:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM last_msg_store WHERE user_id=%s AND msg_type='analyzing' RETURNING msg_id",
+                        (user_id,)
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if row:
+                msg_id = row["msg_id"]
+        except Exception:
+            pass
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
 
 def save_last_signal_msg(user_id, msg_id):
     LAST_SIGNAL_MSG[user_id] = msg_id  # in-memory cache
@@ -2193,8 +2300,7 @@ async def _confirm_signal_direction(pair, initial_direction, is_otc):
         symbol    = YAHOO_SYMBOLS.get(real_pair)
         if not symbol:
             return initial_direction
-        df = yf.download(symbol, period="1d", interval="1m",
-                         progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, "1d", "1m")
         if df is None or len(df) < 4:
             return initial_direction
         closes = df["Close"].squeeze().astype(float)
@@ -2518,6 +2624,35 @@ def _calc_indicators_from_df(df):
         "adx": adx_val,
     }
 
+# ============================================================
+# YFINANCE DOWNLOAD CACHE
+# Kuzuia downloads nyingi zinazofail kimya → scores 0 → 3m kila wakati
+# Cache inashikilia data kwa dakika 2 kwa kila (symbol, period, interval)
+# ============================================================
+import threading as _threading
+_YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
+_YF_CACHE_TTL = 120     # sekunde 2 dakika
+_YF_CACHE_LOCK = _threading.Lock()
+
+def _yf_download_cached(symbol, period, interval):
+    """yf.download na cache ya dakika 2. Huzuia downloads 7+ kwa signal moja."""
+    key = (symbol, period, interval)
+    now = time.time()
+    with _YF_CACHE_LOCK:
+        if key in _YF_CACHE:
+            ts, df = _YF_CACHE[key]
+            if now - ts < _YF_CACHE_TTL:
+                return df
+    try:
+        df = yf.download(symbol, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+    except Exception:
+        df = None
+    if df is not None and len(df) > 0:
+        with _YF_CACHE_LOCK:
+            _YF_CACHE[key] = (now, df)
+    return df
+
 # OTC → real pair mapping for 1H trend reference
 OTC_TO_REAL = {
     "EUR/USD OTC": "EUR/USD", "GBP/USD OTC": "GBP/USD", "USD/JPY OTC": "USD/JPY",
@@ -2571,7 +2706,7 @@ def _fetch_1h_trend(pair):
 
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="7d", interval="1h", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "7d", "1h")
             if df is not None and len(df) >= 30:
                 logging.info("1H trend source: YAHOO {}".format(pair))
         except Exception as _ye:
@@ -2694,7 +2829,7 @@ def _confirm_1h_direction(pair, direction):
         df = None
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="3d", interval="1h", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "3d", "1h")
         except Exception:
             df = None
     try:
@@ -2761,7 +2896,7 @@ def _fetch_vwap_trend(pair):
 
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="1d", interval="5m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "1d", "5m")
         except Exception:
             df = None
 
@@ -2889,8 +3024,7 @@ def _fetch_mtf_score(pair):
     tf_details = {}
     for interval, period in MTF_INTERVALS:
         try:
-            df = yf.download(symbol, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
+            df = _yf_download_cached(symbol, period, interval)
             ind = _calc_indicators_from_df(df)
             if ind is None:
                 continue
@@ -2922,7 +3056,7 @@ def _fetch_real_indicators(pair):
     if not symbol:
         return None
     try:
-        df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, "2d", "5m")
         result = _calc_indicators_from_df(df)
         return result
     except Exception as e:
@@ -2936,7 +3070,7 @@ def _check_reversal_candle(pair, lookback_candles):
     if not symbol:
         return None
     try:
-        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, "1d", "1m")
         if df is None or len(df) < lookback_candles + 2:
             return None
         closes = df["Close"].squeeze()
@@ -2968,7 +3102,7 @@ def _get_live_candle_direction(pair):
     symbol = YAHOO_SYMBOLS.get(pair)
     if not symbol: return None
     try:
-        df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, "1d", "1m")
         if df is None or len(df) < 2: return None
         c = float(df["Close"].squeeze().iloc[-1])
         o = float(df["Open"].squeeze().iloc[-1])
@@ -3058,8 +3192,7 @@ def _fetch_real_indicators_mtf(pair):
             if interval in results:
                 continue  # Finnhub tayari imepata TF hii - skip
             try:
-                df = yf.download(yf_sym, period=period, interval=interval,
-                                 progress=False, auto_adjust=True)
+                df = _yf_download_cached(yf_sym, period, interval)
                 ind = _calc_indicators_from_df(df)
                 if ind is not None:
                     results[interval] = ind
@@ -3131,7 +3264,7 @@ def _fetch_current_price(pair):
     # -- C) Yahoo Finance fallback --
     if yf_sym:
         try:
-            df = yf.download(yf_sym, period="1d", interval="1m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "1d", "1m")
             if df is not None and len(df) >= 1:
                 price = float(df["Close"].squeeze().iloc[-1])
                 logging.info("Price source: YAHOO {} = {}".format(pair, price))
@@ -3800,7 +3933,7 @@ def _check_pip_movement(pair):
         df = None
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="2d", interval="5m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "2d", "5m")
         except Exception:
             df = None
     try:
@@ -3899,7 +4032,7 @@ def _check_volatility(pair):
         df = None
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="1d", interval="5m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "1d", "5m")
         except Exception:
             df = None
     try:
@@ -3952,7 +4085,7 @@ def _check_fibonacci(pair, direction):
         df = None
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="2d", interval="5m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "2d", "5m")
         except Exception:
             df = None
     try:
@@ -4027,7 +4160,7 @@ def _price_action_score(pair):
         df = None
     if df is None and yf_sym:
         try:
-            df = yf.download(yf_sym, period="1d", interval="5m", progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "1d", "5m")
         except Exception:
             df = None
     try:
@@ -4459,46 +4592,122 @@ def _smart_nonOTC_expiry(
         scores[3] += 8
 
     # -------------------------------------------------------
-    # F) DERIV WEBSOCKET MICRO HTF TREND  (KIPENGELE KIKUU)
-    # 5s → 1m, 10s → 2m, 15s → 3m (mapping ya v45 - haibadiliki)
-    # Kila TF ya micro inasaidia TF yake husika na UZITO MKUBWA.
-    # Hii ndiyo kipengele chenye uzito mkubwa zaidi kwa uchambuzi wa expiry.
-    # Kwa sababu: ticks za Deriv ni data halisi ya soko - hazibuniwa.
+    # F) DERIV WEBSOCKET MICRO HTF — PER-TF INDICATOR SCORING (v52)
+    # Kanuni mpya:
+    #   5s  candles → ipima indicators ZAKE (RSI,MACD,EMA,BB,MOM,STR) → score → 1m
+    #   10s candles → ipima indicators ZAKE                           → score → 2m
+    #   15s candles → ipima indicators ZAKE                           → score → 3m
+    #
+    # Kila TF inajipima kwa kujitegemea. Indicator score kubwa = TF hiyo inashinda.
+    # Hakuna majority vote — kila TF ina nafasi yake kulingana na data yake.
+    # TF yenye indicator alignment bora zaidi ndiyo itakayochaguliwa.
     # -------------------------------------------------------
     if deriv_cache:
-        dc_map = {1: "5_s", 2: "10_s", 3: "15_s"}
-        for tf_m, dc_key in dc_map.items():
+        dc_map = {1: ("5_s", "5_s_ind"), 2: ("10_s", "10_s_ind"), 3: ("15_s", "15_s_ind")}
+        for tf_m, (dc_key, ind_key) in dc_map.items():
             dc_trend = deriv_cache.get(dc_key)
-            if dc_trend:
-                dc_dir    = dc_trend.get("direction", "FLAT")
-                dc_str    = dc_trend.get("strength", 0)
-                dc_rev    = dc_trend.get("reversal", False)
-                dc_struct = dc_trend.get("htf_structure", "RANGING")
-                dc_ema    = dc_trend.get("ema_cross")
+            dc_ind   = deriv_cache.get(ind_key)
 
-                # Multiplier: UPTREND/DOWNTREND = nguvu halisi
-                struct_mult = 1.4 if dc_struct in ("UPTREND", "DOWNTREND") else 0.75
+            if not dc_trend:
+                continue
 
-                if dc_dir == direction:
-                    if not dc_rev:
-                        # Micro HTF inakubaliana na direction - uzito mkubwa
-                        base_bonus = dc_str * 0.65 * struct_mult
-                        ema_bonus  = 12 if dc_ema == direction else 0
-                        scores[tf_m] += base_bonus + ema_bonus
-                    else:
-                        # Direction sawa lakini reversal ipo - punguza lakini si punguza sana
-                        scores[tf_m] += dc_str * 0.12 - 14
-                elif dc_dir not in ("FLAT", None) and dc_dir != direction:
-                    if dc_rev:
-                        # Micro HTF inapinga direction + reversal = hatari kubwa
-                        scores[tf_m] -= 35
-                    else:
-                        # HTF inapinga bila reversal
-                        oppose_penalty = 22 if dc_struct in ("UPTREND", "DOWNTREND") else 14
-                        scores[tf_m] -= oppose_penalty
-                # FLAT micro: punguza kidogo tu (si kwa nguvu)
-                elif dc_dir in ("FLAT", None):
-                    scores[tf_m] -= 5
+            dc_dir    = dc_trend.get("direction", "FLAT")
+            dc_str    = dc_trend.get("strength", 0)
+            dc_rev    = dc_trend.get("reversal", False)
+            dc_struct = dc_trend.get("htf_structure", "RANGING")
+            dc_ema    = dc_trend.get("ema_cross")
+
+            # -- Trend/structure score kwa TF hii --
+            struct_mult = 1.4 if dc_struct in ("UPTREND", "DOWNTREND") else 0.75
+
+            if dc_dir == direction:
+                if not dc_rev:
+                    base_bonus = dc_str * 0.65 * struct_mult
+                    ema_bonus  = 12 if dc_ema == direction else 0
+                    scores[tf_m] += base_bonus + ema_bonus
+                else:
+                    scores[tf_m] += dc_str * 0.12 - 14
+            elif dc_dir not in ("FLAT", None) and dc_dir != direction:
+                if dc_rev:
+                    scores[tf_m] -= 35
+                else:
+                    oppose_penalty = 22 if dc_struct in ("UPTREND", "DOWNTREND") else 14
+                    scores[tf_m] -= oppose_penalty
+            elif dc_dir in ("FLAT", None):
+                scores[tf_m] -= 5
+
+            # -- Full indicators za TF hii (RSI, MACD, BB, MA, MOM, STO) --
+            # Hii ndiyo kipengele kipya cha v52: kila TF inajipima kwa indicators ZAKE
+            if dc_ind:
+                ind_dir  = dc_ind.get("direction")
+                ind_rsi  = dc_ind.get("rsi", 50)
+                ind_macd = dc_ind.get("macd", 0)
+                ind_ma   = dc_ind.get("ma_diff", 0)
+                ind_bb   = dc_ind.get("bb_pos", 0.5)
+                ind_mom  = dc_ind.get("mom", 0)
+                ind_sto  = dc_ind.get("sto", 50)
+
+                ind_score = 0.0
+
+                # EMA+MACD direction (uzito 10)
+                if ind_dir == direction:
+                    ind_score += 10
+                elif ind_dir is not None and ind_dir != direction:
+                    ind_score -= 8
+
+                # RSI alignment (uzito 8)
+                if direction == "BUY":
+                    if ind_rsi < 30:     ind_score += 8
+                    elif ind_rsi < 45:   ind_score += 4
+                    elif ind_rsi > 70:   ind_score -= 6
+                    elif ind_rsi > 55:   ind_score -= 2
+                else:
+                    if ind_rsi > 70:     ind_score += 8
+                    elif ind_rsi > 55:   ind_score += 4
+                    elif ind_rsi < 30:   ind_score -= 6
+                    elif ind_rsi < 45:   ind_score -= 2
+
+                # MACD histogram (uzito 6)
+                if (direction == "BUY" and ind_macd > 0.1) or (direction == "SELL" and ind_macd < -0.1):
+                    ind_score += min(6, abs(ind_macd) * 8)
+                elif (direction == "BUY" and ind_macd < -0.1) or (direction == "SELL" and ind_macd > 0.1):
+                    ind_score -= 5
+
+                # EMA diff alignment (uzito 6)
+                if (direction == "BUY" and ind_ma > 0.1) or (direction == "SELL" and ind_ma < -0.1):
+                    ind_score += min(6, abs(ind_ma) * 10)
+                elif (direction == "BUY" and ind_ma < -0.1) or (direction == "SELL" and ind_ma > 0.1):
+                    ind_score -= 4
+
+                # BB position (uzito 5)
+                if direction == "BUY" and ind_bb <= 0.20:
+                    ind_score += 5
+                elif direction == "SELL" and ind_bb >= 0.80:
+                    ind_score += 5
+                elif direction == "BUY" and ind_bb >= 0.80:
+                    ind_score -= 4
+                elif direction == "SELL" and ind_bb <= 0.20:
+                    ind_score -= 4
+
+                # Momentum (uzito 5)
+                if (direction == "BUY" and ind_mom > 0.1) or (direction == "SELL" and ind_mom < -0.1):
+                    ind_score += min(5, abs(ind_mom) * 15)
+                elif (direction == "BUY" and ind_mom < -0.1) or (direction == "SELL" and ind_mom > 0.1):
+                    ind_score -= 3
+
+                # Stochastic (uzito 4)
+                if direction == "BUY" and ind_sto < 25:
+                    ind_score += 4
+                elif direction == "SELL" and ind_sto > 75:
+                    ind_score += 4
+                elif direction == "BUY" and ind_sto > 75:
+                    ind_score -= 3
+                elif direction == "SELL" and ind_sto < 25:
+                    ind_score -= 3
+
+                scores[tf_m] += ind_score
+                logging.info("DERIV IND {}s→{}m {}: dir={} rsi={:.0f} macd={:.2f} ma={:.2f} bb={:.2f} mom={:.2f} sto={:.0f} ind_score={:.1f}".format(
+                    tf_m * 5, tf_m, pair, ind_dir, ind_rsi, ind_macd, ind_ma, ind_bb, ind_mom, ind_sto, ind_score))
 
     # -------------------------------------------------------
     # G) ADX TREND STRENGTH
@@ -4721,8 +4930,7 @@ def _smart_nonOTC_expiry(
     yf_sym = YAHOO_SYMBOLS.get(pair)
     if yf_sym:
         try:
-            df_1m = yf.download(yf_sym, period="1d", interval="1m",
-                                progress=False, auto_adjust=True)
+            df_1m = _yf_download_cached(yf_sym, "1d", "1m")
             if df_1m is not None and len(df_1m) >= 5:
                 c1 = df_1m["Close"].squeeze().astype(float)
                 o1 = df_1m["Open"].squeeze().astype(float)
@@ -4790,15 +4998,16 @@ def _smart_nonOTC_expiry(
             if dc_trend:
                 _micro_scores[dc_key] = dc_trend.get("strength", 0)
 
-    # Chagua TF yenye score kubwa zaidi — data inaamua, hakuna tiebreak ya ziada.
-    # VTE/DB tayari imeshirikishwa katika scoring hapo juu.
+    # Rudisha scores kamili + best_tf kwa generate_signal.
+    # generate_signal ndiyo itakayofanya final max() baada ya gates zote.
+    # Hakuna chaguo la mwisho hapa — downstream pipeline inaamua.
     best_tf = max(scores, key=lambda t: scores[t])
 
-    logging.info("NONOTC EXPIRY SELECT {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → {}m [ia={} atr={:.3f} fib={} pa={} pat={} adx={:.0f}]".format(
+    logging.info("NONOTC EXPIRY SELECT {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → leading={}m [ia={} atr={:.3f} fib={} pa={} pat={} adx={:.0f}]".format(
         pair, direction, scores[1], scores[2], scores[3], best_tf,
         indicators_agree, atr_pct, fib_active, pa_active, pat_active, adx_f))
 
-    return best_tf
+    return (best_tf, scores)
 
 
 # ============================================================
@@ -5103,8 +5312,7 @@ def _smart_otc_expiry(
             yf_sym = YAHOO_SYMBOLS.get(real_p)
             if yf_sym:
                 try:
-                    df_1m = yf.download(yf_sym, period="1d", interval="1m",
-                                        progress=False, auto_adjust=True)
+                    df_1m = _yf_download_cached(yf_sym, "1d", "1m")
                     if df_1m is not None and len(df_1m) >= 5:
                         c1 = df_1m["Close"].squeeze().astype(float)
                         o1 = df_1m["Open"].squeeze().astype(float)
@@ -5135,17 +5343,15 @@ def _smart_otc_expiry(
     # -------------------------------------------------------
     # FINAL DECISION — pure score, hakuna upendeleo wa TF yoyote
     # -------------------------------------------------------
-    # Normalize ili hakuna TF iwe na advantage ya awali
     min_s  = min(scores.values())
     if min_s < 0:
         for tf in scores:
-            scores[tf] -= min_s  # Shift all to ≥ 0
+            scores[tf] -= min_s  # Shift all to >= 0
 
-    # Chagua TF yenye score kubwa zaidi — data inaamua, hakuna tiebreak ya ziada.
-    # VTE/DB tayari imeshirikishwa katika section A ya scoring hapo juu.
+    # Chagua TF yenye score kubwa zaidi — daima inarudisha 1, 2, au 3. (v52)
     best_tf = max(scores, key=lambda t: scores[t])
 
-    logging.info("EXPIRY SELECT {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → {}m".format(
+    logging.info("EXPIRY SELECT OTC {}: dir={} 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → {}m".format(
         pair, direction, scores[1], scores[2], scores[3], best_tf))
 
     return best_tf
@@ -5238,7 +5444,7 @@ def _mtf_fh_candles(symbol, resolution, count=120):
 def _mtf_yf_candles(symbol, interval, period):
     """Fetch candles from Yahoo Finance. Returns DataFrame or None."""
     try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, period, interval)
         return df if df is not None and len(df) >= 20 else None
     except Exception as e:
         logging.warning("_mtf_yf_candles {} {} failed: {}".format(symbol, interval, e))
@@ -6122,8 +6328,7 @@ def _micro_candle_trend_score(pair):
     if not opens_arr and yf_sym:
         try:
             import yfinance as yf
-            df = yf.download(yf_sym, period="1d", interval="1m",
-                             progress=False, auto_adjust=True)
+            df = _yf_download_cached(yf_sym, "1d", "1m")
             if df is not None and len(df) >= 15:
                 opens_arr  = df["Open"].squeeze().astype(float).tolist()
                 closes_arr = df["Close"].squeeze().astype(float).tolist()
@@ -6305,8 +6510,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
     micro_result = None  # {tf_mins: (direction, support_pct)}
     if symbol:
         try:
-            df = yf.download(symbol, period="1d", interval="1m",
-                             progress=False, auto_adjust=True)
+            df = _yf_download_cached(symbol, "1d", "1m")
             if df is not None and len(df) >= 20:
                 opens  = df["Open"].squeeze().astype(float).values
                 closes = df["Close"].squeeze().astype(float).values
@@ -6718,7 +6922,7 @@ def generate_signal(pair):
         symbol = YAHOO_SYMBOLS.get(real_pair)
         if symbol:
             try:
-                df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+                df_5m = _yf_download_cached(symbol, "2d", "5m")
                 detected_patterns = _detect_candlestick_patterns(df_5m)
             except Exception:
                 pass
@@ -6729,7 +6933,7 @@ def generate_signal(pair):
             symbol = YAHOO_SYMBOLS.get(real_p)
             if symbol:
                 try:
-                    df_5m = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+                    df_5m = _yf_download_cached(symbol, "2d", "5m")
                     detected_patterns = _detect_candlestick_patterns(df_5m)
                 except Exception:
                     pass
@@ -7220,6 +7424,7 @@ def generate_signal(pair):
 
     # -- TIMEFRAME SELECTION ----------------------------------
     vte_tf = None  # will be set by non-OTC branch; used by downstream filters
+    _pipeline_scores = {1: 0.0, 2: 0.0, 3: 0.0}  # v53: unified score dict kwa gates zote
     if is_otc:
         # Smart OTC TF selection: uchambuzi wa kweli, si random
         timeframe = _smart_otc_expiry(
@@ -7234,7 +7439,9 @@ def generate_signal(pair):
         # Non-OTC: tumia _smart_nonOTC_expiry - engine yenye uchambuzi kamili
         # Inatumia vipengele vyote: VTE, momentum, ATR, RSI, BB, MACD,
         # Fibonacci, PA, patterns, Deriv cache, 1H trend, MTF
-        timeframe = _smart_nonOTC_expiry(
+        # v53: inarudi (leading_tf, scores_dict) — hatua ya mwisho (max) ifanyike
+        # baada ya gates zote (h1confirm, candle_gate, fingerprint).
+        _nonotc_result = _smart_nonOTC_expiry(
             pair, direction,
             rsi=rsi, sto=sto, ma_diff=ma_diff, macd=macd,
             bb_pos=bb_pos, mom=mom, vol=vol, candle=candle,
@@ -7248,73 +7455,66 @@ def generate_signal(pair):
             deriv_cache=_deriv_ind_data,
             adx_val=float(real.get("adx", 25.0)) if real and real.get("adx") else 25.0,
         )
+        # v53: _smart_nonOTC_expiry inarudi (leading_tf, scores_dict)
+        if isinstance(_nonotc_result, tuple):
+            _leading_tf, _live_scores = _nonotc_result
+        else:
+            # Backward compat kama kuna tatizo - fallback kwa integer
+            _leading_tf = _nonotc_result
+            _live_scores = dict(_tf_candidate_scores) if _tf_candidate_scores else {1: 0.0, 2: 0.0, 3: 0.0}
+
+        timeframe = _leading_tf  # leading suggestion - bado inaweza kubadilika
         vte_tf = timeframe  # keep vte_tf for downstream filters
 
-        logging.info("TF SELECTION {}: scores=1m:{:.0f} 2m:{:.0f} 3m:{:.0f} → chosen={}m ia={} micro={}".format(
+        # Hifadhi scores za smart expiry kwa ajili ya downstream gates
+        # Gates zitaongeza/kupunguza points kwenye dict hii,
+        # kisha max(final_scores) itaamua TF ya mwisho.
+        _pipeline_scores = dict(_live_scores)
+
+        logging.info("TF SELECTION {}: scores=1m:{:.0f} 2m:{:.0f} 3m:{:.0f} → leading={}m ia={} micro={}".format(
             pair,
-            _tf_candidate_scores.get(1, 0),
-            _tf_candidate_scores.get(2, 0),
-            _tf_candidate_scores.get(3, 0),
+            _pipeline_scores.get(1, 0),
+            _pipeline_scores.get(2, 0),
+            _pipeline_scores.get(3, 0),
             timeframe, indicators_agree,
             {k: round(v, 1) for k, v in _micro_scores.items()}
         ))
+
+    # Smart expiry daima inarudisha 1, 2, au 3 — haiwezi kurudisha 0. (v52)
 
     # -- MICRO-CANDLE TREND: imeshughulikiwa ndani ya TF SELECTION block juu --
     # ---------------------------------------------------------
 
 
-    # -- NON-OTC: ADX Weak-Trend Blocker ---------------------
-    # Block only in genuinely ranging/choppy market.
-    # ADX < 14  → always block
-    # ADX 14-20 + agree < 4 + no 1H trend + no VTE → block
-    if not is_otc and real is not None:
-        _adx_live = float(real.get("adx", 25.0)) if real.get("adx") else 25.0
-        _adx_block = False
-        if _adx_live < 14.0:
-            _adx_block = True
-        elif _adx_live < 20.0 and indicators_agree < 4 and trend_1h is None and vte_tf is None:
-            _adx_block = True
-
-        if _adx_block:
-            logging.info("ADX BLOCK {}: adx={:.1f} agree={} trend={} → no signal".format(
-                pair, _adx_live, indicators_agree, trend_1h))
-            record_signal(pair, direction)
-            return {
-                "direction": direction, "pair": pair, "timeframe": 0,
-                "strength": 0, "indicators_agree": indicators_agree,
-                "trend_1h": None, "vwap_data": vwap_data,
-                "confluence": {"level": "WEAK", "score": 0, "badge": "⚠️ RANGING"},
-                "mtf": mtf, "flat": True, "patterns": detected_patterns,
-                "movement_cat": movement_cat, "avg_movement": avg_movement,
-                "no_signal_reason": "🟡 *Market is ranging – ADX={:.0f}. No clear trend.*".format(_adx_live),
-                "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
-            }
-    # ---------------------------------------------------------
+    # ADX: inatumika kama scoring factor ndani ya _smart_nonOTC_expiry (section G)
+    # Haizuii signal hapa - indicators za micro TFs ndiyo zinazoamua. (v52)
 
     # -- NON-OTC: Weak confluence → fuata 1H trend (ilikuwa ina bug ya kupinga 1H) --
-    if not is_otc and is_filter_on("confluence") and indicators_agree < 5 and vte_tf is None:
+    # v51: Hii inafanya kazi tu kama timeframe > 0 (smart expiry ilipata conviction)
+    # Kama smart expiry ilirudisha 0 (no conviction), usibadilishe - no signal
+    if not is_otc and is_filter_on("confluence") and indicators_agree < 5 and vte_tf is None and timeframe > 0:
         if trend_1h is not None:
             direction = trend_1h  # Fuata 1H - si kupingana nayo
-            timeframe = timeframe if timeframe > 0 else 3
+            # timeframe > 0 tayari - usibadilishe
         elif not yahoo_available:
-            timeframe = 3  # No data - use 3m instead of blocking
+            pass  # No data - lakini timeframe tayari ipo, usiibadilishe
 
     # -- 1H CANDLE CONFIRMATION (non-OTC only) ---------------
     # OTC always forces a signal - no blocking on 1H confirmation.
     if not is_otc and is_filter_on("h1confirm") and timeframe > 0:
         h1_confirmed = _confirm_1h_direction(pair, direction)
         if not h1_confirmed:
-            # h1 does not confirm - penalise shorter TFs in score copy and re-decide
-            h1_scores = dict(_tf_candidate_scores)
-            # Penalise 1m more harshly (needs strongest confirmation for 1m)
-            h1_scores[1] = max(0.0, h1_scores[1] - 35)
-            h1_scores[2] = max(0.0, h1_scores[2] - 15)
-            # 3m is most forgiving - slight bonus for waiting
-            h1_scores[3] = h1_scores.get(3, 0) + 10
-            new_tf = max(h1_scores, key=lambda t: h1_scores[t])
+            # h1 does not confirm — penalise TFs kwenye _pipeline_scores moja kwa moja.
+            # Hii inazingatia scores KAMILI za smart expiry + A0 + VTE + Deriv + ATR nk.
+            # Badala ya kubadilisha TF moja kwa moja, tunaacha max() wa mwisho aamue.
+            _pipeline_scores[1] = max(0.0, _pipeline_scores.get(1, 0) - 35)  # 1m: penalty kubwa
+            _pipeline_scores[2] = max(0.0, _pipeline_scores.get(2, 0) - 15)  # 2m: penalty ya kati
+            _pipeline_scores[3] = _pipeline_scores.get(3, 0) + 10             # 3m: bonus ya kusubiri
+            new_tf = max(_pipeline_scores, key=lambda t: _pipeline_scores[t])
             if new_tf != timeframe:
-                logging.info("H1CONFIRM {}: 1H not confirmed → {}m → {}m (score-based)".format(
-                    pair, timeframe, new_tf))
+                logging.info("H1CONFIRM {}: 1H not confirmed → leading {}m → {}m after score adjustment (scores: 1m={:.1f} 2m={:.1f} 3m={:.1f})".format(
+                    pair, timeframe, new_tf,
+                    _pipeline_scores[1], _pipeline_scores[2], _pipeline_scores[3]))
             timeframe = new_tf
 
     # -- SESSION-AWARE BIAS ------------------------------------
@@ -7338,30 +7538,8 @@ def generate_signal(pair):
         if raw_gap < 35:
             direction = "SELL"
 
-    # -- 1H vs SHORT-TF CONFLICT FILTER (non-OTC only) --------
-    # If 1H trend is clear but 5m+15m real data strongly disagrees → no signal
-    if not is_otc and trend_1h is not None and real is not None and is_filter_on("conflict"):
-        tv = real.get("tf_buy_votes", 0)
-        sv = real.get("tf_sell_votes", 0)
-        tf_total = real.get("tf_count", 1)
-        short_tf_dir = "BUY" if tv > sv else ("SELL" if sv > tv else None)
-        if short_tf_dir is not None and short_tf_dir != trend_1h:
-            # Short TFs majority oppose the 1H trend (lowered from 100% to 67%)
-            opposition_pct = max(tv, sv) / tf_total
-            if opposition_pct >= 0.67 and tf_total >= 2:
-                # 100% of short TFs oppose 1H - market in transition, wait
-                timeframe = 0   # Signal flat - will trigger no-signal in handler
-                direction = "BUY" if b > s else "SELL"
-                record_signal(pair, direction)
-                return {
-                    "direction": direction, "pair": pair, "timeframe": 0,
-                    "strength": 0, "indicators_agree": 0,
-                    "trend_1h": trend_1h, "vwap_data": vwap_data,
-                    "confluence": {"level": "CONFLICTED", "score": 0, "badge": "⚠️ WEAK"},
-                    "mtf": mtf, "flat": True, "patterns": detected_patterns,
-                    "movement_cat": movement_cat, "avg_movement": avg_movement,
-                    "no_signal_reason": "1H vs short-TF conflict",
-                }
+    # 1H trend: inatumika kama bonus kwenye scoring (b/s) ndani ya generate_signal.
+    # Haizuii signal hapa - 5s/10s/15s indicators ndiyo zinazoamua TF. (v52)
 
     # -- SIGNAL STABILITY FILTER (non-OTC only) --------------
     # OTC always produces a signal - stability filter does not apply.
@@ -7396,8 +7574,7 @@ def generate_signal(pair):
             real_pair_cg = OTC_TO_REAL.get(pair, pair)
             cg_symbol    = YAHOO_SYMBOLS.get(real_pair_cg)
             if cg_symbol:
-                df_1m = yf.download(cg_symbol, period="1d", interval="1m",
-                                    progress=False, auto_adjust=True)
+                df_1m = _yf_download_cached(cg_symbol, "1d", "1m")
                 candle_dir_1m = "NEUTRAL"
                 if df_1m is not None and len(df_1m) >= 4:
                     opens_1m  = df_1m["Open"].squeeze().astype(float)
@@ -7407,8 +7584,7 @@ def generate_signal(pair):
                     candle_dir_1m = "BUY" if (c1_bull and c2_bull) else \
                                     ("SELL" if (not c1_bull and not c2_bull) else "NEUTRAL")
 
-                df_5m = yf.download(cg_symbol, period="1d", interval="5m",
-                                    progress=False, auto_adjust=True)
+                df_5m = _yf_download_cached(cg_symbol, "1d", "5m")
                 candle_dir_5m = "NEUTRAL"
                 if df_5m is not None and len(df_5m) >= 3:
                     opens_5m  = df_5m["Open"].squeeze().astype(float)
@@ -7418,9 +7594,9 @@ def generate_signal(pair):
                     candle_dir_5m = "BUY" if (c1_5_bull and c2_5_bull) else \
                                     ("SELL" if (not c1_5_bull and not c2_5_bull) else "NEUTRAL")
 
-                # Score adjustments on _tf_candidate_scores (global copy set by _smart_nonOTC_expiry)
+                # Score adjustments on _pipeline_scores (carries ALL smart expiry + h1confirm scores)
                 # Guard: if scores are all zero/trivial (e.g. fresh start), skip gate
-                gate_scores = dict(_tf_candidate_scores)  # local mutable copy
+                gate_scores = _pipeline_scores  # direct reference - edits ni za kweli
                 _total_gate_score = sum(gate_scores.values())
                 if _total_gate_score < 5.0:
                     # Scores not meaningfully populated - skip gate to avoid biased TF change
@@ -7452,8 +7628,9 @@ def generate_signal(pair):
                     if gate_changed:
                         new_tf = max(gate_scores, key=lambda t: gate_scores[t])
                         if new_tf != timeframe:
-                            logging.info("CANDLE GATE {}: smart expiry {}m → {}m after candle scores".format(
-                                pair, timeframe, new_tf))
+                            logging.info("CANDLE GATE {}: leading {}m → {}m after candle scores (1m:{:.1f} 2m:{:.1f} 3m:{:.1f})".format(
+                                pair, timeframe, new_tf,
+                                gate_scores[1], gate_scores[2], gate_scores[3]))
                         timeframe = new_tf
         except Exception as _cg_e:
             logging.warning("candle gate {} failed: {}".format(pair, _cg_e))
@@ -7486,9 +7663,10 @@ def generate_signal(pair):
 
     # AUTO-REVERSE disabled - signal follows MTF direction only
 
-    # -- v50: FINGERPRINT LEARNING - chagua combo bora kutoka historia halisi --
-    # Non-OTC tu. Kama historia inasema direction/TF tofauti na iliyochaguliwa,
-    # badilisha. Inazingatia movement ya bei, si win/loss tu.
+    # -- v50/v53: FINGERPRINT LEARNING - score adjustment, si hard override --
+    # Non-OTC tu. Historia ya DB inaongeza/kupunguza points kwenye _pipeline_scores.
+    # Mabadiliko ya direction yanaweza kutokea kama history inathibitisha kwa nguvu.
+    # v53 fix: haibadilishi TF moja kwa moja — inaacha max(_pipeline_scores) aamue.
     if not is_otc and timeframe > 0:
         try:
             # Deriv directions kutoka cache
@@ -7509,14 +7687,44 @@ def generate_signal(pair):
                 fp_tf  = best_combo["tf_mins"]
                 fp_wr  = best_combo["win_rate"]
                 fp_mov = best_combo["avg_movement"]
-                logging.info("FP_OVERRIDE {}: dir {} → {} tf {} → {}m wr={:.0f}% move={:.4f}%".format(
-                    pair, direction, fp_dir, timeframe, fp_tf,
-                    fp_wr * 100, fp_mov))
-                direction = fp_dir
-                timeframe = fp_tf
+                fp_score = best_combo["score"]
+
+                # v53: badala ya kubadilisha TF moja kwa moja,
+                # ongeza points kwenye TF inayopendekezwa na fingerprint.
+                # Nguvu ya ongezeko inategemea nguvu ya history (fp_score).
+                fp_bonus = min(60.0, fp_score * 80)  # max 60pts kwa fp_score=0.75
+                _pipeline_scores[fp_tf] = _pipeline_scores.get(fp_tf, 0) + fp_bonus
+                # Direction override: tu kama history imara sana (wr >= 0.65)
+                if fp_dir != direction and fp_wr >= 0.65:
+                    direction = fp_dir
+                    logging.info("FP_DIR_OVERRIDE {}: dir → {} (wr={:.0f}% n={})".format(
+                        pair, fp_dir, fp_wr * 100, best_combo["sample_n"]))
+
+                # Chagua TF mpya baada ya kuongeza fp_bonus
+                new_tf = max(_pipeline_scores, key=lambda t: _pipeline_scores[t])
+                if new_tf != timeframe:
+                    logging.info("FP_TF_ADJUST {}: leading {}m → {}m after fp_bonus={:.1f} (wr={:.0f}% move={:.4f}% scores: 1m={:.1f} 2m={:.1f} 3m={:.1f})".format(
+                        pair, timeframe, new_tf, fp_bonus, fp_wr * 100, fp_mov,
+                        _pipeline_scores[1], _pipeline_scores[2], _pipeline_scores[3]))
+                else:
+                    logging.info("FP_SCORE_CONFIRM {}: {}m confirmed by fingerprint (wr={:.0f}% move={:.4f}%)".format(
+                        pair, timeframe, fp_wr * 100, fp_mov))
+                timeframe = new_tf
         except Exception as _fp_e:
             logging.warning("fingerprint combo select failed {}: {}".format(pair, _fp_e))
     # ---------------------------------------------------------
+
+    # -- PIPELINE FINAL LOG (non-OTC) -------------------------
+    # Onesha scores za mwisho baada ya gates zote kukamilika.
+    if not is_otc:
+        logging.info("TF PIPELINE FINAL {}: 1m:{:.1f} 2m:{:.1f} 3m:{:.1f} → CHOSEN={}m [h1conf={} candlegate=done fp=done]".format(
+            pair,
+            _pipeline_scores.get(1, 0),
+            _pipeline_scores.get(2, 0),
+            _pipeline_scores.get(3, 0),
+            timeframe,
+            is_filter_on("h1confirm")
+        ))
 
     record_signal(pair, direction,
                   rsi=rsi, macd=macd, bb_pos=bb_pos, sto=sto,
@@ -8039,6 +8247,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/addlifetime 5` - Generate 5 lifetime codes\n"
             "`/listlicences` - View all codes (used/unused)\n"
             "`/revoke 123456` - Remove user licence\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📊 *RESULT MESSAGES*\n"
             "`/resultson` - Enable WIN/LOSS result messages\n"
             "`/resultsoff` - Disable result messages\n"
             "━━━━━━━━━━━━━━━━━━\n"
@@ -8049,11 +8259,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/userinfo 123456` - Full details of a user\n"
             "`/addtrial 123456 5` - Give user extra free signals\n"
             "`/deleteuser 123456` - Delete user permanently\n"
+            "`finduser name` - Search user by name/username\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "🚫 *BLACKLIST*\n"
+            "🚫 *BAN MANAGEMENT*\n"
             "`/blacklist 123456 reason` - Ban a user\n"
             "`/unblacklist 123456` - Unban a user\n"
             "`/listblacklist` - View all banned users\n"
+            "`/blockuser 123456` - Block user (no access)\n"
+            "`/unblockuser 123456` - Unblock user\n"
+            "`/listblocked` - View all blocked users\n"
+            "`/blockedbot` - Find users who blocked the bot\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📢 *BROADCAST*\n"
             "`/broadcast message` - Send to all users\n"
@@ -8066,7 +8281,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/dbcheck` - Check database status\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 *PAIR STATS*\n"
-            "`/pairstats` - Win/loss stats for all pairs\n"
+            "`/pairstats` - Win/loss stats for all pairs (today)\n"
+            "`/pairreport` - Full pair performance report\n"
+            "`vtestats` - Forex pairs VTE win rate ranking\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔀 *OTC CONTROL*\n"
             "`/toggleotc` - Enable or disable OTC pairs\n"
@@ -8094,9 +8311,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧠 *NEURAL NETWORK*\n"
             "`/nnstats` - NN status, accuracy & per-pair models\n"
             "`/nnretrain` - Force NN retrain immediately\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📊 *REPORTS*\n"
-            "`/pairreport` - Full pair performance report\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "`/help` - This menu",
             parse_mode="Markdown",
@@ -8664,7 +8878,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.message.delete()
         except: pass
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
-        sig = await safe_generate_signal(pair)  # timeout-safe, never hangs
+        mark_pair_active(pair)
+        sig, _from_cache = await safe_generate_signal_cached(pair)
+        if _from_cache:
+            logging.info("PREFETCH HIT nonotctf {}: signal served from cache".format(pair))
         _anim_stop.set()
         direction = sig["direction"]
         timeframe = chosen_tf
@@ -9235,6 +9452,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # -- Non-OTC: Bot decides TF automatically (1m/2m/3m) ----------------
         context.user_data["_user_chose_tf"] = False
 
+        # -- v52: PREFETCH — fetch pair aliyoichagua tu, kila sekunde --
+        # Pair ya zamani itaisha TTL yake (dakika 10) na kufutwa auto.
+        # Pair mpya inaingia active list mara moja.
+        mark_pair_active(pair)
+
         # Initialize variables for non-OTC auto flow
         is_non_otc  = True
         entry_price = None
@@ -9244,7 +9466,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
         if check["action"] == "fresh":
-            sig = await safe_generate_signal(pair)  # timeout-safe, OTC guaranteed
+            sig, _from_cache = await safe_generate_signal_cached(pair)
+            if _from_cache:
+                logging.info("PREFETCH HIT {}: signal served from cache".format(pair))
             _anim_stop.set()
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
@@ -10157,25 +10381,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text("❌ Error: {}".format(e))
         return
-        context.user_data["awaiting_code"]=False
-        code=text.upper().strip()
-        if activate_licence(code,user_id):
-            u=get_user(user_id); exp=get_expiry_text(user_id)
-            tl="📅 Monthly" if u.get("licence_type")=="monthly" else "♾️ Lifetime"
-            await update.message.reply_text(
-                "✅ *Licence Activated!*\n\n🎉 Welcome to EVALON WINNERS BOT!\n🏆 Win Rate: 90% - 98%\n🔑 Type: *{}*\n⏳ {}\n\nYou can now use unlimited signals!".format(tl,exp),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Start Trading Now", callback_data="choose_pair")]])
-            )
-        else:
-            await update.message.reply_text(
-                "❌ *Invalid or already used code.*\n\nCheck your code or contact admin.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 Support", url=support_url())],
-                    [InlineKeyboardButton("🔑 Try Again", callback_data="enter_code")]
-                ])
-            )
 
 # ============================================================
 # VIRTUAL TRADING ENGINE v2
@@ -10498,6 +10703,105 @@ async def _bg_check_fingerprint_outcomes():
         _bg_fp_pending.pop(fp_id, None)
 
 
+# ============================================================
+# SIGNAL PRE-FETCH CACHE (v52)
+# ============================================================
+_signal_prefetch_cache: dict = {}
+_PREFETCH_TTL = 30  # sekunde 30 - baada ya hapo signal ni stale
+
+_prefetch_active_pairs: dict = {}   # pair → last_used unix timestamp
+_PREFETCH_ACTIVE_TTL  = 600         # sekunde 600 = dakika 10
+
+_PREFETCH_PAIRS_NONOTC = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD",
+    "EUR/GBP", "EUR/JPY", "GBP/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
+    "GBP/AUD", "GBP/CAD", "GBP/CHF", "AUD/JPY", "AUD/CAD", "CAD/JPY", "CHF/JPY",
+]
+_PREFETCH_PAIRS_OTC = [
+    "EUR/USD OTC", "GBP/USD OTC", "USD/JPY OTC", "USD/CHF OTC",
+    "AUD/USD OTC", "NZD/USD OTC", "USD/CAD OTC",
+    "EUR/GBP OTC", "EUR/JPY OTC", "GBP/JPY OTC",
+]
+
+
+def mark_pair_active(pair: str):
+    """Weka pair kama active — inaitwa user anapobonyeza pair."""
+    _prefetch_active_pairs[pair] = time.time()
+
+
+def get_active_pairs() -> list:
+    """Rudisha pairs zote zilizotumiwa ndani ya dakika 10. Futa za zamani."""
+    now = time.time()
+    stale = [p for p, ts in _prefetch_active_pairs.items()
+             if now - ts > _PREFETCH_ACTIVE_TTL]
+    for p in stale:
+        _prefetch_active_pairs.pop(p, None)
+        _signal_prefetch_cache.pop(p, None)
+    return list(_prefetch_active_pairs.keys())
+
+
+def get_prefetched_signal(pair: str):
+    entry = _signal_prefetch_cache.get(pair)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > _PREFETCH_TTL:
+        _signal_prefetch_cache.pop(pair, None)
+        return None
+    return entry["sig"]
+
+
+def set_prefetched_signal(pair: str, sig: dict):
+    _signal_prefetch_cache[pair] = {"sig": sig, "ts": time.time()}
+
+
+async def signal_prefetch_engine():
+    """
+    Background engine ya pre-fetching signals (v52).
+    - Inafetch active pairs tu (zilizotumiwa ndani ya dakika 10)
+    - User akihacha → pairs zinatoka active list → engine inasimama
+    - User akirudi → mark_pair_active() → engine inaanza tena
+    """
+    logging.info("Signal Prefetch Engine v52 starting...")
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            market_open  = not is_market_closed()
+            active_pairs = get_active_pairs()
+
+            if not active_pairs:
+                await asyncio.sleep(1)
+                continue
+
+            for pair in active_pairs:
+                if "OTC" not in pair and not market_open:
+                    continue
+                if get_prefetched_signal(pair) is not None:
+                    continue  # Bado fresh - ruka
+                try:
+                    sig = await asyncio.wait_for(safe_generate_signal(pair), timeout=25)
+                    set_prefetched_signal(pair, sig)
+                    logging.info("PREFETCH {}: dir={} tf={}m".format(
+                        pair, sig.get("direction", "?"), sig.get("timeframe", 0)))
+                except Exception as _pfe:
+                    logging.warning("PREFETCH failed {}: {}".format(pair, _pfe))
+                await asyncio.sleep(0.3)
+
+        except Exception as e:
+            logging.warning("signal_prefetch_engine error: {}".format(e))
+        await asyncio.sleep(1)
+
+
+async def safe_generate_signal_cached(pair: str) -> tuple:
+    """Tumia cache kama ipo na fresh, vinginevyo fetch upya."""
+    cached = get_prefetched_signal(pair)
+    if cached is not None:
+        return cached, True
+    sig = await safe_generate_signal(pair)
+    set_prefetched_signal(pair, sig)
+    return sig, False
+
+
 async def background_learning_engine():
     """
     Main loop ya background learning.
@@ -10630,8 +10934,7 @@ def _vt_calc_atr(pair, period=14):
     if not symbol:
         return None
     try:
-        df = yf.download(symbol, period="2d", interval="5m",
-                         progress=False, auto_adjust=True)
+        df = _yf_download_cached(symbol, "2d", "5m")
         if df is None or len(df) < period + 1:
             return None
         high  = df["High"].squeeze()
@@ -11160,8 +11463,7 @@ def _quick_pair_quality_check(pair):
             real_pair = OTC_TO_REAL.get(pair, pair)
             symbol    = YAHOO_SYMBOLS.get(real_pair)
             if symbol:
-                df = yf.download(symbol, period="1d", interval="5m",
-                                 progress=False, auto_adjust=True)
+                df = _yf_download_cached(symbol, "1d", "5m")
                 if df is not None and len(df) >= 35:
                     direction_5m = _mtf_calc_direction(df)
                     if direction_5m is None:
@@ -11399,6 +11701,10 @@ async def run_bot():
     # -- Launch Background Learning Engine (v50) ---------------
     asyncio.create_task(background_learning_engine())
     print("Background learning engine started.")
+
+    # -- Launch Signal Prefetch Engine (v52) -------------------
+    asyncio.create_task(signal_prefetch_engine())
+    print("Signal prefetch engine started.")
 
     # -- Launch stats reset loop (every 30 minutes) -------------
     asyncio.create_task(_stats_reset_loop())
