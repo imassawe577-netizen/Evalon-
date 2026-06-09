@@ -8698,6 +8698,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
+    # Cancel active auto scan
+    if data == "cancel_scan":
+        ev = _ACTIVE_SCANS.get(user_id)
+        if ev is not None:
+            ev.set()
+        try: await q.answer("✅ Scan imesimama.", show_alert=False)
+        except: pass
+        return
+
     if data=="choose_pair":
         # Delete previous menu/signal messages
         await delete_last_signal(context.bot, chat, user_id)
@@ -9729,6 +9738,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_last_bot_msg(user_id, _otcm.message_id)
             return
 
+        # -- AUTO SCAN: Major pairs zinaendesha smart scanner ------------------
+        if pair in AUTO_SCAN_PAIRS and not is_market_closed():
+            # Cancel scan iliyopo kama ipo
+            old_ev = _ACTIVE_SCANS.get(user_id)
+            if old_ev is not None:
+                old_ev.set()
+            await asyncio.sleep(0.1)
+            asyncio.create_task(auto_scan_and_send(context.bot, chat, user_id, pair, context))
+            return
         # -- Non-OTC: Bot decides TF automatically (1m/2m/3m) ----------------
         context.user_data["_user_chose_tf"] = False
         mark_pair_active(pair)
@@ -9921,6 +9939,253 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         task = asyncio.create_task(inactivity_expire(user_id, chat))
         USER_INACTIVITY[user_id]["task"] = task
+
+
+# ============================================================
+# AUTO SCAN PAIRS - Binary broker majors only
+# ============================================================
+AUTO_SCAN_PAIRS = {
+    "EUR/USD", "GBP/USD", "USD/JPY",
+    "AUD/USD", "USD/CAD", "EUR/JPY", "GBP/JPY",
+    "CAD/JPY", "EUR/GBP", "CHF/JPY",
+    "AUD/CHF", "AUD/CAD", "AUD/JPY"
+}
+
+# Track active scans per user to allow cancel
+_ACTIVE_SCANS = {}  # {user_id: asyncio.Event (cancel event)}
+
+async def auto_scan_and_send(bot, chat, user_id, pair, context):
+    """
+    Smart entry scanner kwa non-OTC major pairs.
+    Inascan kila 45 sec, inangoja signal nzuri, kisha inatuma.
+    Timeout: dakika 12. User anaweza cancel wakati wowote.
+    
+    Signal inachukuliwa kuwa nzuri kama:
+      - sig.flat == False
+      - timeframe > 0
+      - indicators_agree >= 5
+      - strength >= 150
+    """
+    SCAN_INTERVAL  = 45   # seconds kati ya scans
+    MAX_WAIT_SECS  = 720  # dakika 12 timeout
+    MIN_INDICATORS = 5    # indicators lazima zikubaliane
+    MIN_STRENGTH   = 150  # signal strength ya chini
+
+    # Cancel event - kama user atachagua pair nyingine au cancel
+    cancel_ev = asyncio.Event()
+    _ACTIVE_SCANS[user_id] = cancel_ev
+
+    # Tumia orodha ya pairs kubwa (binary-compatible) kwa display
+    PAIR_EMOJIS = {
+        "EUR/USD": "🇪🇺🇺🇸", "GBP/USD": "🇬🇧🇺🇸",
+        "USD/JPY": "🇺🇸🇯🇵", "AUD/USD": "🇦🇺🇺🇸",
+        "USD/CAD": "🇺🇸🇨🇦", "EUR/JPY": "🇪🇺🇯🇵",
+        "GBP/JPY": "🇬🇧🇯🇵", "CAD/JPY": "🇨🇦🇯🇵",
+        "EUR/GBP": "🇪🇺🇬🇧", "CHF/JPY": "🇨🇭🇯🇵",
+        "AUD/CHF": "🇦🇺🇨🇭", "AUD/CAD": "🇦🇺🇨🇦",
+        "AUD/JPY": "🇦🇺🇯🇵",
+    }
+    emoji = PAIR_EMOJIS.get(pair, "📊")
+
+    # Tuma scanning message
+    cancel_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel Scan", callback_data="cancel_scan")]
+    ])
+    try:
+        scan_msg = await bot.send_message(
+            chat_id=chat,
+            text=(
+                "🔍 *Scanning {}* {}\n\n"
+                "⏳ Waiting for best entry...\n"
+                "📡 Analysing market structure\n\n"
+                "_Bot will alert you automatically when a strong entry is found._"
+            ).format(pair, emoji),
+            parse_mode="Markdown",
+            reply_markup=cancel_kb
+        )
+        save_last_bot_msg(user_id, scan_msg.message_id)
+    except Exception as e:
+        logging.warning("auto_scan: send scanning msg failed {}: {}".format(pair, e))
+        return
+
+    elapsed    = 0
+    scan_count = 0
+    found      = False
+
+    try:
+        while elapsed < MAX_WAIT_SECS:
+            # Check cancel
+            if cancel_ev.is_set() or _ACTIVE_SCANS.get(user_id) is not cancel_ev:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text="❌ *Scan cancelled.*",
+                        parse_mode="Markdown"
+                    )
+                except: pass
+                return
+
+            # Wait interval (wakati huu user anaweza cancel)
+            if scan_count > 0:
+                try:
+                    await asyncio.wait_for(cancel_ev.wait(), timeout=SCAN_INTERVAL)
+                    # cancel_ev liwashwa - toka
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat,
+                            message_id=scan_msg.message_id,
+                            text="❌ *Scan cancelled.*",
+                            parse_mode="Markdown"
+                        )
+                    except: pass
+                    return
+                except asyncio.TimeoutError:
+                    pass  # Normal - endelea scan
+
+            scan_count += 1
+            elapsed = scan_count * SCAN_INTERVAL
+
+            # Update scanning message na progress
+            dots = "." * ((scan_count % 3) + 1)
+            mins_left = max(0, (MAX_WAIT_SECS - elapsed) // 60)
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat,
+                    message_id=scan_msg.message_id,
+                    text=(
+                        "🔍 *Scanning {}* {}\n\n"
+                        "📡 Scan #{}{}\n"
+                        "⏱ ~{}m remaining\n\n"
+                        "_Waiting for a strong entry signal..._"
+                    ).format(pair, emoji, scan_count, dots, mins_left),
+                    parse_mode="Markdown",
+                    reply_markup=cancel_kb
+                )
+            except: pass
+
+            # Generate signal na ukague ubora
+            try:
+                sig, _ = await safe_generate_signal_cached(pair)
+
+                if sig is None:
+                    continue
+
+                is_flat       = sig.get("flat", False)
+                tf            = sig.get("timeframe", 0)
+                ind_agree     = sig.get("indicators_agree", 0)
+                strength_val  = sig.get("strength", 0)
+
+                # Normalize strength kama ilivyo kwenye sel_ handler
+                _s = strength_val
+                if isinstance(_s, int) and _s > 450:
+                    _s = int(90 + (min(500, max(300, _s)) - 300) / 200 * 360)
+                elif isinstance(_s, int) and _s < 90:
+                    _s = int(90 + (max(35, min(97, _s)) - 35) / 62 * 360)
+                _s = max(90, min(450, int(_s)))
+
+                logging.info("AUTO_SCAN {}: scan#{} flat={} tf={} ind={} str={}".format(
+                    pair, scan_count, is_flat, tf, ind_agree, _s))
+
+                # Angalia kama signal ni nzuri ya kutosha
+                if (not is_flat and tf > 0
+                        and ind_agree >= MIN_INDICATORS
+                        and _s >= MIN_STRENGTH):
+
+                    # Deriv confirmation kwa pair hizi
+                    direction = sig["direction"]
+                    timeframe = tf
+
+                    if pair in DERIV_SYMBOLS:
+                        try:
+                            _best_tf, _best_str, _micro_dir, _reason = await pick_best_tf_deriv(pair)
+                            if _best_tf is not None and _micro_dir is not None:
+                                direction = _micro_dir
+                                timeframe = _best_tf
+                        except Exception as _de:
+                            logging.warning("auto_scan Deriv confirm failed {}: {}".format(pair, _de))
+
+                    # Futa scanning message
+                    try:
+                        await bot.delete_message(chat_id=chat, message_id=scan_msg.message_id)
+                    except: pass
+
+                    # Tuma signal rasmi
+                    ib    = direction == "BUY"
+                    img   = get_buy_image() if ib else get_sell_image()
+                    arrow = "Up 🟢" if ib else "Down 🔴"
+
+                    # Entry time (dakika/saa)
+                    now_t  = datetime.utcnow()
+                    entry_t = now_t + timedelta(minutes=1)
+                    entry_str = entry_t.strftime("%H:%M") + " UTC"
+
+                    cap = (
+                        "⚡ *AUTO SIGNAL FOUND*\n\n"
+                        "{} *{}* {}\n"
+                        "🕐 Entry: *{}* | Expiry: *{}m*\n"
+                        "📊 Strength: *{}%*\n"
+                        "✅ Scan #{} — conditions confirmed"
+                    ).format(
+                        emoji, pair, arrow,
+                        entry_str, timeframe,
+                        _s, scan_count
+                    )
+
+                    await delete_last_signal(bot, chat, user_id)
+                    entry_price = _fetch_current_price(pair)
+                    save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=entry_price)
+                    if not is_licensed(user_id): use_free_signal(user_id)
+
+                    sent_msg = await bot.send_photo(
+                        chat_id=chat,
+                        photo=img,
+                        caption=cap,
+                        parse_mode="Markdown",
+                        reply_markup=signal_keyboard(pair)
+                    )
+                    save_last_signal_msg(user_id, sent_msg.message_id)
+                    record_signal(pair, direction)
+
+                    # Result tracker
+                    if entry_price is not None:
+                        asyncio.create_task(
+                            schedule_result_check(bot, chat, user_id, pair, direction, timeframe, entry_price)
+                        )
+
+                    inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
+                    found = True
+                    return
+
+            except Exception as _se:
+                logging.warning("auto_scan generate failed {}: {}".format(pair, _se))
+                continue
+
+        # Timeout - signal haikupatikana ndani ya dakika 12
+        if not found:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat,
+                    message_id=scan_msg.message_id,
+                    text=(
+                        "⏰ *Scan Timeout* — {} {}\n\n"
+                        "Completed {} scans with no strong entry found.\n"
+                        "Market may be ranging or low volatility.\n\n"
+                        "_Try again later or select a different pair._"
+                    ).format(pair, emoji, scan_count),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Scan Again", callback_data="sel_{}".format(pair_to_idx(pair)))],
+                        [InlineKeyboardButton("📊 Choose Pair", callback_data="choose_pair")],
+                    ])
+                )
+            except: pass
+
+    finally:
+        # Futa scan kutoka registry
+        if _ACTIVE_SCANS.get(user_id) is cancel_ev:
+            _ACTIVE_SCANS.pop(user_id, None)
+
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id=update.effective_user.id
