@@ -2634,8 +2634,60 @@ _YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
 _YF_CACHE_TTL = 120     # sekunde 2 dakika
 _YF_CACHE_LOCK = _threading.Lock()
 
+# ============================================================
+# YF DOWNLOAD CACHE + FINNHUB FALLBACK (v53)
+# ============================================================
+# _yf_download_cached: Jaribu yfinance kwanza.
+# Kama yfinance inashindwa (timeout, error, data tupu),
+# jaribu Finnhub moja kwa moja kama pair ina OANDA symbol.
+# Hii inashughulikia kila call site yote mara moja.
+# ============================================================
+
+# interval/period → Finnhub resolution mapping
+_YF_TO_FH_RESOLUTION = {
+    "1m": "1", "2m": "1", "5m": "5", "15m": "15",
+    "30m": "30", "1h": "60", "1H": "60", "4h": "240",
+}
+# count ya candles kwa kila period
+_YF_PERIOD_TO_CANDLES = {
+    "1d": 390, "2d": 780, "3d": 1170, "5d": 1950, "7d": 2730,
+}
+
+def _fh_candles_as_df(fh_sym, resolution, count=200):
+    """Fanya Finnhub call na rudisha DataFrame au None. Internal helper."""
+    if not fh_sym or not FINNHUB_KEY:
+        return None
+    try:
+        now     = int(time.time())
+        res_sec = {"1":60,"5":300,"15":900,"30":1800,"60":3600,"240":14400}.get(str(resolution), 60)
+        from_ts = now - res_sec * (count + 60)
+        url = ("https://finnhub.io/api/v1/forex/candle"
+               "?symbol={}&resolution={}&from={}&to={}&token={}".format(
+                   fh_sym, resolution, from_ts, now, FINNHUB_KEY))
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        if d.get("s") != "ok" or not d.get("c"):
+            return None
+        df = pd.DataFrame({
+            "Open": d["o"], "High": d["h"], "Low": d["l"],
+            "Close": d["c"], "Volume": d.get("v", [0]*len(d["c"])),
+        }, index=pd.to_datetime(d["t"], unit="s"))
+        df.columns = pd.MultiIndex.from_tuples(
+            [(c, "") for c in df.columns]
+        ) if isinstance(df.columns, pd.MultiIndex) else df.columns
+        return df.iloc[-count:] if len(df) > count else df
+    except Exception as _fe:
+        logging.warning("_fh_candles_as_df {} res={} failed: {}".format(fh_sym, resolution, _fe))
+        return None
+
 def _yf_download_cached(symbol, period, interval):
-    """yf.download na cache ya dakika 2. Huzuia downloads 7+ kwa signal moja."""
+    """
+    yfinance download na cache ya dakika 2.
+    v53: kama yfinance inashindwa, jaribu Finnhub kama fallback.
+    Hii inashughulikia kila call site yote mara moja.
+    """
     key = (symbol, period, interval)
     now = time.time()
     with _YF_CACHE_LOCK:
@@ -2643,11 +2695,46 @@ def _yf_download_cached(symbol, period, interval):
             ts, df = _YF_CACHE[key]
             if now - ts < _YF_CACHE_TTL:
                 return df
+
+    df = None
+
+    # -- A) jaribu yfinance kwanza --
     try:
         df = yf.download(symbol, period=period, interval=interval,
                          progress=False, auto_adjust=True)
-    except Exception:
+        if df is None or len(df) < 5:
+            df = None
+    except Exception as _ye:
+        logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
+            symbol, period, interval, _ye))
         df = None
+
+    # -- B) Finnhub fallback kama yfinance imeshindwa --
+    if df is None:
+        # Pata fh_sym kutoka symbol ya Yahoo → pair name → OANDA symbol
+        # Reverse lookup: YAHOO_SYMBOLS value → key → FINNHUB_FOREX_SYMBOLS value
+        _fh_sym = None
+        try:
+            _yf_to_pair = {v: k for k, v in YAHOO_SYMBOLS.items()}
+            _pair_name  = _yf_to_pair.get(symbol)
+            if _pair_name:
+                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name)
+        except Exception:
+            pass
+
+        if _fh_sym and FINNHUB_KEY:
+            _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
+            _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
+            df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
+            if df is not None and len(df) >= 5:
+                logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
+                    symbol, period, interval, len(df)))
+            else:
+                df = None
+                logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
+                    symbol, period, interval))
+
+    # Cache kama data imepatikana
     if df is not None and len(df) > 0:
         with _YF_CACHE_LOCK:
             _YF_CACHE[key] = (now, df)
@@ -8746,8 +8833,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_non_otc = False  # pair is OTC
         entry_price = None
         trend = get_trend_direction(pair)
+        direction = "BUY"; timeframe = 1; strength = 180; flip_count = 0; sig = None
 
-        if check["action"] == "fresh":
+        try:
+          if check["action"] == "fresh":
             sig = await safe_generate_signal(pair)  # guaranteed - OTC always signals
             _anim_stop.set()
             direction = sig["direction"]
@@ -8789,17 +8878,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
-        elif check["action"] == "flip":
+          elif check["action"] == "flip":
             direction  = check["direction"]
             timeframe  = random.choice([1, 2, 3])
             strength   = random.randint(120, 300)
             flip_count = 1
-        else:
+          else:
             state_s    = get_user_signal_state(user_id, pair)
             flip_count = state_s["flip_count"] + 1 if state_s else 2
             direction  = check["direction"]
             timeframe  = random.choice([1, 2, 3])
             strength   = random.randint(120, 300)
+
+        except Exception as _otn_err:
+            logging.warning("otc_normal_ signal failed {}: {}".format(pair, _otn_err))
+            _anim_stop.set()
+            try: await cm.delete()
+            except: pass
+            _nsm = await context.bot.send_message(
+                chat_id=chat,
+                text="⚠️ *Signal unavailable* — please try again.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx_str))]
+                ])
+            )
+            save_last_bot_msg(user_id, _nsm.message_id)
+            return
+        finally:
+            _anim_stop.set()
 
         save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None)
         if check["action"] != "fresh":
@@ -9465,7 +9572,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_user_signal_state(user_id, pair)
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
 
-        if check["action"] == "fresh":
+        # v53 FIX: Hifadhi variables hapa - zitumike nje ya try block pia
+        direction  = "BUY"
+        timeframe  = 1
+        strength   = 180
+        flip_count = 0
+        sig        = None
+
+        try:
+          if check["action"] == "fresh":
             sig, _from_cache = await safe_generate_signal_cached(pair)
             if _from_cache:
                 logging.info("PREFETCH HIT {}: signal served from cache".format(pair))
@@ -9492,22 +9607,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Override with dominant trend if available
             if trend is not None:
                 direction = trend
-            # Non-OTC: no signal if confluence weak - never guess
-            elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 6):
-                try: await cm.delete()
-                except: pass
-                await delete_last_signal(context.bot, chat, user_id)
-                _nsm = await context.bot.send_message(
-                    chat_id=chat,
-                    text=sig.get("no_signal_reason") or "🟡 *No signal available*",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Get More", callback_data="getmore_{}".format(pair_to_idx(pair)))]
-                    ])
-                )
-                save_last_bot_msg(user_id, _nsm.message_id)
-                return
-            elif is_non_otc and sig.get("indicators_agree", 7) < 4:
+            # Non-OTC: no signal kama indicators dhaifu sana (< 3, si < 6)
+            # Threshold imeshushwa: 6 ilikuwa inazuia signals nyingi za kawaida
+            elif is_non_otc and (sig.get("flat") or sig.get("indicators_agree", 10) < 3):
                 try: await cm.delete()
                 except: pass
                 await delete_last_signal(context.bot, chat, user_id)
@@ -9541,7 +9643,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # Deriv imeshindwa - fallback kwa MTF direction
             # ---------------------------------------------------------
 
-        else:
+          else:
             # Non-fresh check actions (flip/same) - always generate a fresh signal
             # instead of using cached/flipped direction. Every request gets real market data.
             sig2       = await safe_generate_signal(pair)
@@ -9551,6 +9653,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             strength   = sig2["strength"]
             flip_count = 0
             sig        = sig2  # use fresh sig for display details
+
+        except Exception as _sel_err:
+            # v53 FIX: Exception yoyote hapa haitasababisha analyzing message kubaki
+            logging.warning("sel_ signal generation failed {}: {}".format(pair, _sel_err))
+            _anim_stop.set()
+            try: await cm.delete()
+            except: pass
+            _nsm = await context.bot.send_message(
+                chat_id=chat,
+                text="⚠️ *Signal unavailable* — please try again in a moment.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="getmore_{}".format(idx))]
+                ])
+            )
+            save_last_bot_msg(user_id, _nsm.message_id)
+            return
+        finally:
+            # v53 FIX: Hakikisha animation imesimama DAIMA - hata kama kuna return au exception
+            _anim_stop.set()
 
         # Save state with updated flip_count
         # entry_price was already captured at signal request time (above)
