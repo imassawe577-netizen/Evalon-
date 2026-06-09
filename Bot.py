@@ -3611,11 +3611,29 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
             if "OTC" in pair:
                 continue
 
-            result_text = (
-                "🏆 *EVALON WINNERS BOT {}* TF {}M - *WON* ✅".format(pair, timeframe_mins)
-                if won_user else
-                "💔 *EVALON WINNERS BOT {}* TF {}M - *LOSS* ❌".format(pair, timeframe_mins)
+            won_label  = "WIN ✅" if won_user else "LOSS ❌"
+            dir_label  = "BUY 🟢" if direction == "BUY" else "SELL 🔴"
+            dir_arrow  = "📈" if direction == "BUY" else "📉"
+            won_footer = (
+                "💰 Congratulations\\! Another profit secured\\!\n"
+                "🔥 Stay focused — more signals coming\\!\n"
+                "💎 VVIP MEMBERS ONLY"
+            ) if won_user else (
+                "📉 Not every trade wins — stay disciplined\\!\n"
+                "🔁 Next signal coming soon\\.\n"
+                "💎 VVIP MEMBERS ONLY"
             )
+
+            result_text = (
+                "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
+                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+                "📊 PAIR      : *{}*\n"
+                "⏱ EXPIRY    : *{} MIN*\n"
+                "{} DIRECTION : *{}*\n"
+                "🏆 RESULT    : *{}*\n"
+                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
+                "{}"
+            ).format(pair, timeframe_mins, dir_arrow, dir_label, won_label, won_footer)
             try:
                 sent = await bot.send_message(chat_id=chat_id, text=result_text,
                                               parse_mode="Markdown")
@@ -8828,21 +8846,10 @@ AUTO_SCAN_PAIRS = {
 _ACTIVE_SCANS = {}  # {user_id: asyncio.Event (cancel event)}
 
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
-    """
-    Smart entry scanner kwa non-OTC major pairs.
-    Inascan kila 45 sec, inangoja signal nzuri, kisha inatuma.
-    Timeout: dakika 12. User anaweza cancel wakati wowote.
-
-    Signal inachukuliwa kuwa nzuri kama:
-      - sig.flat == False
-      - timeframe > 0
-      - indicators_agree >= 5
-      - strength >= 150
-    """
-    SCAN_INTERVAL  = 45   # seconds kati ya scans
-    MAX_WAIT_SECS  = 720  # dakika 12 timeout
-    MIN_INDICATORS = 5    # indicators lazima zikubaliane
-    MIN_STRENGTH   = 150  # signal strength ya chini
+    SCAN_INTERVAL  = 45
+    MIN_INDICATORS = 5
+    MIN_STRENGTH   = 150
+    COOLDOWN_SECS  = 90  # subiri baada ya signal kabla ya scan nyingine
 
     cancel_ev = asyncio.Event()
     _ACTIVE_SCANS[user_id] = cancel_ev
@@ -8858,140 +8865,134 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     }
     emoji = PAIR_EMOJIS.get(pair, "📊")
 
-    cancel_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel Scan", callback_data="cancel_scan")]
+    stop_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Stop Auto Scan", callback_data="cancel_scan")]
     ])
+
+    def _is_cancelled():
+        return cancel_ev.is_set() or _ACTIVE_SCANS.get(user_id) is not cancel_ev
+
+    async def _wait(secs):
+        try:
+            await asyncio.wait_for(cancel_ev.wait(), timeout=secs)
+        except asyncio.TimeoutError:
+            pass
+
+    # Send initial scanning message
     try:
         scan_msg = await bot.send_message(
             chat_id=chat,
             text=(
-                "🔍 *Scanning {}* {}\n\n"
-                "⏳ Waiting for best entry...\n"
-                "📡 Analysing market structure\n\n"
-                "_Bot will alert you automatically when a strong entry is found._"
+                "🔍 *Auto Scan Started* — {} {}\n\n"
+                "📡 Scanning market continuously...\n"
+                "⚡ Every strong signal will be sent automatically.\n\n"
+                "_Tap Stop to end the session._"
             ).format(pair, emoji),
             parse_mode="Markdown",
-            reply_markup=cancel_kb
+            reply_markup=stop_kb
         )
         save_last_bot_msg(user_id, scan_msg.message_id)
     except Exception as e:
-        logging.warning("auto_scan: send scanning msg failed {}: {}".format(pair, e))
+        logging.warning("auto_scan: start msg failed {}: {}".format(pair, e))
         return
 
-    elapsed    = 0
-    scan_count = 0
-    found      = False
+    scan_count   = 0
+    signal_count = 0
 
     try:
-        while elapsed < MAX_WAIT_SECS:
-            if cancel_ev.is_set() or _ACTIVE_SCANS.get(user_id) is not cancel_ev:
+        while True:
+            if _is_cancelled():
                 try:
                     await bot.edit_message_text(
                         chat_id=chat,
                         message_id=scan_msg.message_id,
-                        text="❌ *Scan cancelled.*",
+                        text=(
+                            "⏹ *Auto Scan Stopped* — {} {}\n\n"
+                            "📊 Signals sent: *{}*\n"
+                            "🔍 Scans completed: *{}*"
+                        ).format(emoji, pair, signal_count, scan_count),
                         parse_mode="Markdown"
                     )
                 except: pass
                 return
 
+            # Wait between scans
             if scan_count > 0:
-                try:
-                    await asyncio.wait_for(cancel_ev.wait(), timeout=SCAN_INTERVAL)
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat,
-                            message_id=scan_msg.message_id,
-                            text="❌ *Scan cancelled.*",
-                            parse_mode="Markdown"
-                        )
-                    except: pass
-                    return
-                except asyncio.TimeoutError:
-                    pass  # Normal - endelea scan
+                await _wait(SCAN_INTERVAL)
+                if _is_cancelled():
+                    continue
 
             scan_count += 1
-            elapsed = scan_count * SCAN_INTERVAL
-
             dots = "." * ((scan_count % 3) + 1)
-            mins_left = max(0, (MAX_WAIT_SECS - elapsed) // 60)
+
+            # Update scanning status
             try:
                 await bot.edit_message_text(
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "🔍 *Scanning {}* {}\n\n"
-                        "📡 Scan #{}{}\n"
-                        "⏱ ~{}m remaining\n\n"
-                        "_Waiting for a strong entry signal..._"
-                    ).format(pair, emoji, scan_count, dots, mins_left),
+                        "🔍 *Scanning{}* — {} {}\n\n"
+                        "📡 Scan #{} | Signals sent: {}\n\n"
+                        "_Waiting for strong entry..._"
+                    ).format(dots, pair, emoji, scan_count, signal_count),
                     parse_mode="Markdown",
-                    reply_markup=cancel_kb
+                    reply_markup=stop_kb
                 )
             except: pass
 
+            # Generate and evaluate signal
             try:
                 sig, _ = await safe_generate_signal_cached(pair)
-
                 if sig is None:
                     continue
 
-                is_flat       = sig.get("flat", False)
-                tf            = sig.get("timeframe", 0)
-                ind_agree     = sig.get("indicators_agree", 0)
-                strength_val  = sig.get("strength", 0)
+                is_flat   = sig.get("flat", False)
+                tf        = sig.get("timeframe", 0)
+                ind_agree = sig.get("indicators_agree", 0)
+                _s        = sig.get("strength", 0)
 
-                _s = strength_val
                 if isinstance(_s, int) and _s > 450:
                     _s = int(90 + (min(500, max(300, _s)) - 300) / 200 * 360)
                 elif isinstance(_s, int) and _s < 90:
                     _s = int(90 + (max(35, min(97, _s)) - 35) / 62 * 360)
                 _s = max(90, min(450, int(_s)))
 
-                logging.info("AUTO_SCAN {}: scan#{} flat={} tf={} ind={} str={}".format(
+                logging.info("AUTO_SCAN {}: #{} flat={} tf={} ind={} str={}".format(
                     pair, scan_count, is_flat, tf, ind_agree, _s))
 
-                if (not is_flat and tf > 0
-                        and ind_agree >= MIN_INDICATORS
-                        and _s >= MIN_STRENGTH):
+                if not is_flat and tf > 0 and ind_agree >= MIN_INDICATORS and _s >= MIN_STRENGTH:
 
                     direction = sig["direction"]
                     timeframe = tf
 
                     if pair in DERIV_SYMBOLS:
                         try:
-                            _best_tf, _best_str, _micro_dir, _reason = await pick_best_tf_deriv(pair)
-                            if _best_tf is not None and _micro_dir is not None:
-                                direction = _micro_dir
-                                timeframe = _best_tf
+                            _bt, _bs, _md, _r = await pick_best_tf_deriv(pair)
+                            if _bt is not None and _md is not None:
+                                direction = _md
+                                timeframe = _bt
                         except Exception as _de:
                             logging.warning("auto_scan Deriv confirm failed {}: {}".format(pair, _de))
 
-                    try:
-                        await bot.delete_message(chat_id=chat, message_id=scan_msg.message_id)
-                    except: pass
-
-                    ib    = direction == "BUY"
-                    img   = get_buy_image() if ib else get_sell_image()
-                    arrow = "Up 🟢" if ib else "Down 🔴"
-
-                    now_t  = datetime.utcnow()
-                    entry_t = now_t + timedelta(minutes=1)
-                    entry_str = entry_t.strftime("%H:%M") + " UTC"
+                    ib        = direction == "BUY"
+                    img       = get_buy_image() if ib else get_sell_image()
+                    dir_arrow = "📈" if ib else "📉"
+                    dir_label = "BUY 🟢" if ib else "SELL 🔴"
+                    entry_str = (datetime.utcnow() + timedelta(minutes=1)).strftime("%H:%M") + " UTC"
+                    signal_count += 1
 
                     cap = (
-                        "⚡ *AUTO SIGNAL FOUND*\n\n"
-                        "{} *{}* {}\n"
-                        "🕐 Entry: *{}* | Expiry: *{}m*\n"
-                        "📊 Strength: *{}%*\n"
-                        "✅ Scan #{} — conditions confirmed"
-                    ).format(
-                        emoji, pair, arrow,
-                        entry_str, timeframe,
-                        _s, scan_count
-                    )
+                        "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
+                        "--------------\n"
+                        "📊 PAIR      : *{}*\n"
+                        "⏱ EXPIRY    : *{} MIN*\n"
+                        "🕐 ENTRY     : *{}*\n"
+                        "{} DIRECTION : *{}*\n"
+                        "--------------\n\n"
+                        "⚡ OPEN YOUR TRADE NOW\\!\n"
+                        "💎 VVIP MEMBERS ONLY"
+                    ).format(pair, timeframe, entry_str, dir_arrow, dir_label)
 
-                    await delete_last_signal(bot, chat, user_id)
                     entry_price = _fetch_current_price(pair)
                     save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=entry_price)
                     if not is_licensed(user_id): use_free_signal(user_id)
@@ -9001,7 +9002,9 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                         photo=img,
                         caption=cap,
                         parse_mode="Markdown",
-                        reply_markup=signal_keyboard(pair)
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⏹ Stop Auto Scan", callback_data="cancel_scan")]
+                        ])
                     )
                     save_last_signal_msg(user_id, sent_msg.message_id)
                     record_signal(pair, direction)
@@ -9011,36 +9014,17 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                             schedule_result_check(bot, chat, user_id, pair, direction, timeframe, entry_price)
                         )
 
-                    inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
-                    found = True
-                    return
+                    # Cooldown kabla ya scan nyingine
+                    await _wait(COOLDOWN_SECS)
 
             except Exception as _se:
                 logging.warning("auto_scan generate failed {}: {}".format(pair, _se))
                 continue
 
-        if not found:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat,
-                    message_id=scan_msg.message_id,
-                    text=(
-                        "⏰ *Scan Timeout* — {} {}\n\n"
-                        "Completed {} scans with no strong entry found.\n"
-                        "Market may be ranging or low volatility.\n\n"
-                        "_Try again later or select a different pair._"
-                    ).format(pair, emoji, scan_count),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Scan Again", callback_data="sel_{}".format(pair_to_idx(pair)))],
-                        [InlineKeyboardButton("📊 Choose Pair", callback_data="choose_pair")],
-                    ])
-                )
-            except: pass
-
     finally:
         if _ACTIVE_SCANS.get(user_id) is cancel_ev:
             _ACTIVE_SCANS.pop(user_id, None)
+
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id=update.effective_user.id
