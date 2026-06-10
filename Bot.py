@@ -7690,10 +7690,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cancel_scan":
-        ev = _ACTIVE_SCANS.get(user_id)
+        ev = _ACTIVE_SCANS.get(int(user_id))
         if ev is not None:
             ev.set()
-        try: await q.answer("✅ Scan imesimama.", show_alert=False)
+        try: await q.answer("⏹ Scan stopped.", show_alert=False)
         except: pass
         return
 
@@ -8845,14 +8845,87 @@ AUTO_SCAN_PAIRS = {
 
 _ACTIVE_SCANS = {}  # {user_id: asyncio.Event (cancel event)}
 
+USER_TZ_OFFSET = {}  # {user_id: timedelta}
+
+def _get_user_local_time(user_id):
+    now_utc = datetime.utcnow()
+    offset  = USER_TZ_OFFSET.get(int(user_id))
+    if offset is not None:
+        return now_utc + offset
+    try:
+        import pytz
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT timezone FROM user_settings WHERE user_id=%s", (user_id,))
+                row = cur.fetchone()
+        if row and row.get("timezone"):
+            tz = pytz.timezone(row["timezone"])
+            return datetime.now(tz).replace(tzinfo=None)
+    except Exception:
+        pass
+    return now_utc
+
+def _get_next_candle_open(user_id):
+    """
+    Pata wakati wa mwanzo wa candle inayofuata (1m).
+    Subiri hadi sekunde 0 ya dakika inayofuata.
+    Returns: (entry_str, secs_until_open, secs_until_close)
+    secs_until_close = secs_until_open + 60 (mwisho wa candle hiyo)
+    """
+    now_local    = _get_user_local_time(user_id)
+    now_utc      = datetime.utcnow()
+    next_min_utc = now_utc.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    next_min_loc = now_local.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    secs_until   = max(0, (next_min_utc - now_utc).total_seconds())
+    entry_str    = next_min_loc.strftime("%H:%M")
+    return entry_str, secs_until, secs_until + 60
+
+
+def _confirm_real_candle_direction(pair, expected_direction):
+    """
+    Fix #6: Thibitisha direction kwa kuangalia candle ya sasa kweli kweli.
+    Angalia candles 3 za mwisho za 1m — lazima 2 kati ya 3 zielekee direction.
+    Returns: True kama confirmed, False kama hazilingani.
+    """
+    try:
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        symbol = YAHOO_SYMBOLS.get(real_pair)
+        if not symbol:
+            return True  # Kama hatuipati data, ruhusu signal iendelee
+        df = _yf_download_cached(symbol, "1d", "1m")
+        if df is None or len(df) < 3:
+            return True
+        opens  = df["Open"].squeeze().astype(float)
+        closes = df["Close"].squeeze().astype(float)
+        votes = 0
+        for i in [-1, -2, -3]:
+            is_bull = float(closes.iloc[i]) > float(opens.iloc[i])
+            if expected_direction == "BUY" and is_bull:
+                votes += 1
+            elif expected_direction == "SELL" and not is_bull:
+                votes += 1
+        confirmed = votes >= 2
+        logging.info("CANDLE CONFIRM {}: dir={} votes={}/3 confirmed={}".format(
+            pair, expected_direction, votes, confirmed))
+        return confirmed
+    except Exception as e:
+        logging.warning("_confirm_real_candle_direction failed {}: {}".format(pair, e))
+        return True  # Usiblock signal kwa sababu ya error
+
+
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
+    # Fix #5: 1m tu
+    FIXED_TF       = 1
     SCAN_INTERVAL  = 45
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
-    COOLDOWN_SECS  = 90  # subiri baada ya signal kabla ya scan nyingine
+    COOLDOWN_SECS  = 75  # subiri sekunde 75 baada ya signal (ni > 1m expiry)
+
+    # Fix #1: Tumia int(user_id) consistently
+    uid = int(user_id)
 
     cancel_ev = asyncio.Event()
-    _ACTIVE_SCANS[user_id] = cancel_ev
+    _ACTIVE_SCANS[uid] = cancel_ev
 
     PAIR_EMOJIS = {
         "EUR/USD": "🇪🇺🇺🇸", "GBP/USD": "🇬🇧🇺🇸",
@@ -8865,12 +8938,13 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     }
     emoji = PAIR_EMOJIS.get(pair, "📊")
 
+    # Fix #1: button inatumia uid string sahihi
     stop_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏹ Stop Auto Scan", callback_data="cancel_scan")]
+        [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
     ])
 
     def _is_cancelled():
-        return cancel_ev.is_set() or _ACTIVE_SCANS.get(user_id) is not cancel_ev
+        return cancel_ev.is_set() or _ACTIVE_SCANS.get(uid) is not cancel_ev
 
     async def _wait(secs):
         try:
@@ -8878,26 +8952,27 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
         except asyncio.TimeoutError:
             pass
 
-    # Send initial scanning message
     try:
         scan_msg = await bot.send_message(
             chat_id=chat,
             text=(
                 "🔍 *Auto Scan Started* — {} {}\n\n"
-                "📡 Scanning market continuously...\n"
-                "⚡ Every strong signal will be sent automatically.\n\n"
-                "_Tap Stop to end the session._"
+                "📡 Scanning market continuously\\.\\.\\.\n"
+                "⚡ Every strong signal will be sent automatically\\.\n\n"
+                "_Tap Stop to end the session\\._"
             ).format(pair, emoji),
-            parse_mode="Markdown",
+            parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
-        save_last_bot_msg(user_id, scan_msg.message_id)
+        save_last_bot_msg(uid, scan_msg.message_id)
     except Exception as e:
         logging.warning("auto_scan: start msg failed {}: {}".format(pair, e))
         return
 
-    scan_count   = 0
-    signal_count = 0
+    scan_count    = 0
+    signal_count  = 0
+    scan_wins_ref    = [0]  # list ili iwe mutable ndani ya nested function
+    scan_losses_ref  = [0]
 
     try:
         while True:
@@ -8908,39 +8983,38 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                         message_id=scan_msg.message_id,
                         text=(
                             "⏹ *Auto Scan Stopped* — {} {}\n\n"
-                            "📊 Signals sent: *{}*\n"
-                            "🔍 Scans completed: *{}*"
-                        ).format(emoji, pair, signal_count, scan_count),
+                            "🏆 Won: *{}*   💔 Lost: *{}*\n"
+                            "📊 Total signals: *{}*"
+                        ).format(emoji, pair,
+                                 scan_wins_ref[0], scan_losses_ref[0],
+                                 scan_wins_ref[0] + scan_losses_ref[0]),
                         parse_mode="Markdown"
                     )
                 except: pass
                 return
 
-            # Wait between scans
             if scan_count > 0:
                 await _wait(SCAN_INTERVAL)
                 if _is_cancelled():
                     continue
 
             scan_count += 1
-            dots = "." * ((scan_count % 3) + 1)
+            anim = ["🔍", "🔎", "📡", "🔍"][scan_count % 4]
 
-            # Update scanning status
             try:
                 await bot.edit_message_text(
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "🔍 *Scanning{}* — {} {}\n\n"
-                        "📡 Scan #{} | Signals sent: {}\n\n"
-                        "_Waiting for strong entry..._"
-                    ).format(dots, pair, emoji, scan_count, signal_count),
-                    parse_mode="Markdown",
+                        "{} *Scanning* — {} {}\n\n"
+                        "Scan \\#{} \\| Signals: {}\n\n"
+                        "_Analysing market\\.\\.\\._"
+                    ).format(anim, pair, emoji, scan_count, signal_count),
+                    parse_mode="MarkdownV2",
                     reply_markup=stop_kb
                 )
             except: pass
 
-            # Generate and evaluate signal
             try:
                 sig, _ = await safe_generate_signal_cached(pair)
                 if sig is None:
@@ -8951,79 +9025,141 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                 ind_agree = sig.get("indicators_agree", 0)
                 _s        = sig.get("strength", 0)
 
-                if isinstance(_s, int) and _s > 450:
+                if isinstance(_s, (int, float)) and _s > 450:
                     _s = int(90 + (min(500, max(300, _s)) - 300) / 200 * 360)
-                elif isinstance(_s, int) and _s < 90:
+                elif isinstance(_s, (int, float)) and _s < 90:
                     _s = int(90 + (max(35, min(97, _s)) - 35) / 62 * 360)
                 _s = max(90, min(450, int(_s)))
 
-                logging.info("AUTO_SCAN {}: #{} flat={} tf={} ind={} str={}".format(
-                    pair, scan_count, is_flat, tf, ind_agree, _s))
+                # Fix #5: tumia 1m tu — ignore tf iliyotoka kwa engine
+                timeframe = FIXED_TF
 
-                if not is_flat and tf > 0 and ind_agree >= MIN_INDICATORS and _s >= MIN_STRENGTH:
+                # Fix #3: Fuata trend — ikiwa trend_1h ni BUY, direction lazima iwe BUY
+                direction   = sig["direction"]
+                trend_1h    = sig.get("trend_1h")
+                if trend_1h in ("BUY", "SELL") and direction != trend_1h:
+                    logging.info("AUTO_SCAN {}: direction {} overridden by trend_1h {}".format(
+                        pair, direction, trend_1h))
+                    direction = trend_1h
 
-                    direction = sig["direction"]
-                    timeframe = tf
+                logging.info("AUTO_SCAN {}: #{} flat={} tf={} ind={} str={} dir={} trend={}".format(
+                    pair, scan_count, is_flat, tf, ind_agree, _s, direction, trend_1h))
 
-                    if pair in DERIV_SYMBOLS:
-                        try:
-                            _bt, _bs, _md, _r = await pick_best_tf_deriv(pair)
-                            if _bt is not None and _md is not None:
-                                direction = _md
-                                timeframe = _bt
-                        except Exception as _de:
-                            logging.warning("auto_scan Deriv confirm failed {}: {}".format(pair, _de))
+                if not is_flat and ind_agree >= MIN_INDICATORS and _s >= MIN_STRENGTH:
+
+                    # Fix #6: Thibitisha kweli candle inakwenda direction hiyo
+                    candle_ok = _confirm_real_candle_direction(pair, direction)
+                    if not candle_ok:
+                        logging.info("AUTO_SCAN {}: CANDLE CONFIRM FAILED dir={} — skipping".format(
+                            pair, direction))
+                        continue
 
                     ib        = direction == "BUY"
                     img       = get_buy_image() if ib else get_sell_image()
                     dir_arrow = "📈" if ib else "📉"
                     dir_label = "BUY 🟢" if ib else "SELL 🔴"
-                    entry_str = (datetime.utcnow() + timedelta(minutes=1)).strftime("%H:%M") + " UTC"
+
+                    entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
                     signal_count += 1
 
                     cap = (
-                        "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
-                        "--------------\n"
+                        "🏆 *EVALON WINNERS* 🏆\n\n"
+                        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
                         "📊 PAIR      : *{}*\n"
-                        "⏱ EXPIRY    : *{} MIN*\n"
+                        "⏱ EXPIRY    : *1 MIN*\n"
                         "🕐 ENTRY     : *{}*\n"
                         "{} DIRECTION : *{}*\n"
-                        "--------------\n\n"
-                        "⚡ OPEN YOUR TRADE NOW\\!\n"
-                        "💎 VVIP MEMBERS ONLY"
-                    ).format(pair, timeframe, entry_str, dir_arrow, dir_label)
+                        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
+                        "⚡ Open at next candle"
+                    ).format(pair, entry_str, dir_arrow, dir_label)
 
                     entry_price = _fetch_current_price(pair)
-                    save_user_signal_state(user_id, pair, direction, timeframe, 0, entry_price=entry_price)
-                    if not is_licensed(user_id): use_free_signal(user_id)
+                    save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+                    if not is_licensed(uid): use_free_signal(uid)
 
                     sent_msg = await bot.send_photo(
                         chat_id=chat,
                         photo=img,
                         caption=cap,
-                        parse_mode="Markdown",
+                        parse_mode="MarkdownV2",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⏹ Stop Auto Scan", callback_data="cancel_scan")]
+                            [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
                         ])
                     )
-                    save_last_signal_msg(user_id, sent_msg.message_id)
+                    save_last_signal_msg(uid, sent_msg.message_id)
                     record_signal(pair, direction)
 
                     if entry_price is not None:
                         asyncio.create_task(
-                            schedule_result_check(bot, chat, user_id, pair, direction, timeframe, entry_price)
+                            auto_scan_result_check(
+                                bot, chat, uid, pair, direction, FIXED_TF,
+                                entry_price, secs_to_close,
+                                scan_wins_ref, scan_losses_ref
+                            )
                         )
 
-                    # Cooldown kabla ya scan nyingine
-                    await _wait(COOLDOWN_SECS)
+                    await _wait(secs_to_close + 5)
 
             except Exception as _se:
                 logging.warning("auto_scan generate failed {}: {}".format(pair, _se))
                 continue
 
     finally:
-        if _ACTIVE_SCANS.get(user_id) is cancel_ev:
-            _ACTIVE_SCANS.pop(user_id, None)
+        if _ACTIVE_SCANS.get(uid) is cancel_ev:
+            _ACTIVE_SCANS.pop(uid, None)
+
+
+async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price, secs_to_close=65, wins_ref=None, losses_ref=None):
+    if entry_price is None:
+        return
+
+    await asyncio.sleep(max(60, secs_to_close) + 3)
+
+    exit_price = None
+    for _ in range(3):
+        exit_price = _fetch_current_price(pair)
+        if exit_price is not None:
+            break
+        await asyncio.sleep(3)
+
+    if exit_price is None:
+        return
+
+    diff = exit_price - entry_price
+    if abs(diff) < 1e-8:
+        return
+
+    won = (diff > 0) if direction == "BUY" else (diff < 0)
+
+    if wins_ref is not None and losses_ref is not None:
+        if won:
+            wins_ref[0] += 1
+        else:
+            losses_ref[0] += 1
+
+    try: update_pair_stats(pair, won)
+    except Exception as _e: logging.warning("auto_scan_result pair_stats: {}".format(_e))
+    try:
+        sess = _get_session().get("name", "Unknown")
+        update_signal_combo_stats(pair=pair, direction=direction,
+                                  tf_mins=timeframe_mins, won=won, session=sess)
+    except Exception as _e: logging.warning("auto_scan_result combo_stats: {}".format(_e))
+    try: nn_feedback_from_vte(user_id, pair, won)
+    except Exception: pass
+
+    if not is_results_enabled():
+        return
+
+    result_text = "WIN 🏆" if won else "LOSS 💔"
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=result_text
+        )
+        push_msg_id(user_id, sent.message_id)
+    except Exception as e:
+        logging.warning("auto_scan_result send failed: {}".format(e))
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9047,7 +9183,48 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text=update.message.text.strip() if update.message.text else ""
 
-    if user_id==ADMIN_ID:
+    # /settimezone +3 au /settimezone -5 au /settimezone +5:30
+    if text.startswith("/settimezone"):
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "⏰ *Set Your Timezone*\n\n"
+                "Usage: `/settimezone +3` or `/settimezone -5` or `/settimezone +5:30`\n\n"
+                "Check your UTC offset — e.g. Nairobi is `+3`, London is `+0` or `+1`",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            raw = parts[1].replace("UTC", "").strip()
+            sign = -1 if raw.startswith("-") else 1
+            raw  = raw.lstrip("+-")
+            if ":" in raw:
+                h, m = raw.split(":")
+                total_mins = sign * (int(h) * 60 + int(m))
+            else:
+                total_mins = sign * int(raw) * 60
+            offset = timedelta(minutes=total_mins)
+            USER_TZ_OFFSET[int(user_id)] = offset
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO user_settings (user_id, timezone)
+                            VALUES (%s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET timezone = EXCLUDED.timezone
+                        """, (user_id, parts[1]))
+                    conn.commit()
+            except Exception: pass
+            sample = (_get_user_local_time(user_id)).strftime("%H:%M")
+            await update.message.reply_text(
+                "✅ *Timezone saved!*\n\nYour current time: `{}`".format(sample),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await update.message.reply_text("❌ Invalid format. Try: `/settimezone +3`", parse_mode="Markdown")
+        return
+
+
         if text=="/addmonthly" or text.startswith("/addmonthly "):
             try: count=min(int(text.split()[1]),50) if len(text.split())>1 else 1
             except: count=1
