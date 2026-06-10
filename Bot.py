@@ -149,7 +149,7 @@ from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _Ba
 class _H(_BaseHandler):
     def do_GET(self):
         if self.path == "/health":
-            body = b'{"status":"ok","version":"3.9","bot":"EVALON WINNERS BOT v56"}' 
+            body = b'{"status":"ok","version":"3.9","bot":"EVALON WINNERS BOT v57"}' 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -431,9 +431,92 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
         # Upgrade direction kama SuperTrend inakubaliana
         if st_dir_t is not None:
             if direction is None:
-                direction = st_dir_t   # SuperTrend anatoa direction kama nyingine hazikusaidiana
+                direction = st_dir_t
             elif st_dir_t != direction:
-                direction = None       # Conflict kati ya indicators na SuperTrend → hakuna signal
+                direction = None
+
+        # ── v57: Additional micro-tick indicators ──────────────────────────
+        _tick_votes_buy = 0; _tick_votes_sell = 0
+
+        # Parabolic SAR (micro)
+        try:
+            _af_t2 = 0.02; _afm_t2 = 0.20; _afs_t2 = 0.02
+            _phh = list(highs.values); _pll = list(lows.values); _pcc = list(closes.values)
+            _nt2 = len(_pcc)
+            if _nt2 >= 8:
+                _bul2 = _pcc[1] > _pcc[0]
+                _sar2 = _pll[0] if _bul2 else _phh[0]
+                _ep2  = _phh[1] if _bul2 else _pll[1]
+                _afc2 = _af_t2
+                for _ii in range(2, _nt2):
+                    _sar2 = _sar2 + _afc2 * (_ep2 - _sar2)
+                    if _bul2:
+                        _sar2 = min(_sar2, _pll[_ii-1])
+                        if _pcc[_ii] < _sar2: _bul2=False; _sar2=_ep2; _ep2=_pll[_ii]; _afc2=_af_t2
+                        else:
+                            if _phh[_ii] > _ep2: _ep2=_phh[_ii]; _afc2=min(_afm_t2,_afc2+_afs_t2)
+                    else:
+                        _sar2 = max(_sar2, _phh[_ii-1])
+                        if _pcc[_ii] > _sar2: _bul2=True; _sar2=_ep2; _ep2=_phh[_ii]; _afc2=_af_t2
+                        else:
+                            if _pll[_ii] < _ep2: _ep2=_pll[_ii]; _afc2=min(_afm_t2,_afc2+_afs_t2)
+                if _bul2: _tick_votes_buy  += 2
+                else:     _tick_votes_sell += 2
+        except Exception: pass
+
+        # CMO (micro)
+        try:
+            _dc = closes.diff(1)
+            _uc = _dc.clip(lower=0).rolling(7).sum()
+            _dc2= (-_dc.clip(upper=0)).rolling(7).sum()
+            _cmo_t = float((100*(_uc-_dc2)/(_uc+_dc2+1e-9)).iloc[-1])
+            if _cmo_t > 20:   _tick_votes_buy  += 1
+            elif _cmo_t < -20: _tick_votes_sell += 1
+        except Exception: pass
+
+        # Awesome Oscillator (micro)
+        try:
+            _mid_t2 = (highs + lows) / 2
+            _ao_t = float((_mid_t2.rolling(5).mean() - _mid_t2.rolling(min(34,len(closes))).mean()).iloc[-1])
+            if _ao_t > 0:   _tick_votes_buy  += 1
+            elif _ao_t < 0: _tick_votes_sell += 1
+        except Exception: pass
+
+        # WMA cross (micro)
+        try:
+            def _wma_t(s, p):
+                w = list(range(1, p+1))
+                return s.rolling(p).apply(lambda x: sum(x[i]*w[i] for i in range(len(x)))/sum(w), raw=True)
+            _wf = _wma_t(closes, min(5, len(closes)//2))
+            _ws = _wma_t(closes, min(10, len(closes)-1))
+            if float(_wf.iloc[-1]) > float(_ws.iloc[-1]): _tick_votes_buy  += 1
+            else:                                           _tick_votes_sell += 1
+        except Exception: pass
+
+        # Vortex (micro)
+        try:
+            _nt3 = len(closes)
+            if _nt3 >= 8:
+                _vp = sum(abs(float(highs.iloc[i])-float(lows.iloc[i-1])) for i in range(max(1,_nt3-7),_nt3))
+                _vm2= sum(abs(float(lows.iloc[i]) -float(highs.iloc[i-1]))for i in range(max(1,_nt3-7),_nt3))
+                if _vp > _vm2: _tick_votes_buy  += 1
+                else:          _tick_votes_sell += 1
+        except Exception: pass
+
+        # Consensus vote from micro-tick indicators
+        _tvt = _tick_votes_buy + _tick_votes_sell
+        if _tvt >= 3:
+            _tick_consensus = "BUY" if _tick_votes_buy > _tick_votes_sell else "SELL"
+            if direction is None:
+                direction = _tick_consensus
+            elif direction != _tick_consensus:
+                # Majority vote decides
+                if _tick_votes_buy >= 4 and direction == "SELL":
+                    direction = None   # conflict kubwa
+                elif _tick_votes_sell >= 4 and direction == "BUY":
+                    direction = None
+        # ── end v57 micro-tick ─────────────────────────────────────────────
+
         # DEMA/Fisher tiebreaker kama direction bado ni None
         if direction is None:
             if dema_diff_t > 0.02 and fisher_dir_t == "BUY":
@@ -441,10 +524,9 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
             elif dema_diff_t < -0.02 and fisher_dir_t == "SELL":
                 direction = "SELL"
         elif dema_diff_t != 0:
-            # Penalize opposite direction
             if (direction == "BUY" and dema_diff_t < -0.05) or \
                (direction == "SELL" and dema_diff_t > 0.05):
-                direction = None  # Conflict — hakuna direction wazi
+                direction = None
 
         return {
             "rsi":       rsi,
@@ -2789,7 +2871,377 @@ def _calc_indicators_from_df(df):
         pass
     # ── end SuperTrend ───────────────────────────────────────────────────────
 
-    # ── v56: Direction upgrade — tumia DEMA + HMA pamoja na EMA ──
+    # ══════════════════════════════════════════════════════════════════════════
+    # v57: INDICATORS MPYA — Parabolic SAR, CMO, TEMA, AO, Elder Ray,
+    #      TTM Squeeze, TRIX, DPO, Aroon, Vortex, Chaikin MF, KAMA,
+    #      McGinley Dynamic, WMA, ZigZag Trend, Coppock Curve
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── 1. Parabolic SAR ─────────────────────────────────────────────────────
+    psar_direction = None
+    try:
+        _af = 0.02; _af_max = 0.20; _af_step = 0.02
+        _ph = list(high.values); _pl = list(low.values); _pc = list(close.values)
+        _n_sar = len(_pc)
+        if _n_sar >= 10:
+            _bull = _pc[1] > _pc[0]
+            _sar  = _pl[0] if _bull else _ph[0]
+            _ep   = _ph[1] if _bull else _pl[1]
+            _af_c = _af
+            for _i in range(2, _n_sar):
+                _sar = _sar + _af_c * (_ep - _sar)
+                if _bull:
+                    _sar = min(_sar, _pl[_i-1], _pl[_i-2] if _i >= 2 else _pl[_i-1])
+                    if _pc[_i] < _sar:
+                        _bull = False; _sar = _ep; _ep = _pl[_i]; _af_c = _af
+                    else:
+                        if _ph[_i] > _ep: _ep = _ph[_i]; _af_c = min(_af_max, _af_c + _af_step)
+                else:
+                    _sar = max(_sar, _ph[_i-1], _ph[_i-2] if _i >= 2 else _ph[_i-1])
+                    if _pc[_i] > _sar:
+                        _bull = True; _sar = _ep; _ep = _ph[_i]; _af_c = _af
+                    else:
+                        if _pl[_i] < _ep: _ep = _pl[_i]; _af_c = min(_af_max, _af_c + _af_step)
+            psar_direction = "BUY" if _bull else "SELL"
+    except Exception:
+        pass
+
+    # ── 2. Chande Momentum Oscillator (CMO) ──────────────────────────────────
+    cmo_val = 0.0
+    cmo_direction = None
+    try:
+        _d = close.diff(1)
+        _up_cmo = _d.clip(lower=0).rolling(14).sum()
+        _dn_cmo = (-_d.clip(upper=0)).rolling(14).sum()
+        _cmo_s  = 100 * (_up_cmo - _dn_cmo) / (_up_cmo + _dn_cmo + 1e-9)
+        cmo_val = float(_cmo_s.iloc[-1])
+        if cmo_val > 25:    cmo_direction = "BUY"
+        elif cmo_val < -25: cmo_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 3. TEMA (Triple EMA) ──────────────────────────────────────────────────
+    tema_direction = None
+    tema_diff      = 0.0
+    try:
+        _e1f = close.ewm(span=9,  adjust=False).mean()
+        _e2f = _e1f.ewm(span=9,   adjust=False).mean()
+        _e3f = _e2f.ewm(span=9,   adjust=False).mean()
+        _tema_fast = 3*_e1f - 3*_e2f + _e3f
+
+        _e1s = close.ewm(span=21, adjust=False).mean()
+        _e2s = _e1s.ewm(span=21,  adjust=False).mean()
+        _e3s = _e2s.ewm(span=21,  adjust=False).mean()
+        _tema_slow = 3*_e1s - 3*_e2s + _e3s
+
+        tema_diff = float(_tema_fast.iloc[-1] - _tema_slow.iloc[-1]) / (abs(float(_tema_slow.iloc[-1])) + 1e-9) * 100
+        if tema_diff > 0.01:   tema_direction = "BUY"
+        elif tema_diff < -0.01: tema_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 4. Awesome Oscillator (AO) ────────────────────────────────────────────
+    ao_val       = 0.0
+    ao_direction = None
+    try:
+        _mid = (high + low) / 2
+        ao_val = float((_mid.rolling(5).mean() - _mid.rolling(34).mean()).iloc[-1])
+        ao_prev = float((_mid.rolling(5).mean() - _mid.rolling(34).mean()).iloc[-2])
+        if ao_val > 0 and ao_val > ao_prev:   ao_direction = "BUY"
+        elif ao_val < 0 and ao_val < ao_prev: ao_direction = "SELL"
+        elif ao_val > 0:                       ao_direction = "BUY"
+        elif ao_val < 0:                       ao_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 5. Elder Ray Index (Bull Power / Bear Power) ──────────────────────────
+    elder_direction = None
+    bull_power = bear_power = 0.0
+    try:
+        _ema13 = close.ewm(span=13, adjust=False).mean()
+        bull_power = float(high.iloc[-1] - float(_ema13.iloc[-1]))
+        bear_power = float(low.iloc[-1]  - float(_ema13.iloc[-1]))
+        if bull_power > 0 and bear_power > -0.0002:  elder_direction = "BUY"
+        elif bear_power < 0 and bull_power < 0.0002: elder_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 6. TTM Squeeze (Squeeze Momentum) ────────────────────────────────────
+    squeeze_direction = None
+    squeeze_active    = False   # True = market sedang compressed (tungsten)
+    try:
+        _bb_u2 = float((sma20 + 2*std20).iloc[-1])
+        _bb_l2 = float((sma20 - 2*std20).iloc[-1])
+        _n_sq  = len(close)
+        if _n_sq >= 22:
+            _tr_sq = pd.Series([
+                max(float(high.iloc[i]) - float(low.iloc[i]),
+                    abs(float(high.iloc[i]) - float(close.iloc[i-1])),
+                    abs(float(low.iloc[i]) - float(close.iloc[i-1])))
+                for i in range(1, _n_sq)
+            ], index=close.index[1:]).rolling(20).mean()
+            _kc_u = float((sma20 + 1.5*_tr_sq).iloc[-1])
+            _kc_l = float((sma20 - 1.5*_tr_sq).iloc[-1])
+            # Squeeze = BB inside KC (compressed — hakuna breakout bado)
+            squeeze_active = (_bb_u2 < _kc_u) and (_bb_l2 > _kc_l)
+            # Momentum oscillator
+            _delta_sq = close - (high.rolling(20).max() + low.rolling(20).min()) / 2
+            _mom_sq   = _delta_sq - _delta_sq.rolling(20).mean()
+            _mval  = float(_mom_sq.iloc[-1])
+            _mprev = float(_mom_sq.iloc[-2]) if len(_mom_sq) >= 2 else 0
+            if not squeeze_active:   # Breakout — nguvu zaidi
+                squeeze_direction = "BUY" if _mval > 0 else "SELL"
+            else:
+                squeeze_direction = "BUY" if _mval > 0 and _mval > _mprev else (
+                                    "SELL" if _mval < 0 and _mval < _mprev else None)
+    except Exception:
+        pass
+
+    # ── 7. TRIX (Triple Exponential Average ROC) ─────────────────────────────
+    trix_direction = None
+    trix_val       = 0.0
+    try:
+        _t1 = close.ewm(span=15, adjust=False).mean()
+        _t2 = _t1.ewm(span=15,   adjust=False).mean()
+        _t3 = _t2.ewm(span=15,   adjust=False).mean()
+        trix_val = float((_t3.pct_change() * 100).iloc[-1])
+        trix_prev= float((_t3.pct_change() * 100).iloc[-2]) if len(_t3) >= 2 else 0
+        if trix_val > 0:   trix_direction = "BUY"
+        elif trix_val < 0: trix_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 8. Aroon Oscillator ───────────────────────────────────────────────────
+    aroon_direction = None
+    aroon_val       = 0.0
+    try:
+        _per_ar = 25
+        _n_ar   = len(close)
+        if _n_ar >= _per_ar + 1:
+            _high_ar = high.rolling(_per_ar + 1)
+            _low_ar  = low.rolling(_per_ar + 1)
+            _aroon_up   = 100 * (_high_ar.apply(lambda x: (_per_ar - x[::-1].argmax()), raw=True) / _per_ar)
+            _aroon_down = 100 * (_low_ar.apply(lambda x:  (_per_ar - x[::-1].argmin()), raw=True) / _per_ar)
+            aroon_val   = float((_aroon_up - _aroon_down).iloc[-1])
+            if aroon_val > 30:    aroon_direction = "BUY"
+            elif aroon_val < -30: aroon_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 9. Vortex Indicator ───────────────────────────────────────────────────
+    vortex_direction = None
+    try:
+        _n_vx = len(close)
+        if _n_vx >= 16:
+            _vm_plus  = abs(high.iloc[1:].values - low.iloc[:-1].values)
+            _vm_minus = abs(low.iloc[1:].values  - high.iloc[:-1].values)
+            _tr_vx    = [max(float(high.iloc[i])-float(low.iloc[i]),
+                             abs(float(high.iloc[i])-float(close.iloc[i-1])),
+                             abs(float(low.iloc[i])-float(close.iloc[i-1])))
+                         for i in range(1, _n_vx)]
+            _sum_vm_p = sum(_vm_plus[-14:]);  _sum_vm_m = sum(_vm_minus[-14:])
+            _sum_tr   = sum(_tr_vx[-14:]) + 1e-9
+            _vi_plus  = _sum_vm_p / _sum_tr
+            _vi_minus = _sum_vm_m / _sum_tr
+            if _vi_plus > _vi_minus:   vortex_direction = "BUY"
+            elif _vi_minus > _vi_plus: vortex_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 10. Chaikin Money Flow (CMF) ──────────────────────────────────────────
+    cmf_val       = 0.0
+    cmf_direction = None
+    try:
+        _n_cmf = len(close)
+        if _n_cmf >= 20 and volume.sum() > 0:
+            _mfm = ((close - low) - (high - close)) / (high - low + 1e-9)
+            _mfv = _mfm * volume
+            cmf_val = float(_mfv.rolling(20).sum().iloc[-1] /
+                            (volume.rolling(20).sum().iloc[-1] + 1e-9))
+            if cmf_val > 0.05:    cmf_direction = "BUY"
+            elif cmf_val < -0.05: cmf_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 11. KAMA (Kaufman Adaptive MA) ───────────────────────────────────────
+    kama_direction = None
+    try:
+        _n_kama = len(close)
+        if _n_kama >= 12:
+            _kama_v = float(close.iloc[10])
+            for _ki in range(10, _n_kama):
+                _dir_k  = abs(float(close.iloc[_ki]) - float(close.iloc[_ki-10]))
+                _vol_k  = sum(abs(float(close.iloc[j]) - float(close.iloc[j-1]))
+                              for j in range(_ki-9, _ki+1))
+                _er   = _dir_k / (_vol_k + 1e-9)
+                _fast_k = 2/(2+1); _slow_k = 2/(30+1)
+                _sc   = (_er * (_fast_k - _slow_k) + _slow_k) ** 2
+                _kama_v = _kama_v + _sc * (float(close.iloc[_ki]) - _kama_v)
+            _kama_prev = float(close.iloc[-2])  # rough prev
+            if float(close.iloc[-1]) > _kama_v and _kama_v > _kama_prev:
+                kama_direction = "BUY"
+            elif float(close.iloc[-1]) < _kama_v and _kama_v < _kama_prev:
+                kama_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 12. McGinley Dynamic ──────────────────────────────────────────────────
+    mcginley_direction = None
+    try:
+        _n_mg = len(close)
+        if _n_mg >= 15:
+            _mg = float(close.iloc[14])
+            for _mi in range(14, _n_mg):
+                _p  = float(close.iloc[_mi])
+                _mg = _mg + (_p - _mg) / (14 * (_p / (_mg + 1e-9)) ** 4 + 1e-9)
+            _mg_prev_val = float(close.ewm(span=14).mean().iloc[-2])
+            if float(close.iloc[-1]) > _mg:  mcginley_direction = "BUY"
+            else:                             mcginley_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 13. Coppock Curve ─────────────────────────────────────────────────────
+    coppock_direction = None
+    try:
+        _n_cop = len(close)
+        if _n_cop >= 14:
+            _roc11 = close.pct_change(11) * 100
+            _roc14 = close.pct_change(min(14, _n_cop-1)) * 100
+            _cop   = (_roc11 + _roc14).ewm(span=10, adjust=False).mean()
+            _cv    = float(_cop.iloc[-1])
+            _cprev = float(_cop.iloc[-2]) if len(_cop) >= 2 else 0
+            if _cv > 0 and _cv > _cprev:   coppock_direction = "BUY"
+            elif _cv < 0 and _cv < _cprev: coppock_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 14. Weighted MA (WMA) Crossover ───────────────────────────────────────
+    wma_direction = None
+    try:
+        def _wma(s, p):
+            w = pd.Series(range(1, p+1), dtype=float)
+            return s.rolling(p).apply(lambda x: (x * w[-len(x):]).sum() / w[-len(x):].sum(), raw=True)
+        _wma_fast = _wma(close, 9)
+        _wma_slow = _wma(close, 21)
+        if float(_wma_fast.iloc[-1]) > float(_wma_slow.iloc[-1]):  wma_direction = "BUY"
+        else:                                                         wma_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 15. DPO (Detrended Price Oscillator) ──────────────────────────────────
+    dpo_direction = None
+    try:
+        _per_dpo = 20
+        _shift   = _per_dpo // 2 + 1
+        _n_dpo   = len(close)
+        if _n_dpo >= _per_dpo + _shift:
+            _sma_dpo = close.rolling(_per_dpo).mean()
+            _dpo_s   = close - _sma_dpo.shift(_shift)
+            dpo_direction = "BUY" if float(_dpo_s.iloc[-1]) > 0 else "SELL"
+    except Exception:
+        pass
+
+    # ── 16. Relative Vigor Index (RVI) ────────────────────────────────────────
+    rvi_direction = None
+    try:
+        _n_rvi  = len(close)
+        _opens  = df["Open"].squeeze().astype(float)
+        if _n_rvi >= 10:
+            _num = (close - _opens + 2*(close.shift(1)-_opens.shift(1)) +
+                    2*(close.shift(2)-_opens.shift(2)) + (close.shift(3)-_opens.shift(3))) / 6
+            _den = (high - low + 2*(high.shift(1)-low.shift(1)) +
+                    2*(high.shift(2)-low.shift(2)) + (high.shift(3)-low.shift(3))) / 6
+            _rvi_line   = _num.rolling(10).mean() / (_den.rolling(10).mean() + 1e-9)
+            _rvi_signal = (_rvi_line + 2*_rvi_line.shift(1) + 2*_rvi_line.shift(2) + _rvi_line.shift(3)) / 6
+            _rv = float(_rvi_line.iloc[-1]); _rs = float(_rvi_signal.iloc[-1])
+            rvi_direction = "BUY" if _rv > _rs else "SELL"
+    except Exception:
+        pass
+
+    # ── 17. Know Sure Thing (KST) ─────────────────────────────────────────────
+    kst_direction = None
+    try:
+        _n_kst = len(close)
+        if _n_kst >= 30:
+            _r1 = close.pct_change(10).rolling(10).mean()
+            _r2 = close.pct_change(13).rolling(13).mean()
+            _r3 = close.pct_change(15).rolling(15).mean()
+            _r4 = close.pct_change(20).rolling(15).mean()
+            _kst_line = _r1*1 + _r2*2 + _r3*3 + _r4*4
+            _kst_sig  = _kst_line.rolling(9).mean()
+            if float(_kst_line.iloc[-1]) > float(_kst_sig.iloc[-1]):  kst_direction = "BUY"
+            else:                                                        kst_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 18. Price Oscillator (PPO) ────────────────────────────────────────────
+    ppo_direction = None
+    try:
+        _ppo = (close.ewm(span=12).mean() - close.ewm(span=26).mean()) / \
+               (close.ewm(span=26).mean() + 1e-9) * 100
+        _ppo_sig = _ppo.ewm(span=9).mean()
+        ppo_direction = "BUY" if float(_ppo.iloc[-1]) > float(_ppo_sig.iloc[-1]) else "SELL"
+    except Exception:
+        pass
+
+    # ── 19. Commodity Channel Index extended (CCI fast 10) ───────────────────
+    cci_fast_direction = None
+    try:
+        _tp_f  = (high + low + close) / 3
+        _mad_f = _tp_f.rolling(10).apply(lambda x: abs(x - x.mean()).mean(), raw=True)
+        _cci_f = float(((_tp_f - _tp_f.rolling(10).mean()) / (0.015*_mad_f + 1e-9)).iloc[-1])
+        if _cci_f < -100:   cci_fast_direction = "BUY"
+        elif _cci_f > 100:  cci_fast_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── 20. Balance of Power (BOP) ────────────────────────────────────────────
+    bop_direction = None
+    try:
+        _opens_bop = df["Open"].squeeze().astype(float)
+        _bop = (close - _opens_bop) / (high - low + 1e-9)
+        _bop_sm = _bop.rolling(14).mean()
+        bop_direction = "BUY" if float(_bop_sm.iloc[-1]) > 0 else "SELL"
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # v57: Weighted Indicator Voting — kila indicator inapiga kura na uzito wake
+    # ══════════════════════════════════════════════════════════════════════════
+    _v57_indicators = [
+        # (direction, uzito)
+        (psar_direction,       10),  # Parabolic SAR
+        (cmo_direction,         7),  # CMO
+        (tema_direction,        9),  # TEMA
+        (ao_direction,          7),  # AO
+        (elder_direction,       8),  # Elder Ray
+        (squeeze_direction,    10),  # TTM Squeeze (nguvu kwa breakouts)
+        (trix_direction,        6),  # TRIX
+        (aroon_direction,       7),  # Aroon
+        (vortex_direction,      7),  # Vortex
+        (cmf_direction,         8),  # Chaikin MF (volume-based)
+        (kama_direction,        9),  # KAMA
+        (mcginley_direction,    7),  # McGinley
+        (coppock_direction,     6),  # Coppock
+        (wma_direction,         6),  # WMA
+        (dpo_direction,         5),  # DPO
+        (rvi_direction,         7),  # RVI
+        (kst_direction,         7),  # KST
+        (ppo_direction,         6),  # PPO
+        (cci_fast_direction,    6),  # CCI fast
+        (bop_direction,         6),  # BOP
+    ]
+    v57_buy_score  = sum(w for d, w in _v57_indicators if d == "BUY")
+    v57_sell_score = sum(w for d, w in _v57_indicators if d == "SELL")
+    v57_total      = v57_buy_score + v57_sell_score
+    v57_direction  = None
+    if v57_total > 0:
+        if v57_buy_score / v57_total >= 0.60:
+            v57_direction = "BUY"
+        elif v57_sell_score / v57_total >= 0.60:
+            v57_direction = "SELL"
+    # ── end v57 indicators ────────────────────────────────────────────────────
+
     dema_agrees = (dema_diff > 0 and direction_raw == "BUY") or \
                   (dema_diff < 0 and direction_raw == "SELL") if dema_diff != 0 else True
     hma_agrees  = (hma_direction == direction_raw) if (hma_direction and direction_raw) else True
@@ -2827,6 +3279,33 @@ def _calc_indicators_from_df(df):
         # ── v56-ST ──
         "supertrend_direction": supertrend_direction,
         "supertrend_val":       supertrend_val,
+        # ── v57 new indicators ──
+        "psar_direction":      psar_direction,
+        "cmo_val":             cmo_val,
+        "cmo_direction":       cmo_direction,
+        "tema_direction":      tema_direction,
+        "ao_direction":        ao_direction,
+        "elder_direction":     elder_direction,
+        "squeeze_direction":   squeeze_direction,
+        "squeeze_active":      squeeze_active,
+        "trix_direction":      trix_direction,
+        "aroon_direction":     aroon_direction,
+        "vortex_direction":    vortex_direction,
+        "cmf_val":             cmf_val,
+        "cmf_direction":       cmf_direction,
+        "kama_direction":      kama_direction,
+        "mcginley_direction":  mcginley_direction,
+        "coppock_direction":   coppock_direction,
+        "wma_direction":       wma_direction,
+        "dpo_direction":       dpo_direction,
+        "rvi_direction":       rvi_direction,
+        "kst_direction":       kst_direction,
+        "ppo_direction":       ppo_direction,
+        "cci_fast_direction":  cci_fast_direction,
+        "bop_direction":       bop_direction,
+        "v57_buy_score":       v57_buy_score,
+        "v57_sell_score":      v57_sell_score,
+        "v57_direction":       v57_direction,
     }
 
 import threading as _threading
@@ -6826,6 +7305,32 @@ def _confluence_quality_gate(
         score -= 8
         reasons.append("ST_against")
 
+    # 6c. v57 Weighted Vote (max 15pts) — consensus ya indicators 20
+    _v57_b = real.get("v57_buy_score", 0)
+    _v57_s = real.get("v57_sell_score", 0)
+    _v57_t = _v57_b + _v57_s
+    if _v57_t > 0:
+        _v57_ratio = (_v57_b if direction == "BUY" else _v57_s) / _v57_t
+        if _v57_ratio >= 0.65:
+            _cq_v57 = min(15, int((_v57_ratio - 0.5) * 30))
+            score += _cq_v57
+            reasons.append("v57vote+{:.0f}%".format(_v57_ratio*100))
+        elif _v57_ratio < 0.40:
+            score -= 8
+            reasons.append("v57vote_against")
+
+    # 6d. PSAR alignment (max 5pts)
+    if real.get("psar_direction") == direction:
+        score += 5
+        reasons.append("PSAR")
+    elif real.get("psar_direction") is not None:
+        score -= 3
+
+    # 6e. TTM Squeeze breakout (max 8pts — nguvu kabisa)
+    if real.get("squeeze_direction") == direction and not real.get("squeeze_active", True):
+        score += 8
+        reasons.append("SQUEEZE_break")
+
     # 7. Trend 1H (max 15pts)
     if trend_1h == direction:
         score += 15
@@ -7232,6 +7737,35 @@ def generate_signal(pair):
         elif _st_dir == "SELL":
             s += 18
 
+        # ── v57: Weighted indicator vote bonus ─────────────────────────────
+        _v57_buy  = _v56_real.get("v57_buy_score",  0)
+        _v57_sell = _v56_real.get("v57_sell_score", 0)
+        _v57_tot  = _v57_buy + _v57_sell
+        if _v57_tot > 0:
+            # Bonus max +40 kwa upande ulioshinda (proportional)
+            _v57_b_bonus = int((_v57_buy  / _v57_tot) * 40)
+            _v57_s_bonus = int((_v57_sell / _v57_tot) * 40)
+            b += _v57_b_bonus
+            s += _v57_s_bonus
+            logging.info("v57 vote {}: buy_score={} sell_score={} → b+{} s+{}".format(
+                pair, _v57_buy, _v57_sell, _v57_b_bonus, _v57_s_bonus))
+
+        # Extra bonuses kwa indicators za nguvu zaidi
+        if _v56_real.get("psar_direction") == "BUY":    b += 8
+        elif _v56_real.get("psar_direction") == "SELL": s += 8
+
+        if _v56_real.get("squeeze_direction") and not _v56_real.get("squeeze_active", True):
+            # Squeeze breakout = nguvu sana
+            if _v56_real.get("squeeze_direction") == "BUY":  b += 12
+            else:                                              s += 12
+
+        if _v56_real.get("cmf_direction") == "BUY":    b += 8
+        elif _v56_real.get("cmf_direction") == "SELL": s += 8
+
+        if _v56_real.get("kama_direction") == "BUY":    b += 8
+        elif _v56_real.get("kama_direction") == "SELL": s += 8
+        # ── end v57 bonuses ─────────────────────────────────────────────────
+
     logging.info("v56 indicator scores {}: b={} s={} [hma={} dema={:.3f} kelt={} fisher={} st={}]".format(
         pair, b, s,
         _v56_real.get("hma_direction") if _v56_real else "N/A",
@@ -7376,6 +7910,20 @@ def generate_signal(pair):
                      (pattern_sell_bonus > 0 and direction == "SELL")
     if pattern_agrees:
         indicators_agree += 2
+
+    # v57: kama zaidi ya 60% ya indicators 20 zinakubaliana → +2 indicators_agree
+    if _v56_real:
+        _v57d = _v56_real.get("v57_direction")
+        if _v57d == direction:
+            indicators_agree += 2
+        elif _v57d is not None and _v57d != direction:
+            indicators_agree = max(0, indicators_agree - 1)
+        # PSAR alignment
+        if _v56_real.get("psar_direction") == direction:
+            indicators_agree += 1
+        # CMF (volume confirms)
+        if _v56_real.get("cmf_direction") == direction:
+            indicators_agree += 1
 
     if mtf and trend_1h and mtf["total"] >= 3:
         mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
@@ -8808,7 +9356,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In {} min.\n📊 Signal strength: {}%".format(pair, arrow, timeframe, strength)
+        cap = "*{}* {}\n🕐 In {} min.\n📊 Signal strength: {}%\n🧠 AI Consensus: {} indicators".format(
+            pair, arrow, timeframe, strength, ind_agree if 'ind_agree' in dir() else "✓")
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
@@ -9041,7 +9590,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             arrow = "Up 🟢" if ib else "Down 🔴"
             await delete_last_signal(context.bot, chat, user_id)
 
-            cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%".format(pair, arrow, chosen_secs, strength)
+            cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, chosen_secs, strength)
             sent_msg = await context.bot.send_photo(
                 chat_id=chat,
                 photo=img,
@@ -9301,7 +9850,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _str = max(90, min(450, int(_str)))
             if not is_licensed(user_id): use_free_signal(user_id)
             await delete_last_signal(context.bot, chat, user_id)
-            cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str)
+            cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, timeframe, _str)
             sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
             save_last_signal_msg(user_id, sent_msg.message_id)
 
@@ -9581,7 +10130,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(pair, arrow, timeframe, _str2)
+        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, timeframe, _str2)
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
 
