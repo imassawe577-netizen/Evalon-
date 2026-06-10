@@ -9113,29 +9113,51 @@ async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timefra
     if entry_price is None:
         return
 
-    await asyncio.sleep(max(60, secs_to_close) + 3)
+    # Subiri candle ifunge
+    await asyncio.sleep(max(60, secs_to_close) + 5)
 
-    exit_price = None
-    for _ in range(3):
-        exit_price = _fetch_current_price(pair)
-        if exit_price is not None:
-            break
-        await asyncio.sleep(3)
+    # Angalia candle iliyofungwa — green au red?
+    won = None
+    try:
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        symbol    = YAHOO_SYMBOLS.get(real_pair)
+        if symbol:
+            df = _yf_download_cached(symbol, "1d", "1m")
+            if df is not None and len(df) >= 2:
+                # Candle iliyofungwa kabla ya ya sasa (iloc[-2])
+                closed_open  = float(df["Open"].squeeze().iloc[-2])
+                closed_close = float(df["Close"].squeeze().iloc[-2])
+                is_green = closed_close > closed_open
+                is_red   = closed_close < closed_open
 
-    if exit_price is None:
-        return
+                logging.info("CANDLE RESULT {}: open={} close={} green={} dir={}".format(
+                    pair, closed_open, closed_close, is_green, direction))
 
-    diff = exit_price - entry_price
-    if abs(diff) < 1e-8:
-        return
+                if direction == "BUY":
+                    won = is_green
+                else:
+                    won = is_red
+    except Exception as e:
+        logging.warning("auto_scan_result candle check failed {}: {}".format(pair, e))
 
-    won = (diff > 0) if direction == "BUY" else (diff < 0)
+    # Kama candle haikupatikana — fallback kwa price diff
+    if won is None:
+        exit_price = None
+        for _ in range(5):
+            exit_price = _fetch_current_price(pair)
+            if exit_price is not None:
+                break
+            await asyncio.sleep(4)
+        if exit_price is not None and entry_price is not None:
+            diff = exit_price - entry_price
+            won = (diff > 0) if direction == "BUY" else (diff < 0)
+        else:
+            won = False
+        logging.info("CANDLE RESULT {}: fallback price diff won={}".format(pair, won))
 
     if wins_ref is not None and losses_ref is not None:
-        if won:
-            wins_ref[0] += 1
-        else:
-            losses_ref[0] += 1
+        if won: wins_ref[0] += 1
+        else:   losses_ref[0] += 1
 
     try: update_pair_stats(pair, won)
     except Exception as _e: logging.warning("auto_scan_result pair_stats: {}".format(_e))
@@ -9147,16 +9169,10 @@ async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timefra
     try: nn_feedback_from_vte(user_id, pair, won)
     except Exception: pass
 
-    if not is_results_enabled():
-        return
-
     result_text = "WIN 🏆" if won else "LOSS 💔"
 
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=result_text
-        )
+        sent = await bot.send_message(chat_id=chat_id, text=result_text)
         push_msg_id(user_id, sent.message_id)
     except Exception as e:
         logging.warning("auto_scan_result send failed: {}".format(e))
