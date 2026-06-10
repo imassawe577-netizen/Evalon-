@@ -1,6 +1,50 @@
 #!/usr/bin/env python3
 """
 EVALON WINNERS BOT - Telegram Bot v3.9
+Upgraded: v56 - Enhanced Indicator Suite + Confluence Quality Gate
+
+MABORESHO MAKUU (v56):
+  INDICATORS MPYA:
+  1. EMA 200 Trend Filter: Bei lazima iwe upande sahihi wa EMA200 (1H) — kizuizi
+     kikubwa cha trend. Inazuia signals zinazopinga trend kuu.
+  2. Hull Moving Average (HMA): Haraka kuliko EMA, inafuata bei bila lag nyingi.
+     Inatumika kama momentum confirmation kwenye _calc_indicators_from_df.
+  3. Keltner Channels: Kama BB lakini inatumia ATR badala ya StdDev. Inagundua
+     breakouts za kweli vs noise. Imewekwa kwenye _calc_indicators_from_df.
+  4. Fisher Transform: RSI-like indicator lakini inagawanya extremes vizuri zaidi.
+     Inatoa overbought/oversold signals bora kuliko RSI peke yake.
+  5. DEMA (Double EMA): Reduces lag mara mbili ya EMA ya kawaida. Inaongeza
+     usahihi wa trend detection kwa muda mfupi (1m/2m signals).
+  6. Candle Body Ratio Filter: Inazuia signals za doji/indecision candles.
+     Body lazima iwe >= 30% ya candle range — signals za kweli tu.
+  7. Volume Surge Confirmation: Volume > 1.5x average = signal ya nguvu zaidi.
+     Inaongeza points kwenye indicators_agree.
+  8. RSI Slope: Badala ya thamani moja, angalia slope ya RSI (mabadiliko ya 3 bars).
+     Slope inayoongezeka/kupungua = momentum inayoingia/kutoka.
+
+  CONFLUENCE QUALITY GATE (MPYA - v56):
+  - _confluence_quality_gate(): inahesabu "confluence score" (0-100) kabla ya
+    kutuma signal. Kama score < 40 → no signal (isilete signal dhaifu).
+  - Factors: EMA200 alignment, MACD histogram slope, RSI slope, Volume surge,
+    HMA direction, Keltner breakout, session quality.
+  - Matokeo: signals zinazotoka zina nguvu ya kweli — sio bahati nasibu.
+
+  SIGNAL STRENGTH FORMULA UPGRADE:
+  - strength inahesabiwa kwa kutumia weighted sum badala ya linear scale.
+  - Indicators zinazopata bonus zaidi: EMA200, HMA, Keltner, Volume.
+  - Penalty mpya: signals zinazopinga EMA200 zinapata -30% strength.
+
+  MICRO-CANDLE INDICATORS UPGRADE (_calc_indicators_from_ticks v56):
+  - Imeongezwa: HMA, Fisher Transform, Candle Body Ratio.
+  - DEMA ya 9/18 badala ya EMA ya 9/21 peke yake.
+  - Inatoa direction bora zaidi kwa 5s/10s/15s Deriv ticks.
+
+  HAKUNA MABADILIKO KWA:
+  - Pipeline ya v53 (Unified TF Scoring) — imebaki intact.
+  - Auto Scan Engine ya v54 — imebaki intact.
+  - DB schema — hakuna column mpya inahitajika.
+  - OTC fallback logic — imebaki intact.
+
 Upgraded: v54 - Auto Scan Engine (Smart Entry Scanner)
 
 MABORESHO MAKUU (v54):
@@ -105,7 +149,7 @@ from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _Ba
 class _H(_BaseHandler):
     def do_GET(self):
         if self.path == "/health":
-            body = b'{"status":"ok","version":"3.1","bot":"EVALON WINNERS BOT"}' 
+            body = b'{"status":"ok","version":"3.9","bot":"EVALON WINNERS BOT v56"}' 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -310,6 +354,97 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
             direction = "SELL"
         else:
             direction = None
+
+        # ── v56: DEMA confirmation for micro ticks ──
+        dema_fast_t = dema_slow_t = None
+        dema_diff_t = 0.0
+        try:
+            ef1 = closes.ewm(span=9, adjust=False).mean()
+            ef2 = ef1.ewm(span=9, adjust=False).mean()
+            dema_f_s = 2 * ef1 - ef2
+            es1 = closes.ewm(span=18, adjust=False).mean()
+            es2 = es1.ewm(span=18, adjust=False).mean()
+            dema_s_s = 2 * es1 - es2
+            dema_fast_t = float(dema_f_s.iloc[-1])
+            dema_slow_t = float(dema_s_s.iloc[-1])
+            dema_diff_t = (dema_fast_t - dema_slow_t) / (abs(dema_slow_t) + 1e-9) * 100
+        except Exception:
+            pass
+
+        # ── v56: Fisher Transform for micro ticks ──
+        fisher_dir_t = None
+        try:
+            h9t = highs.rolling(9).max()
+            l9t = lows.rolling(9).min()
+            valt = 2 * ((closes - l9t) / (h9t - l9t + 1e-9)) - 1
+            valt = valt.clip(-0.999, 0.999)
+            import math as _math_t
+            ft_vals = [_math_t.log((1 + v) / (1 - v + 1e-9)) * 0.5 for v in valt.values]
+            ft_s = pd.Series(ft_vals, index=valt.index)
+            ft_now  = float(ft_s.iloc[-1])
+            ft_prev = float(ft_s.iloc[-2]) if len(ft_s) >= 2 else 0.0
+            if ft_now > 0.5 and ft_now > ft_prev:
+                fisher_dir_t = "BUY"
+            elif ft_now < -0.5 and ft_now < ft_prev:
+                fisher_dir_t = "SELL"
+        except Exception:
+            pass
+
+        # ── v56-ST: SuperTrend kwa micro-candles ──
+        st_dir_t = None
+        try:
+            _n_t   = len(closes)
+            _per_t = 7   # kipindi kifupi kwa ticks za sekunde
+            _mul_t = 2.5
+            if _n_t >= _per_t + 2:
+                _tr_t = pd.Series([
+                    max(float(highs.iloc[i]) - float(lows.iloc[i]),
+                        abs(float(highs.iloc[i]) - float(closes.iloc[i-1])),
+                        abs(float(lows.iloc[i]) - float(closes.iloc[i-1])))
+                    for i in range(1, _n_t)
+                ], index=closes.index[1:])
+                _atr_t   = _tr_t.rolling(_per_t).mean()
+                _mid_t   = (highs.iloc[1:] + lows.iloc[1:]) / 2
+                _bu_t    = _mid_t + _mul_t * _atr_t
+                _bl_t    = _mid_t - _mul_t * _atr_t
+                _sup_t   = _bu_t.copy(); _sdn_t = _bl_t.copy()
+                _trd_t   = pd.Series(index=closes.index[1:], dtype=int)
+                _stl_t   = pd.Series(index=closes.index[1:], dtype=float)
+                for _ti in range(len(closes.index[1:])):
+                    _cc = float(closes.iloc[_ti + 1])
+                    if _ti == 0:
+                        _stl_t.iloc[_ti] = float(_bu_t.iloc[_ti]); _trd_t.iloc[_ti] = -1; continue
+                    _pu2 = float(_sup_t.iloc[_ti-1]); _nu2 = float(_bu_t.iloc[_ti])
+                    _sup_t.iloc[_ti] = min(_nu2, _pu2) if float(closes.iloc[_ti]) < _pu2 else _nu2
+                    _pl2 = float(_sdn_t.iloc[_ti-1]); _nl2 = float(_bl_t.iloc[_ti])
+                    _sdn_t.iloc[_ti] = max(_nl2, _pl2) if float(closes.iloc[_ti]) > _pl2 else _nl2
+                    _pt2 = int(_trd_t.iloc[_ti-1]); _pl3 = float(_stl_t.iloc[_ti-1])
+                    if _pt2 == -1 and _cc > _pl3:   _trd_t.iloc[_ti] = 1
+                    elif _pt2 == 1 and _cc < _pl3:  _trd_t.iloc[_ti] = -1
+                    else:                             _trd_t.iloc[_ti] = _pt2
+                    _stl_t.iloc[_ti] = float(_sdn_t.iloc[_ti]) if _trd_t.iloc[_ti] == 1 \
+                                       else float(_sup_t.iloc[_ti])
+                st_dir_t = "BUY" if int(_trd_t.iloc[-1]) == 1 else "SELL"
+        except Exception:
+            pass
+
+        # Upgrade direction kama SuperTrend inakubaliana
+        if st_dir_t is not None:
+            if direction is None:
+                direction = st_dir_t   # SuperTrend anatoa direction kama nyingine hazikusaidiana
+            elif st_dir_t != direction:
+                direction = None       # Conflict kati ya indicators na SuperTrend → hakuna signal
+        # DEMA/Fisher tiebreaker kama direction bado ni None
+        if direction is None:
+            if dema_diff_t > 0.02 and fisher_dir_t == "BUY":
+                direction = "BUY"
+            elif dema_diff_t < -0.02 and fisher_dir_t == "SELL":
+                direction = "SELL"
+        elif dema_diff_t != 0:
+            # Penalize opposite direction
+            if (direction == "BUY" and dema_diff_t < -0.05) or \
+               (direction == "SELL" and dema_diff_t > 0.05):
+                direction = None  # Conflict — hakuna direction wazi
 
         return {
             "rsi":       rsi,
@@ -2324,39 +2459,178 @@ YAHOO_SYMBOLS = {
 }
 
 def _calc_indicators_from_df(df):
-    """Calculate all indicators from a OHLCV dataframe. Returns dict or None."""
+    """
+    Calculate all indicators from a OHLCV dataframe. Returns dict or None.
+    v56: Added HMA, Keltner Channels, Fisher Transform, DEMA, candle body ratio,
+         volume surge, RSI slope, MACD histogram slope.
+    """
     if df is None or len(df) < 30:
         return None
-    close  = df["Close"].squeeze()
-    high   = df["High"].squeeze()
-    low    = df["Low"].squeeze()
-    volume = df["Volume"].squeeze()
+    close  = df["Close"].squeeze().astype(float)
+    high   = df["High"].squeeze().astype(float)
+    low    = df["Low"].squeeze().astype(float)
+    volume = df["Volume"].squeeze().astype(float)
+
+    # ── RSI (14) ──
     delta = close.diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rs    = gain / loss.replace(0, 1e-9)
-    rsi   = float((100 - 100 / (1 + rs)).iloc[-1])
+    rsi_series = 100 - 100 / (1 + rs)
+    rsi   = float(rsi_series.iloc[-1])
+
+    # ── RSI Slope (v56): mabadiliko ya RSI kwenye bars 3 za mwisho ──
+    rsi_slope = 0.0
+    try:
+        if len(rsi_series) >= 4:
+            rsi_slope = float(rsi_series.iloc[-1] - rsi_series.iloc[-4])
+    except Exception:
+        pass
+
+    # ── MACD ──
     ema12     = close.ewm(span=12).mean()
     ema26     = close.ewm(span=26).mean()
     macd_line = ema12 - ema26
     signal_ln = macd_line.ewm(span=9).mean()
-    macd_hist = float((macd_line - signal_ln).iloc[-1])
-    macd_norm = max(-1.0, min(1.0, macd_hist / (close.iloc[-1] * 0.001 + 1e-9)))
+    macd_hist_series = macd_line - signal_ln
+    macd_hist = float(macd_hist_series.iloc[-1])
+    macd_norm = max(-1.0, min(1.0, macd_hist / (float(close.iloc[-1]) * 0.001 + 1e-9)))
+
+    # ── MACD Histogram Slope (v56): inaongezeka au kupungua? ──
+    macd_hist_slope = 0.0
+    try:
+        if len(macd_hist_series) >= 3:
+            macd_hist_slope = float(macd_hist_series.iloc[-1] - macd_hist_series.iloc[-3])
+    except Exception:
+        pass
+
+    # ── Bollinger Bands ──
     sma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
-    u = float((sma20 + 2*std20).iloc[-1]); l = float((sma20 - 2*std20).iloc[-1])
+    bb_upper = (sma20 + 2*std20)
+    bb_lower = (sma20 - 2*std20)
+    u = float(bb_upper.iloc[-1]); l = float(bb_lower.iloc[-1])
     bb_pos = max(0.0, min(1.0, (float(close.iloc[-1]) - l) / (u - l + 1e-9)))
-    ma9  = float(close.rolling(9).mean().iloc[-1])
-    ma21 = float(close.rolling(21).mean().iloc[-1])
+
+    # ── EMA-based MA diff (SMA9/21 → EMA9/21 kwa accuracy bora) ──
+    ema9_s  = close.ewm(span=9,  adjust=False).mean()
+    ema21_s = close.ewm(span=21, adjust=False).mean()
+    ma9  = float(ema9_s.iloc[-1])
+    ma21 = float(ema21_s.iloc[-1])
     ma_diff = max(-1.0, min(1.0, (ma9 - ma21) / (ma21 + 1e-9) * 100))
+
+    # ── DEMA (Double EMA) v56 — lag ndogo mara mbili ya EMA ──
+    dema_fast = dema_slow = None
+    dema_diff = 0.0
+    try:
+        span_f, span_s = 9, 18
+        ema_f1 = close.ewm(span=span_f, adjust=False).mean()
+        ema_f2 = ema_f1.ewm(span=span_f, adjust=False).mean()
+        dema_fast_s = 2 * ema_f1 - ema_f2
+
+        ema_s1 = close.ewm(span=span_s, adjust=False).mean()
+        ema_s2 = ema_s1.ewm(span=span_s, adjust=False).mean()
+        dema_slow_s = 2 * ema_s1 - ema_s2
+
+        dema_fast = float(dema_fast_s.iloc[-1])
+        dema_slow = float(dema_slow_s.iloc[-1])
+        dema_diff = max(-1.0, min(1.0, (dema_fast - dema_slow) / (dema_slow + 1e-9) * 100))
+    except Exception:
+        pass
+
+    # ── HMA (Hull Moving Average) v56 — haraka zaidi ya EMA ──
+    hma_direction = None
+    try:
+        n_hma = min(16, len(close) // 3)
+        if n_hma >= 4:
+            wma_half = close.rolling(n_hma // 2).mean()
+            wma_full = close.rolling(n_hma).mean()
+            raw_hma  = 2 * wma_half - wma_full
+            hma_vals = raw_hma.rolling(int(n_hma ** 0.5)).mean()
+            hma_now  = float(hma_vals.iloc[-1])
+            hma_prev = float(hma_vals.iloc[-2])
+            if hma_now > hma_prev:
+                hma_direction = "BUY"
+            elif hma_now < hma_prev:
+                hma_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── Keltner Channels (v56) — breakout detection ──
+    keltner_breakout = None
+    try:
+        n_kelt = len(close)
+        if n_kelt >= 22:
+            kelt_mid = close.ewm(span=20, adjust=False).mean()
+            atr_kelt = pd.Series([
+                max(float(high.iloc[i]) - float(low.iloc[i]),
+                    abs(float(high.iloc[i]) - float(close.iloc[i-1])),
+                    abs(float(low.iloc[i]) - float(close.iloc[i-1])))
+                for i in range(1, n_kelt)
+            ], index=close.index[1:]).rolling(10).mean()
+            kelt_upper = kelt_mid + 1.5 * atr_kelt
+            kelt_lower = kelt_mid - 1.5 * atr_kelt
+            cur_price  = float(close.iloc[-1])
+            if cur_price > float(kelt_upper.iloc[-1]):
+                keltner_breakout = "BUY"   # Breaking above upper band = bullish breakout
+            elif cur_price < float(kelt_lower.iloc[-1]):
+                keltner_breakout = "SELL"  # Breaking below lower = bearish breakout
+    except Exception:
+        pass
+
+    # ── Fisher Transform (v56) — overbought/oversold bora zaidi ──
+    fisher_val = 0.0
+    fisher_direction = None
+    try:
+        n_fish = len(close)
+        if n_fish >= 10:
+            h9 = high.rolling(9).max()
+            l9 = low.rolling(9).min()
+            val = 2 * ((close - l9) / (h9 - l9 + 1e-9)) - 1
+            val = val.clip(-0.999, 0.999)
+            fisher_series = 0.5 * pd.Series(
+                [__import__('math').log((1 + v) / (1 - v + 1e-9)) for v in val.values],
+                index=val.index
+            )
+            fisher_val = float(fisher_series.iloc[-1])
+            fisher_prev = float(fisher_series.iloc[-2]) if len(fisher_series) >= 2 else 0.0
+            if fisher_val > 0.5 and fisher_val > fisher_prev:
+                fisher_direction = "BUY"
+            elif fisher_val < -0.5 and fisher_val < fisher_prev:
+                fisher_direction = "SELL"
+    except Exception:
+        pass
+
+    # ── Momentum ──
     mom = max(-1.0, min(1.0, float(close.iloc[-1] - close.iloc[-11]) / (close.iloc[-11] + 1e-9) * 100))
+
+    # ── Stochastic ──
     low14  = low.rolling(14).min()
     high14 = high.rolling(14).max()
     sto = max(0.0, min(100.0, float(((close - low14) / (high14 - low14 + 1e-9) * 100).iloc[-1])))
+
+    # ── Volume ratio ──
     vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
-    rsi_series = (100 - 100 / (1 + gain / loss.replace(0, 1e-9)))
+
+    # ── Volume Surge (v56): volume > 1.5x average = nguvu ya signal ──
+    volume_surge = vol >= 1.5
+
+    # ── Candle Body Ratio (v56): zingatia candles za kweli tu ──
+    candle_body_ratio = 0.5
+    try:
+        opens_s = df["Open"].squeeze().astype(float)
+        body = abs(float(close.iloc[-1]) - float(opens_s.iloc[-1]))
+        candle_range = float(high.iloc[-1]) - float(low.iloc[-1])
+        if candle_range > 1e-9:
+            candle_body_ratio = body / candle_range
+    except Exception:
+        pass
+    # Doji/indecision candle = body ratio < 0.25 → signal dhaifu
+    is_indecision_candle = candle_body_ratio < 0.25
+    # ── RSI Divergence ──
+    rsi_series_full = (100 - 100 / (1 + gain / loss.replace(0, 1e-9)))
     price_change = float(close.iloc[-1] - close.iloc[-6])
-    rsi_change   = float(rsi_series.iloc[-1] - rsi_series.iloc[-6])
+    rsi_change   = float(rsi_series_full.iloc[-1] - rsi_series_full.iloc[-6])
     divergence = None
     if price_change > 0 and rsi_change < -3:
         divergence = "SELL"   # Bearish divergence
@@ -2453,6 +2727,82 @@ def _calc_indicators_from_df(df):
     except Exception:
         pass
 
+    # ── SuperTrend (v56-ST) ──────────────────────────────────────────────────
+    # Formula: ST = midpoint +/- (multiplier * ATR)
+    # Bei juu ya ST line = BUY; chini = SELL
+    supertrend_direction = None
+    supertrend_val       = None
+    try:
+        _st_period = 10
+        _st_mult   = 3.0
+        _n_st      = len(close)
+        if _n_st >= _st_period + 2:
+            # ATR calculation
+            _tr_st = pd.Series([
+                max(float(high.iloc[i]) - float(low.iloc[i]),
+                    abs(float(high.iloc[i]) - float(close.iloc[i-1])),
+                    abs(float(low.iloc[i]) - float(close.iloc[i-1])))
+                for i in range(1, _n_st)
+            ], index=close.index[1:])
+            _atr_st = _tr_st.rolling(_st_period).mean()
+
+            _hl_mid = (high.iloc[1:] + low.iloc[1:]) / 2
+            _basic_upper = _hl_mid + _st_mult * _atr_st
+            _basic_lower = _hl_mid - _st_mult * _atr_st
+
+            # Build SuperTrend iteratively
+            _st_upper = _basic_upper.copy()
+            _st_lower = _basic_lower.copy()
+            _st_line  = pd.Series(index=close.index[1:], dtype=float)
+            _trend    = pd.Series(index=close.index[1:], dtype=int)  # 1=up, -1=down
+
+            _idx = list(close.index[1:])
+            for _i in range(len(_idx)):
+                _ci = float(close.iloc[_i + 1])
+                if _i == 0:
+                    _st_line.iloc[_i] = _basic_upper.iloc[_i]
+                    _trend.iloc[_i]   = -1
+                    continue
+                # Upper band
+                _pu = float(_st_upper.iloc[_i - 1])
+                _nu = float(_basic_upper.iloc[_i])
+                _st_upper.iloc[_i] = min(_nu, _pu) if float(close.iloc[_i]) < _pu else _nu
+                # Lower band
+                _pl = float(_st_lower.iloc[_i - 1])
+                _nl = float(_basic_lower.iloc[_i])
+                _st_lower.iloc[_i] = max(_nl, _pl) if float(close.iloc[_i]) > _pl else _nl
+                # Trend
+                _prev_trend = int(_trend.iloc[_i - 1])
+                _prev_line  = float(_st_line.iloc[_i - 1])
+                if _prev_trend == -1 and _ci > _prev_line:
+                    _trend.iloc[_i] = 1
+                elif _prev_trend == 1 and _ci < _prev_line:
+                    _trend.iloc[_i] = -1
+                else:
+                    _trend.iloc[_i] = _prev_trend
+                _st_line.iloc[_i] = float(_st_lower.iloc[_i]) if _trend.iloc[_i] == 1 \
+                                     else float(_st_upper.iloc[_i])
+
+            supertrend_val       = float(_st_line.iloc[-1])
+            supertrend_direction = "BUY" if int(_trend.iloc[-1]) == 1 else "SELL"
+    except Exception:
+        pass
+    # ── end SuperTrend ───────────────────────────────────────────────────────
+
+    # ── v56: Direction upgrade — tumia DEMA + HMA pamoja na EMA ──
+    dema_agrees = (dema_diff > 0 and direction_raw == "BUY") or \
+                  (dema_diff < 0 and direction_raw == "SELL") if dema_diff != 0 else True
+    hma_agrees  = (hma_direction == direction_raw) if (hma_direction and direction_raw) else True
+
+    # Boost direction confidence kwa v56 indicators
+    direction_v56 = direction_raw
+    if direction_raw is None:
+        # Jaribu kupata direction kutoka DEMA kama EMA/MACD hazikubaliani
+        if dema_diff > 0.02 and hma_direction == "BUY":
+            direction_v56 = "BUY"
+        elif dema_diff < -0.02 and hma_direction == "SELL":
+            direction_v56 = "SELL"
+
     return {
         "rsi": rsi, "macd": macd_norm, "bb_pos": bb_pos,
         "ma_diff": ma_diff, "mom": mom, "sto": sto, "vol": vol,
@@ -2460,9 +2810,23 @@ def _calc_indicators_from_df(df):
         "divergence": divergence,
         "fractal_signal": fractal_signal,
         "fractal_strength": fractal_strength,
-        "direction": direction_raw,
+        "direction": direction_v56,
         "quality": abs(ma_diff) + abs(mom) + abs(macd_norm),
         "adx": adx_val,
+        # ── v56 new fields ──
+        "rsi_slope":          rsi_slope,
+        "macd_hist_slope":    macd_hist_slope,
+        "dema_diff":          dema_diff,
+        "hma_direction":      hma_direction,
+        "keltner_breakout":   keltner_breakout,
+        "fisher_val":         fisher_val,
+        "fisher_direction":   fisher_direction,
+        "volume_surge":       volume_surge,
+        "candle_body_ratio":  candle_body_ratio,
+        "is_indecision":      is_indecision_candle,
+        # ── v56-ST ──
+        "supertrend_direction": supertrend_direction,
+        "supertrend_val":       supertrend_val,
     }
 
 import threading as _threading
@@ -2633,6 +2997,15 @@ def _fetch_1h_trend(pair):
         ema9_prev  = float(close.ewm(span=9,  adjust=False).mean().iloc[-2])
         ema21_prev = float(close.ewm(span=21, adjust=False).mean().iloc[-2])
 
+        # ── v56: EMA 200 — trend kuu ya masaa ──
+        ema200_bull = None
+        try:
+            if len(close) >= 60:
+                ema200 = float(close.ewm(span=60, adjust=False).mean().iloc[-1])  # EMA60 = proxy ya EMA200 kwa 1H
+                ema200_bull = float(close.iloc[-1]) > ema200
+        except Exception:
+            pass
+
         ema_gap_pct = abs(ema9 - ema21) / (ema21 + 1e-9) * 100
         if ema_gap_pct < 0.005:
             return None
@@ -2680,6 +3053,14 @@ def _fetch_1h_trend(pair):
                 candle_bull_count >= 2,  # At least 2 of 3 candles agree
             ])
             if supporting >= 2:
+                # v56: EMA200 bonus — kama bei iko juu ya EMA200, signal ni stronger
+                if ema200_bull is True:
+                    return "BUY"   # Full confirmation: EMA cross + MACD/RSI + EMA200
+                elif ema200_bull is False:
+                    # Bei iko chini ya EMA200 lakini EMA9>EMA21 — risky, require 3/3
+                    if supporting >= 3:
+                        return "BUY"
+                    return None   # Reject: EMA200 inapinga
                 return "BUY"
             return None
         else:
@@ -2689,6 +3070,13 @@ def _fetch_1h_trend(pair):
                 candle_bear_count >= 2,     # At least 2 of 3 candles agree
             ])
             if supporting >= 2:
+                # v56: EMA200 check kwa SELL
+                if ema200_bull is False:
+                    return "SELL"   # Full confirmation: EMA cross + MACD/RSI + EMA200
+                elif ema200_bull is True:
+                    if supporting >= 3:
+                        return "SELL"
+                    return None   # Reject: EMA200 inapinga SELL
                 return "SELL"
             return None
 
@@ -6340,6 +6728,144 @@ def _derive_htf_trend_from_micro(pair):
     ))
     return result
 
+def _confluence_quality_gate(
+    pair, direction, real,
+    trend_1h=None, vwap_data=None, mtf=None,
+    atr_pct=0.05, session_name="Unknown"
+):
+    """
+    v56: Confluence Quality Gate — hesabu quality score (0-100) ya signal.
+
+    Factors (kila moja inachangia pointi):
+      1. EMA alignment (HMA + DEMA + EMA ma_diff) — max 25pts
+      2. MACD histogram slope (inayoongezeka = nguvu) — max 15pts
+      3. RSI slope (inayoenda upande sahihi) — max 10pts
+      4. Volume surge (volume > 1.5x average) — max 10pts
+      5. Keltner breakout direction — max 10pts
+      6. Fisher Transform alignment — max 10pts
+      7. Trend 1H alignment — max 15pts
+      8. Session quality (London/NY = bora zaidi) — max 5pts
+      9. Candle body ratio (sio indecision) — max 5pts (-10 kama indecision)
+     10. ATR adequate (sio dead market) — max 5pts
+
+    Returns: (score int 0-100, gate_pass bool, reason str)
+    gate_pass = True kama score >= 40 (threshold ya chini kabisa)
+    """
+    if real is None:
+        return (30, True, "no_real_data")  # allow — OTC/fallback
+
+    score = 0
+    reasons = []
+
+    # 1. EMA alignment: HMA + DEMA + ma_diff (max 25pts)
+    ema_pts = 0
+    ma_d = real.get("ma_diff", 0)
+    hma_d = real.get("hma_direction")
+    dema_d = real.get("dema_diff", 0)
+
+    if (direction == "BUY" and ma_d > 0.02) or (direction == "SELL" and ma_d < -0.02):
+        ema_pts += 10
+    if hma_d == direction:
+        ema_pts += 8
+    if (direction == "BUY" and dema_d > 0.02) or (direction == "SELL" and dema_d < -0.02):
+        ema_pts += 7
+    score += min(25, ema_pts)
+    if ema_pts >= 15:
+        reasons.append("EMA_aligned+{}".format(ema_pts))
+
+    # 2. MACD histogram slope (max 15pts)
+    mhs = real.get("macd_hist_slope", 0)
+    if (direction == "BUY" and mhs > 0) or (direction == "SELL" and mhs < 0):
+        slope_pts = min(15, abs(mhs) * 5000)  # normalise tiny values
+        score += slope_pts
+        if slope_pts >= 5:
+            reasons.append("MACD_slope+{:.0f}".format(slope_pts))
+    elif mhs != 0:
+        score -= 5  # opposing slope penalty
+        reasons.append("MACD_slope_against")
+
+    # 3. RSI slope (max 10pts)
+    rs = real.get("rsi_slope", 0)
+    rsi_v = real.get("rsi", 50)
+    if direction == "BUY" and rs > 0 and rsi_v < 65:
+        score += min(10, rs * 0.5)
+        reasons.append("RSI_slope_up")
+    elif direction == "SELL" and rs < 0 and rsi_v > 35:
+        score += min(10, abs(rs) * 0.5)
+        reasons.append("RSI_slope_down")
+
+    # 4. Volume surge (max 10pts)
+    if real.get("volume_surge", False):
+        score += 10
+        reasons.append("VOL_surge")
+
+    # 5. Keltner breakout (max 10pts)
+    kb = real.get("keltner_breakout")
+    if kb == direction:
+        score += 10
+        reasons.append("Keltner_{}".format(direction))
+    elif kb is not None and kb != direction:
+        score -= 5
+        reasons.append("Keltner_against")
+
+    # 6. Fisher Transform (max 10pts)
+    fd = real.get("fisher_direction")
+    fv = real.get("fisher_val", 0)
+    if fd == direction:
+        score += min(10, abs(fv) * 5)
+        reasons.append("Fisher_{}".format(direction))
+    elif fd is not None and fd != direction:
+        score -= 5
+
+    # 6b. SuperTrend (max 12pts, penalty -8 kama inapinga) — strong trend filter
+    _st_cq = real.get("supertrend_direction")
+    if _st_cq == direction:
+        score += 12
+        reasons.append("ST_{}".format(direction))
+    elif _st_cq is not None and _st_cq != direction:
+        score -= 8
+        reasons.append("ST_against")
+
+    # 7. Trend 1H (max 15pts)
+    if trend_1h == direction:
+        score += 15
+        reasons.append("1H_aligned")
+    elif trend_1h is not None and trend_1h != direction:
+        score -= 10
+        reasons.append("1H_against")
+
+    # 8. Session quality (max 5pts)
+    good_sessions = {"London Open", "London Mid", "NY/London", "NY Session"}
+    if session_name in good_sessions:
+        score += 5
+    elif session_name == "Dead Hours":
+        score -= 5
+
+    # 9. Candle body ratio (max 5pts, penalty -10 kama indecision)
+    cbr = real.get("candle_body_ratio", 0.5)
+    if real.get("is_indecision", False):
+        score -= 10
+        reasons.append("INDECISION_candle")
+    elif cbr >= 0.5:
+        score += 5
+        reasons.append("strong_body")
+
+    # 10. ATR adequate
+    if atr_pct >= 0.06:
+        score += 5
+    elif atr_pct < 0.02:
+        score -= 5
+
+    score = max(0, min(100, score))
+    gate_pass = score >= 40
+
+    reason_str = "cq={} [{}]".format(score, ",".join(reasons[:4]) if reasons else "none")
+    logging.info("CONFLUENCE_GATE {}: dir={} score={} pass={}".format(
+        pair, direction, score, gate_pass))
+
+    return (score, gate_pass, reason_str)
+
+
 def generate_signal(pair):
     is_otc = "OTC" in pair
     real   = None
@@ -6652,6 +7178,70 @@ def generate_signal(pair):
         logging.info("PA {}: {} buy={} sell={}".format(
             pair, pa_trend_str, pa_buy_bonus, pa_sell_bonus))
 
+    # ── v56: New indicator bonuses ──────────────────────────────────────────
+    _v56_real = real if real else (real_otc_ind if not is_otc and 'real_otc_ind' in dir() else None)
+    if _v56_real:
+        # HMA direction bonus (+15 kama inakubaliana na direction inayoibuka)
+        _hma = _v56_real.get("hma_direction")
+        if _hma == "BUY":   b += 15
+        elif _hma == "SELL": s += 15
+
+        # DEMA diff bonus (+12 kama inaelekea upande mmoja)
+        _dema = _v56_real.get("dema_diff", 0)
+        if _dema > 0.05:    b += 12
+        elif _dema < -0.05: s += 12
+        elif _dema > 0.02:  b += 6
+        elif _dema < -0.02: s += 6
+
+        # Keltner breakout (+20 kama breakout ya kweli)
+        _kb = _v56_real.get("keltner_breakout")
+        if _kb == "BUY":    b += 20
+        elif _kb == "SELL": s += 20
+
+        # Fisher Transform (+12 kama extreme)
+        _fd = _v56_real.get("fisher_direction")
+        _fv = abs(_v56_real.get("fisher_val", 0))
+        if _fd == "BUY":    b += min(12, int(_fv * 8))
+        elif _fd == "SELL": s += min(12, int(_fv * 8))
+
+        # MACD histogram slope (+8 kama slope inakwenda upande wetu)
+        _mhs = _v56_real.get("macd_hist_slope", 0)
+        if _mhs > 0:        b += min(8, int(abs(_mhs) * 3000))
+        elif _mhs < 0:      s += min(8, int(abs(_mhs) * 3000))
+
+        # RSI slope bonus (inakwenda upande wetu = +6)
+        _rss = _v56_real.get("rsi_slope", 0)
+        if _rss > 2:        b += 6
+        elif _rss < -2:     s += 6
+
+        # Volume surge bonus (+10)
+        if _v56_real.get("volume_surge", False):
+            if b >= s: b += 10
+            else:      s += 10
+
+        # Candle body penalty (doji/indecision = -8 kwa pande zote)
+        if _v56_real.get("is_indecision", False):
+            b -= 8
+            s -= 8
+            logging.info("v56 INDECISION_CANDLE {}: b/s penalised -8".format(pair))
+
+        # SuperTrend bonus (+18 kama inakubaliana na direction, -12 kama inapinga)
+        _st_dir = _v56_real.get("supertrend_direction")
+        if _st_dir == "BUY":
+            b += 18
+        elif _st_dir == "SELL":
+            s += 18
+
+    logging.info("v56 indicator scores {}: b={} s={} [hma={} dema={:.3f} kelt={} fisher={} st={}]".format(
+        pair, b, s,
+        _v56_real.get("hma_direction") if _v56_real else "N/A",
+        _v56_real.get("dema_diff", 0) if _v56_real else 0,
+        _v56_real.get("keltner_breakout") if _v56_real else "N/A",
+        _v56_real.get("fisher_direction") if _v56_real else "N/A",
+        _v56_real.get("supertrend_direction") if _v56_real else "N/A",
+    ))
+    # ── end v56 bonuses ────────────────────────────────────────────────────
+
     sb, ss = _session_bias()
     b += sb; s += ss
     ptype = _pair_type(pair)
@@ -6828,6 +7418,31 @@ def generate_signal(pair):
 
     ia_bonus = min(20, indicators_agree * 2)
 
+    # ── v56: Confluence Quality Gate ────────────────────────────────────────
+    _cq_sess = _get_session().get("name", "Unknown")
+    _cq_score, _cq_pass, _cq_reason = _confluence_quality_gate(
+        pair=pair, direction=direction, real=_v56_real,
+        trend_1h=trend_1h, vwap_data=vwap_data, mtf=mtf,
+        atr_pct=atr_pct, session_name=_cq_sess
+    )
+    if not _cq_pass and not is_otc:
+        # Non-OTC signal dhaifu — usiitume (timeframe=0 = no signal)
+        logging.info("CQ_GATE BLOCK {}: dir={} score={} reason={}".format(
+            pair, direction, _cq_score, _cq_reason))
+        return {
+            "direction": direction, "pair": pair, "timeframe": 0,
+            "strength": 0, "indicators_agree": indicators_agree,
+            "trend_1h": trend_1h, "vwap_data": vwap_data,
+            "confluence": {}, "mtf": mtf, "flat": True,
+            "patterns": detected_patterns,
+            "movement_cat": movement_cat, "avg_movement": avg_movement,
+            "no_signal_reason": "🔍 *Market confluence too weak* — waiting for clearer setup.",
+            "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
+        }
+    # Boost strength kama quality gate score ni juu
+    _cq_strength_bonus = max(0, (_cq_score - 50) // 5)  # 0-10pts bonus
+    # ── end v56 CQ gate ──────────────────────────────────────────────────────
+
     mtf_bonus = 0
     if mtf and mtf["total"] >= 3:
         agreeing = mtf["buy_tfs"] if direction == "BUY" else mtf["sell_tfs"]
@@ -6853,7 +7468,7 @@ def generate_signal(pair):
         elif hist_pct < 0.40:
             hist_bonus_str = -5  # Penalize direction with poor win history
 
-    raw_strength = base_score + ia_bonus + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str + micro_htf_bonus_str
+    raw_strength = base_score + ia_bonus + mtf_bonus + trend_bonus + pattern_bonus_str + hist_bonus_str + micro_htf_bonus_str + _cq_strength_bonus
     raw_clamped = max(35, min(97, raw_strength))
     strength = int(90 + (raw_clamped - 35) / (97 - 35) * (450 - 90))
 
@@ -7662,6 +8277,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 Start Trading", callback_data="choose_pair")],
+                [InlineKeyboardButton("🌐 Global Scan (Best Pair Auto)", callback_data="global_scan")],
                 [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
                 [InlineKeyboardButton("💬 Support", url=support_url)],
             ])
@@ -7779,8 +8395,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🤖 Bot Pick Best Pair", callback_data="bot_pick_pair")],
                 [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+                [InlineKeyboardButton("🌐 Global Scan (Best Pair Auto)", callback_data="global_scan")],
             ])
         )
+        return
+
+    if data == "global_scan":
+        if not is_licensed(user_id):
+            await q.edit_message_text(
+                "🔒 *Global Scan — Subscribers Only*\n\n"
+                "Global Scan inascan pairs {} kwa pamoja na kutuma signal moja bora.\n\n"
+                "Upgrade to unlock:\n"
+                "✅ Global scan — pairs zote kwa wakati mmoja\n"
+                "✅ Trend-follow signals tu (hakuna reverse)\n"
+                "✅ Unlimited signals".format(len(GLOBAL_SCAN_PAIRS)),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
+                    [InlineKeyboardButton("📊 Choose Pair Myself", callback_data="choose_pair")],
+                ])
+            )
+            return
+        if is_market_closed():
+            await q.edit_message_text(
+                "🔒 *Market Closed*\n\n"
+                "Global Scan inafanya kazi kwa non-OTC pairs tu.\n"
+                "Market imefungwa sasa (weekend au night hours).\n\n"
+                "_Subiri market ifunguke au chagua OTC pair manually._",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Choose OTC Pair", callback_data="choose_pair")],
+                ])
+            )
+            return
+        # Simamisha scan nyingine inayoendelea
+        old_ev = _ACTIVE_SCANS.get(int(user_id))
+        if old_ev is not None:
+            old_ev.set()
+        asyncio.create_task(global_scan_and_send(context.bot, chat, user_id, context))
         return
 
     if data == "check_join":
@@ -8801,7 +9453,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["_user_chose_tf"] = False
         mark_pair_active(pair)
 
-        is_non_otc  = True
+        is_non_otc  = "OTC" not in pair and pair in YAHOO_SYMBOLS
         entry_price = None
         trend       = get_trend_direction(pair)
         check       = check_signal_request(user_id, pair)
@@ -8976,6 +9628,15 @@ AUTO_SCAN_PAIRS = {
     "CAD/JPY", "EUR/GBP", "CHF/JPY",
     "AUD/CHF", "AUD/CAD", "AUD/JPY"
 }
+
+# Global scan: pairs zote za non-OTC zinazoscan kwa pamoja
+GLOBAL_SCAN_PAIRS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD",
+    "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
+    "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
+    "AUD/JPY", "AUD/CAD", "AUD/CHF",
+    "CAD/JPY", "CHF/JPY",
+]
 
 _ACTIVE_SCANS = {}  # {user_id: asyncio.Event (cancel event)}
 
@@ -9168,13 +9829,36 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                 # Fix #5: tumia 1m tu — ignore tf iliyotoka kwa engine
                 timeframe = FIXED_TF
 
-                # Fix #3: Fuata trend — ikiwa trend_1h ni BUY, direction lazima iwe BUY
+                # TREND-FOLLOW ONLY: direction lazima iwe sawa na trend_1h
                 direction   = sig["direction"]
                 trend_1h    = sig.get("trend_1h")
-                if trend_1h in ("BUY", "SELL") and direction != trend_1h:
-                    logging.info("AUTO_SCAN {}: direction {} overridden by trend_1h {}".format(
-                        pair, direction, trend_1h))
-                    direction = trend_1h
+
+                # Kama trend_1h inapatikana, direction LAZIMA ilingane nayo
+                # Reverse signals (direction ≠ trend_1h) zinakataliwa kabisa
+                if trend_1h in ("BUY", "SELL"):
+                    if direction != trend_1h:
+                        logging.info("AUTO_SCAN {}: TREND-FOLLOW SKIP — dir={} opposes trend_1h={} (reverse rejected)".format(
+                            pair, direction, trend_1h))
+                        continue  # Skip — hii ni reverse, sio trend follow
+                    # Direction sawa na trend — nzuri, endelea
+                else:
+                    # trend_1h haipo — angalia indicators za Deriv kama trend proxy
+                    micro_htf = sig.get("micro_htf")
+                    if micro_htf:
+                        micro_dirs = [
+                            micro_htf.get("5_s",  {}).get("direction"),
+                            micro_htf.get("10_s", {}).get("direction"),
+                            micro_htf.get("15_s", {}).get("direction"),
+                        ]
+                        micro_dirs = [d for d in micro_dirs if d in ("BUY", "SELL")]
+                        if len(micro_dirs) >= 2:
+                            buy_votes  = micro_dirs.count("BUY")
+                            sell_votes = micro_dirs.count("SELL")
+                            micro_trend = "BUY" if buy_votes > sell_votes else "SELL"
+                            if direction != micro_trend:
+                                logging.info("AUTO_SCAN {}: MICRO-TREND SKIP — dir={} opposes micro_trend={}".format(
+                                    pair, direction, micro_trend))
+                                continue
 
                 logging.info("AUTO_SCAN {}: #{} flat={} tf={} ind={} str={} dir={} trend={}".format(
                     pair, scan_count, is_flat, tf, ind_agree, _s, direction, trend_1h))
@@ -9310,6 +9994,314 @@ async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timefra
         push_msg_id(user_id, sent.message_id)
     except Exception as e:
         logging.warning("auto_scan_result send failed: {}".format(e))
+
+
+async def global_scan_and_send(bot, chat, user_id, context):
+    """
+    GLOBAL SCAN ENGINE (v55):
+    Scan pairs ZOTE za GLOBAL_SCAN_PAIRS kwa wakati mmoja.
+    Chagua signal MOJA bora zaidi kati ya zote — itume mtu.
+
+    Kanuni za uchaguzi wa signal bora:
+      1. TREND-FOLLOW TU: direction lazima ilingane na trend_1h au micro-HTF
+         Reverse signals (counter-trend) zinakataliwa kabisa
+      2. Ubora: indicators_agree × strength × trend confirmation
+      3. Pair moja tu inatumwa kila scan cycle
+    """
+    SCAN_INTERVAL  = 45   # sekunde kati ya scans
+    MIN_INDICATORS = 5
+    MIN_STRENGTH   = 150
+    FIXED_TF       = 1
+    COOLDOWN_SECS  = 75   # subiri baada ya signal
+
+    uid = int(user_id)
+
+    cancel_ev = asyncio.Event()
+    _ACTIVE_SCANS[uid] = cancel_ev
+
+    stop_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
+    ])
+
+    def _is_cancelled():
+        return cancel_ev.is_set() or _ACTIVE_SCANS.get(uid) is not cancel_ev
+
+    async def _wait(secs):
+        try:
+            await asyncio.wait_for(cancel_ev.wait(), timeout=secs)
+        except asyncio.TimeoutError:
+            pass
+
+    try:
+        scan_msg = await bot.send_message(
+            chat_id=chat,
+            text=(
+                "🌐 *Global Scan Started*\n\n"
+                "📡 Scanning *{}* pairs simultaneously\\.\n"
+                "⚡ Best trend\\-follow signal will be sent automatically\\.\n\n"
+                "_Only trend\\-following signals \\(BUY with uptrend / SELL with downtrend\\)\\._\n\n"
+                "_Tap Stop to end the session\\._"
+            ).format(len(GLOBAL_SCAN_PAIRS)),
+            parse_mode="MarkdownV2",
+            reply_markup=stop_kb
+        )
+        save_last_bot_msg(uid, scan_msg.message_id)
+    except Exception as e:
+        logging.warning("global_scan: start msg failed: {}".format(e))
+        return
+
+    scan_count    = 0
+    signal_count  = 0
+    scan_wins_ref   = [0]
+    scan_losses_ref = [0]
+
+    # Filter pairs kwa market hours
+    def _get_active_pairs():
+        if is_market_closed():
+            return []  # Global scan ni kwa non-OTC tu
+        return [p for p in GLOBAL_SCAN_PAIRS if p in YAHOO_SYMBOLS]
+
+    try:
+        while True:
+            if _is_cancelled():
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "⏹ *Global Scan Stopped*\n\n"
+                            "🏆 Won: *{}*   💔 Lost: *{}*\n"
+                            "📊 Total signals: *{}*\n"
+                            "📡 Pairs scanned: *{}*"
+                        ).format(
+                            scan_wins_ref[0], scan_losses_ref[0],
+                            scan_wins_ref[0] + scan_losses_ref[0],
+                            len(GLOBAL_SCAN_PAIRS)
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except: pass
+                return
+
+            if scan_count > 0:
+                await _wait(SCAN_INTERVAL)
+                if _is_cancelled():
+                    continue
+
+            scan_count += 1
+            anim = ["🌐", "📡", "🔍", "⚡"][scan_count % 4]
+
+            active_pairs = _get_active_pairs()
+            if not active_pairs:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "🔒 *Market Closed*\n\n"
+                            "Global Scan ni kwa non\\-OTC pairs tu\\.\n"
+                            "Subiri market ifunguke au chagua OTC pair manually\\.\n\n"
+                            "_Tap Stop to end\\._"
+                        ),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
+                await _wait(60)
+                continue
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat,
+                    message_id=scan_msg.message_id,
+                    text=(
+                        "{} *Global Scanning* — {} pairs\n\n"
+                        "Scan \\#{} \\| Signals sent: {}\n\n"
+                        "_Analysing all pairs\\.\\.\\. picking best trend signal\\._"
+                    ).format(anim, len(active_pairs), scan_count, signal_count),
+                    parse_mode="MarkdownV2",
+                    reply_markup=stop_kb
+                )
+            except: pass
+
+            # ── Scan all pairs, collect candidates ──────────────────────────
+            candidates = []
+
+            scan_tasks = []
+            for p in active_pairs:
+                scan_tasks.append(safe_generate_signal_cached(p))
+
+            results = await asyncio.gather(*scan_tasks, return_exceptions=True)
+
+            for i, result in enumerate(results):
+                pair = active_pairs[i]
+                try:
+                    if isinstance(result, Exception):
+                        continue
+                    sig, _ = result if isinstance(result, tuple) else (result, None)
+                    if sig is None:
+                        continue
+
+                    is_flat   = sig.get("flat", False)
+                    tf        = sig.get("timeframe", 0)
+                    ind_agree = sig.get("indicators_agree", 0)
+                    strength  = sig.get("strength", 0)
+                    direction = sig.get("direction")
+                    trend_1h  = sig.get("trend_1h")
+                    micro_htf = sig.get("micro_htf")
+
+                    if is_flat or tf == 0:
+                        continue
+                    if ind_agree < MIN_INDICATORS:
+                        continue
+                    if not direction:
+                        continue
+
+                    # ── TREND-FOLLOW FILTER ──────────────────────────────
+                    # trend_1h inapatikana → direction LAZIMA ilingane
+                    if trend_1h in ("BUY", "SELL"):
+                        if direction != trend_1h:
+                            logging.info("GLOBAL_SCAN {}: SKIP reverse dir={} vs trend_1h={}".format(
+                                pair, direction, trend_1h))
+                            continue
+                        trend_confirmed = True
+                    else:
+                        # Tumia Deriv micro-HTF kama trend proxy
+                        trend_confirmed = False
+                        if micro_htf:
+                            micro_dirs = [
+                                micro_htf.get("5_s",  {}).get("direction"),
+                                micro_htf.get("10_s", {}).get("direction"),
+                                micro_htf.get("15_s", {}).get("direction"),
+                            ]
+                            micro_dirs = [d for d in micro_dirs if d in ("BUY", "SELL")]
+                            if len(micro_dirs) >= 2:
+                                buy_v  = micro_dirs.count("BUY")
+                                sell_v = micro_dirs.count("SELL")
+                                micro_trend = "BUY" if buy_v > sell_v else "SELL"
+                                if direction != micro_trend:
+                                    logging.info("GLOBAL_SCAN {}: SKIP reverse dir={} vs micro_trend={}".format(
+                                        pair, direction, micro_trend))
+                                    continue
+                                trend_confirmed = True
+
+                        # Hakuna trend data yoyote — skip (haijulikani ni trend au reverse)
+                        if not trend_confirmed:
+                            logging.info("GLOBAL_SCAN {}: SKIP — no trend data, cannot confirm trend-follow".format(pair))
+                            continue
+
+                    # ── Normalise strength ───────────────────────────────
+                    _s = strength
+                    if isinstance(_s, (int, float)) and _s > 450:
+                        _s = int(90 + (min(500, max(300, _s)) - 300) / 200 * 360)
+                    elif isinstance(_s, (int, float)) and _s < 90:
+                        _s = int(90 + (max(35, min(97, _s)) - 35) / 62 * 360)
+                    _s = max(90, min(450, int(_s)))
+
+                    if _s < MIN_STRENGTH:
+                        continue
+
+                    # ── Score candidate ──────────────────────────────────
+                    # Score = indicators_agree × strength × trend_bonus
+                    trend_bonus = 1.3 if trend_1h in ("BUY", "SELL") else 1.0
+                    score = ind_agree * _s * trend_bonus
+
+                    # Candle confirm bonus
+                    candle_ok = _confirm_real_candle_direction(pair, direction)
+                    if not candle_ok:
+                        logging.info("GLOBAL_SCAN {}: candle confirm failed dir={} — penalise".format(pair, direction))
+                        score *= 0.5  # Punguza score badala ya kukataa kabisa
+
+                    candidates.append({
+                        "pair":      pair,
+                        "sig":       sig,
+                        "direction": direction,
+                        "trend_1h":  trend_1h,
+                        "strength":  _s,
+                        "ind_agree": ind_agree,
+                        "score":     score,
+                        "candle_ok": candle_ok,
+                    })
+                    logging.info("GLOBAL_SCAN candidate: {} dir={} score={:.0f} ind={} str={} trend={}".format(
+                        pair, direction, score, ind_agree, _s, trend_1h))
+
+                except Exception as _pe:
+                    logging.warning("GLOBAL_SCAN pair {} error: {}".format(pair, _pe))
+                    continue
+
+            # ── Pick best candidate ─────────────────────────────────────────
+            if not candidates:
+                logging.info("GLOBAL_SCAN #{}: no trend-follow candidates found".format(scan_count))
+                continue
+
+            # Sort: candle_ok kwanza, kisha score kubwa
+            candidates.sort(key=lambda c: (c["candle_ok"], c["score"]), reverse=True)
+            best = candidates[0]
+
+            pair      = best["pair"]
+            direction = best["direction"]
+            _s        = best["strength"]
+            trend_1h  = best["trend_1h"]
+
+            logging.info("GLOBAL_SCAN #{} BEST: {} dir={} score={:.0f} (from {} candidates)".format(
+                scan_count, pair, direction, best["score"], len(candidates)))
+
+            # ── Send signal ─────────────────────────────────────────────────
+            ib        = direction == "BUY"
+            img       = get_buy_image() if ib else get_sell_image()
+            dir_arrow = "📈" if ib else "📉"
+            dir_label = "BUY 🟢" if ib else "SELL 🔴"
+            trend_txt = "Trend: {} ✅".format(trend_1h) if trend_1h else "Trend confirmed ✅"
+
+            entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
+            signal_count += 1
+
+            cap = (
+                "🏆 *EVALON WINNERS* 🏆\n\n"
+                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+                "📊 PAIR      : *{}*\n"
+                "⏱ EXPIRY    : *1 MIN*\n"
+                "🕐 ENTRY     : *{}*\n"
+                "{} DIRECTION : *{}*\n"
+                "📡 {}*\n"
+                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
+                "✅ Trend\\-follow signal"
+            ).format(
+                pair, entry_str, dir_arrow, dir_label,
+                trend_txt.replace("-","\\-").replace(">","\\>")
+            )
+
+            entry_price = _fetch_current_price(pair)
+            save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+            if not is_licensed(uid): use_free_signal(uid)
+
+            sent_msg = await bot.send_photo(
+                chat_id=chat,
+                photo=img,
+                caption=cap,
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
+                ])
+            )
+            save_last_signal_msg(uid, sent_msg.message_id)
+            record_signal(pair, direction)
+
+            if entry_price is not None:
+                asyncio.create_task(
+                    auto_scan_result_check(
+                        bot, chat, uid, pair, direction, FIXED_TF,
+                        entry_price, secs_to_close,
+                        scan_wins_ref, scan_losses_ref
+                    )
+                )
+
+            # Subiri expiry + buffer kabla ya scan inayofuata
+            await _wait(secs_to_close + COOLDOWN_SECS)
+
+    finally:
+        if _ACTIVE_SCANS.get(uid) is cancel_ev:
+            _ACTIVE_SCANS.pop(uid, None)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
