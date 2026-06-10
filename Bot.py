@@ -2363,40 +2363,64 @@ def _calc_indicators_from_df(df):
     elif price_change < 0 and rsi_change > 3:
         divergence = "BUY"    # Bullish divergence
 
+    # ── Williams Fractal Detection (v54-8 fixed) ──
+    # Bull fractal: candle ya chini kuliko 2 za pande zote mbili → bei ilirudi juu → BUY
+    # Bear fractal: candle ya juu kuliko 2 za pande zote mbili → bei iligeuka chini → SELL
+    # Candle lazima ifunge kabisa (i+2 lazima iwepo) → loop inaishia n-3
     fractal_signal = None
-    fractal_strength = 0  # 0=none, 1=fractal 1, 2=fractal 2+ (stronger)
+    fractal_strength = 0
     high_vals = high.values
     low_vals  = low.values
     n = len(high_vals)
-    recent_bull_fractals = []
-    recent_bear_fractals = []
-    for i in range(n - 4, max(n - 15, 4), -1):
-        if (high_vals[i] > high_vals[i-2] and high_vals[i] > high_vals[i-1] and
+    recent_bull_fractals = []  # (index, low_price)
+    recent_bear_fractals = []  # (index, high_price)
+
+    for i in range(n - 3, max(n - 20, 2), -1):
+        if i + 2 >= n or i - 2 < 0:
+            continue
+        # Bear fractal: high[i] > high[i-2], high[i-1], high[i+1], high[i+2]
+        if (high_vals[i] > high_vals[i-1] and high_vals[i] > high_vals[i-2] and
                 high_vals[i] > high_vals[i+1] and high_vals[i] > high_vals[i+2]):
-            recent_bear_fractals.append(i)
-        if (low_vals[i] < low_vals[i-2] and low_vals[i] < low_vals[i-1] and
+            recent_bear_fractals.append((i, float(high_vals[i])))
+        # Bull fractal: low[i] < low[i-2], low[i-1], low[i+1], low[i+2]
+        if (low_vals[i] < low_vals[i-1] and low_vals[i] < low_vals[i-2] and
                 low_vals[i] < low_vals[i+1] and low_vals[i] < low_vals[i+2]):
-            recent_bull_fractals.append(i)
+            recent_bull_fractals.append((i, float(low_vals[i])))
+
     current_price_val = float(close.iloc[-1])
-    if recent_bull_fractals:
-        latest_bull = float(low_vals[recent_bull_fractals[0]])
-        if current_price_val > latest_bull:
+
+    # Pata fractal ya hivi karibuni ya kila aina
+    latest_bull_price = recent_bull_fractals[0][1] if recent_bull_fractals else None
+    latest_bear_price = recent_bear_fractals[0][1] if recent_bear_fractals else None
+
+    bull_signal = False
+    bear_signal = False
+
+    # Bull fractal: bei ya sasa iko JUU ya fractal low → trend inaendelea juu → BUY
+    if latest_bull_price is not None and current_price_val > latest_bull_price:
+        bull_signal = True
+
+    # Bear fractal: bei ya sasa iko CHINI ya fractal high → trend inaendelea chini → SELL
+    if latest_bear_price is not None and current_price_val < latest_bear_price:
+        bear_signal = True
+
+    if bull_signal and not bear_signal:
+        fractal_signal = "BUY"
+        fractal_strength = min(3, len(recent_bull_fractals))
+    elif bear_signal and not bull_signal:
+        fractal_signal = "SELL"
+        fractal_strength = min(3, len(recent_bear_fractals))
+    elif bull_signal and bear_signal:
+        # Zote mbili — chagua kwa nguvu ya fractal (umbali kutoka bei ya sasa)
+        bull_gap = current_price_val - latest_bull_price   # juu ya bull = nguvu ya BUY
+        bear_gap = latest_bear_price - current_price_val   # chini ya bear = nguvu ya SELL
+        if bull_gap > bear_gap:
             fractal_signal = "BUY"
-            fractal_strength = min(2, len(recent_bull_fractals))
-    if recent_bear_fractals:
-        latest_bear = float(high_vals[recent_bear_fractals[0]])
-        if current_price_val < latest_bear:
-            fractal_signal = "SELL"
-            fractal_strength = min(2, len(recent_bear_fractals))
-    if recent_bull_fractals and recent_bear_fractals:
-        bull_dist = abs(current_price_val - float(low_vals[recent_bull_fractals[0]]))
-        bear_dist = abs(current_price_val - float(high_vals[recent_bear_fractals[0]]))
-        if bull_dist < bear_dist:
-            fractal_signal = "BUY"
-            fractal_strength = min(2, len(recent_bull_fractals))
+            fractal_strength = min(3, len(recent_bull_fractals))
         else:
             fractal_signal = "SELL"
-            fractal_strength = min(2, len(recent_bear_fractals))
+            fractal_strength = min(3, len(recent_bear_fractals))
+    # else: fractal_signal = None (hakuna fractal iliyothibitishwa)
 
     current_price = float(close.iloc[-1])
     direction_raw = "BUY" if ma_diff > 0 and macd_norm > 0 else ("SELL" if ma_diff < 0 and macd_norm < 0 else None)
@@ -3504,41 +3528,108 @@ def get_cooldown_remaining(user_id, pair):
 
 async def schedule_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price):
     """
-    v53: Multi-TF outcome learning.
+    v54-8: Candle-Close Result Tracker.
 
-    Badala ya kuangalia TF moja tu iliyotumwa, sasa tunaangalia TF zote 3
-    (1m, 2m, 3m) kwa wakati mmoja. Hii inafundisha mfumo kujua:
-      - TF gani ilishinda ZAIDI kwa setup hii?
-      - Kama trend ya 2m BUY ilionekana, je 1m/3m zingelishinda pia?
+    Mantiki sahihi ya binary options:
+      - Subiri candle IFUNGE kabisa (siyo tu dakika 1 baada ya signal)
+      - Angalia open vs close ya candle iliyofungwa (iloc[-2])
+      - Green candle = BUY win, Red candle = SELL win
+      - Timing: hesabu sekunde hadi mwisho wa dakika inayofuata
 
-    Mpangilio:
-      - Hifadhi entry_price
-      - Baada ya dakika 1: pata exit → record TF=1 outcome
-      - Baada ya dakika 2: pata exit → record TF=2 outcome
-      - Baada ya dakika 3: pata exit → record TF=3 outcome
-      - Tuma result kwa mtumiaji baada ya TF yao (timeframe_mins) kuisha
+    Kwa TF 1m: subiri candle 1 ifunge
+    Kwa TF 2m: subiri candles 2 zifunge
+    Kwa TF 3m: subiri candles 3 zifunge
     """
     if entry_price is None:
         return
 
     _ep = entry_price
 
-    async def _get_exit():
-        for _ in range(3):
-            p = _fetch_current_price(pair)
-            if p is not None:
-                return p
-            await asyncio.sleep(3)
+    def _secs_until_next_candle_close(tf_mins):
+        """
+        Hesabu sekunde hadi candle INAYOFUATA ifunge.
+
+        Mfano: signal 14:32:40, expiry 1m
+          Trade inaanza  14:32:40
+          Expiry         14:33:40
+          Candle ifunge  14:34:00  ← hapa ndio tunasubiri
+          (siyo 14:33:00 ambayo ni candle ya sasa tu)
+
+        Formula:
+          secs_to_end_current = candle_secs - (now % candle_secs)
+          secs_to_next_close  = secs_to_end_current + candle_secs + 5s buffer
+        """
+        now = datetime.utcnow()
+        total_secs = now.hour * 3600 + now.minute * 60 + now.second
+        candle_secs = tf_mins * 60
+        secs_into_candle = total_secs % candle_secs
+        secs_to_end_current = candle_secs - secs_into_candle
+        # Subiri candle ya sasa iishe + candle inayofuata iishe + buffer 5s
+        return secs_to_end_current + candle_secs + 5
+
+    async def _get_candle_result(tf_mins):
+        """
+        Angalia candle iliyofungwa hivi karibuni.
+        Returns: True (won), False (lost), None (data haikupatikana)
+        """
+        real_pair = OTC_TO_REAL.get(pair, pair)
+        yf_sym    = YAHOO_SYMBOLS.get(real_pair)
+        fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
+
+        # Jaribu mara 3 kwa interval ya 5s kama data haipo bado
+        for attempt in range(3):
+            # Jaribu Finnhub 1m kwanza (haraka zaidi)
+            if fh_sym and FINNHUB_KEY and tf_mins == 1:
+                try:
+                    df = _mtf_fh_candles(fh_sym, "1", 5)
+                    if df is not None and len(df) >= 2:
+                        closed_open  = float(df["Open"].iloc[-2])
+                        closed_close = float(df["Close"].iloc[-2])
+                        is_green = closed_close > closed_open
+                        is_red   = closed_close < closed_open
+                        logging.info("CANDLE RESULT Finnhub {}: open={:.5f} close={:.5f} green={} dir={}".format(
+                            pair, closed_open, closed_close, is_green, direction))
+                        if is_green == is_red:  # wote ni False = doji, skip
+                            await asyncio.sleep(5)
+                            continue
+                        return (direction == "BUY" and is_green) or (direction == "SELL" and is_red)
+                except Exception as _fe:
+                    logging.warning("Finnhub candle result {} failed: {}".format(pair, _fe))
+
+            # Yahoo Finance fallback
+            if yf_sym:
+                try:
+                    interval = "1m" if tf_mins == 1 else ("2m" if tf_mins == 2 else "5m")
+                    df = _yf_download_cached(yf_sym, "1d", interval)
+                    if df is not None and len(df) >= 2:
+                        closed_open  = float(df["Open"].squeeze().iloc[-2])
+                        closed_close = float(df["Close"].squeeze().iloc[-2])
+                        is_green = closed_close > closed_open
+                        is_red   = closed_close < closed_open
+                        logging.info("CANDLE RESULT Yahoo {}: open={:.5f} close={:.5f} green={} dir={}".format(
+                            pair, closed_open, closed_close, is_green, direction))
+                        if is_green == is_red:  # doji - jaribu tena
+                            await asyncio.sleep(5)
+                            continue
+                        return (direction == "BUY" and is_green) or (direction == "SELL" and is_red)
+                except Exception as _ye:
+                    logging.warning("Yahoo candle result {} failed: {}".format(pair, _ye))
+
+            await asyncio.sleep(5)
+
+        # Fallback wa mwisho: tumia price diff kama candle data haikupatikana
+        logging.warning("CANDLE RESULT {}: fallback to price diff".format(pair))
+        exit_p = _fetch_current_price(pair)
+        if exit_p is not None and _ep is not None:
+            diff = exit_p - _ep
+            if abs(diff) > 1e-8:
+                return (diff > 0) if direction == "BUY" else (diff < 0)
         return None
 
-    def _record_tf_outcome(tf, exit_p):
-        """Hifadhi matokeo ya TF moja kwenye DB."""
-        if exit_p is None or _ep is None:
+    def _record_outcome(tf, won):
+        """Hifadhi matokeo kwenye DB tables zote."""
+        if won is None:
             return
-        diff = exit_p - _ep
-        if abs(diff) < 1e-8:
-            return  # Harakati ndogo sana - skip
-        won = (diff > 0) if direction == "BUY" else (diff < 0)
         try:
             session = _get_session().get("name", "Unknown")
         except Exception:
@@ -3555,75 +3646,70 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                     """.format(col, col), (pair, session, tf, 1 if won else 0, 0 if won else 1))
                 conn.commit()
         except Exception as _e:
-            logging.warning("multi_tf_outcome tf_session_stats tf={} {}: {}".format(tf, pair, _e))
+            logging.warning("result tf_session_stats tf={} {}: {}".format(tf, pair, _e))
         try:
             update_signal_combo_stats(pair=pair, direction=direction, tf_mins=tf,
                                       won=won, session=session)
         except Exception as _e:
-            logging.warning("multi_tf_outcome combo_stats tf={} {}: {}".format(tf, pair, _e))
-        try:
-            if tf == timeframe_mins:  # Hifadhi pair stats mara moja tu (TF iliyotumwa)
+            logging.warning("result combo_stats tf={} {}: {}".format(tf, pair, _e))
+        if tf == timeframe_mins:
+            try:
                 update_pair_stats(pair, won)
-        except Exception as _e:
-            logging.warning("multi_tf_outcome pair_stats tf={} {}: {}".format(tf, pair, _e))
-        logging.info("MULTI_TF_OUTCOME {}: dir={} tf={}m entry={:.5f} exit={:.5f} won={}".format(
-            pair, direction, tf, _ep, exit_p, won))
+            except Exception as _e:
+                logging.warning("result pair_stats tf={} {}: {}".format(tf, pair, _e))
+        logging.info("RESULT_RECORDED {}: dir={} tf={}m won={}".format(pair, direction, tf, won))
 
-    result_sent = False
-
+    # ── Mzunguko wa TFs 1m, 2m, 3m ──
     for check_tf in [1, 2, 3]:
-        await asyncio.sleep(60)  # kila loop = dakika 1
 
+        # Hesabu muda wa kusubiri hadi candle ya check_tf ifunge
+        wait_secs = _secs_until_next_candle_close(check_tf)
+        logging.info("RESULT WAIT {}: tf={}m sleeping {:.0f}s".format(pair, check_tf, wait_secs))
+        await asyncio.sleep(wait_secs)
+
+        # Angalia kama user amebadilisha signal (signal mpya)
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT result_sent, entry_price FROM user_signal_state "
+                        "SELECT entry_price FROM user_signal_state "
                         "WHERE user_id=%s AND pair=%s", (user_id, pair))
                     row = cur.fetchone()
             if row and row.get("entry_price") is not None:
                 _ep2 = float(row["entry_price"])
                 if abs(_ep2 - _ep) > 1e-6:
-                    logging.info("MULTI_TF_OUTCOME {}: entry changed, stopping tracking".format(pair))
+                    logging.info("RESULT {}: entry changed ({} vs {}), stopping".format(
+                        pair, _ep, _ep2))
                     return
         except Exception:
             pass
 
-        exit_p = await _get_exit()
-        _record_tf_outcome(check_tf, exit_p)
+        # Angalia candle iliyofungwa
+        won = await _get_candle_result(check_tf)
+        _record_outcome(check_tf, won)
 
-        if check_tf == timeframe_mins and not result_sent:
-            result_sent = True
-            if exit_p is None or _ep is None:
-                continue
-            diff = exit_p - _ep
-            if abs(diff) < 1e-8:
-                continue
-            won_user = (diff > 0) if direction == "BUY" else (diff < 0)
-
+        # Tuma result kwa mtumiaji (TF yao tu)
+        if check_tf == timeframe_mins:
             try:
-                nn_feedback_from_vte(user_id, pair, won_user)
-            except Exception as _nn_e:
-                logging.warning("NN feedback error: {}".format(_nn_e))
+                nn_feedback_from_vte(user_id, pair, won)
+            except Exception:
+                pass
 
-            if not is_results_enabled():
-                continue
-            if "OTC" in pair:
-                continue
+            if not is_results_enabled() or "OTC" in pair or won is None:
+                return
 
-            won_label  = "WIN ✅" if won_user else "LOSS ❌"
+            won_label  = "WIN ✅" if won else "LOSS ❌"
             dir_label  = "BUY 🟢" if direction == "BUY" else "SELL 🔴"
             dir_arrow  = "📈" if direction == "BUY" else "📉"
             won_footer = (
                 "💰 Congratulations\\! Another profit secured\\!\n"
                 "🔥 Stay focused — more signals coming\\!\n"
                 "💎 VVIP MEMBERS ONLY"
-            ) if won_user else (
+            ) if won else (
                 "📉 Not every trade wins — stay disciplined\\!\n"
                 "🔁 Next signal coming soon\\.\n"
                 "💎 VVIP MEMBERS ONLY"
             )
-
             result_text = (
                 "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
                 "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
@@ -3647,6 +3733,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                     conn.commit()
             except Exception as e:
                 logging.warning("schedule_result_check send failed: {}".format(e))
+            return  # Tumekwisha — toka baada ya TF ya mtumiaji
 
         if check_tf == 3:
             break
@@ -6455,7 +6542,7 @@ def generate_signal(pair):
             vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
             candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
 
-    _w = 0.5 if not is_otc else 1.0
+    _w = 1.0  # v54-8: non-OTC indicators sasa zinapata uzito kamili (ilikuwa 0.5)
     b = s = 0
     if rsi < 25:    b += int(25 * _w)
     elif rsi < 35:  b += int(15 * _w)
@@ -6508,24 +6595,47 @@ def generate_signal(pair):
             b -= 10
             s -= 10
 
+    # ── Fractal scoring (v54-8) ──
+    # Chanzo 1: fractal kutoka 5m data (ndani ya real)
     fractal_sig = None
     fractal_str = 0
     if real and real.get("fractal_signal"):
         fractal_sig = real["fractal_signal"]
         fractal_str = real.get("fractal_strength", 1)
-    else:
-        if bb_pos < 0.15:
+
+    # Chanzo 2: fractal kutoka 1m data halisi (muhimu zaidi kwa binary 1m)
+    # Inasupersede 5m fractal kama inapatikana
+    if not is_otc:
+        real_pair_fr = OTC_TO_REAL.get(pair, pair)
+        yf_sym_fr = YAHOO_SYMBOLS.get(real_pair_fr)
+        fh_sym_fr = FINNHUB_FOREX_SYMBOLS.get(real_pair_fr)
+        df_1m_fr = None
+        try:
+            if fh_sym_fr and FINNHUB_KEY:
+                df_1m_fr = _mtf_fh_candles(fh_sym_fr, "1", 60)
+            if df_1m_fr is None and yf_sym_fr:
+                df_1m_fr = _yf_download_cached(yf_sym_fr, "1d", "1m")
+        except Exception:
+            df_1m_fr = None
+        if df_1m_fr is not None and len(df_1m_fr) >= 10:
+            ind_1m_fr = _calc_indicators_from_df(df_1m_fr)
+            if ind_1m_fr and ind_1m_fr.get("fractal_signal"):
+                fractal_sig = ind_1m_fr["fractal_signal"]
+                fractal_str = ind_1m_fr.get("fractal_strength", 1) + 1  # 1m inapata bonus +1
+                logging.info("FRACTAL 1m {}: {} str={}".format(pair, fractal_sig, fractal_str))
+
+    # Kama hakuna fractal yoyote - BB fallback (dhaifu)
+    if fractal_sig is None:
+        if bb_pos < 0.08:
             fractal_sig = "BUY";  fractal_str = 1
-        elif bb_pos < 0.08:
-            fractal_sig = "BUY";  fractal_str = 2
-        elif bb_pos > 0.85:
-            fractal_sig = "SELL"; fractal_str = 1
         elif bb_pos > 0.92:
-            fractal_sig = "SELL"; fractal_str = 2
+            fractal_sig = "SELL"; fractal_str = 1
+
+    # Uzito: fractal inapata pointi 35 (ilikuwa 15) - muhimu zaidi
     if fractal_sig == "BUY":
-        b += 15 * fractal_str
+        b += 35 * fractal_str
     elif fractal_sig == "SELL":
-        s += 15 * fractal_str
+        s += 35 * fractal_str
 
     b += pattern_buy_bonus
     s += pattern_sell_bonus
@@ -6594,6 +6704,25 @@ def generate_signal(pair):
             s += mtf["sell_tfs"] * _mtf_w
 
     direction = "BUY" if b >= s else "SELL"
+
+    # Fix B (v54-8): kama trend_1h haipo na real data ipo, anchor direction kwa 5m data halisi
+    # Hii inazuia direction flip-flop wakati 1H haiji na vitu vingine vina mgawanyiko
+    if not is_otc and trend_1h is None and real is not None:
+        real_dir = real.get("direction")  # direction kutoka 5m indicators (MA+MACD)
+        if real_dir in ("BUY", "SELL"):
+            tf_votes_match = (real_dir == "BUY" and real.get("tf_buy_votes", 0) >= real.get("tf_sell_votes", 0)) or                              (real_dir == "SELL" and real.get("tf_sell_votes", 0) >= real.get("tf_buy_votes", 0))
+            if tf_votes_match:
+                # 5m direction + tf votes zinabaliana - anchor hapa
+                direction = real_dir
+                logging.info("DIRECTION ANCHOR {}: trend_1h=None, real_dir={} tf_buy={} tf_sell={} → anchored".format(
+                    pair, real_dir, real.get("tf_buy_votes",0), real.get("tf_sell_votes",0)))
+            else:
+                # 5m direction na tf votes hazikubaliani - angalia vwap kama tiebreaker
+                if vwap_data is not None:
+                    direction = vwap_data["direction"]
+                    logging.info("DIRECTION ANCHOR {}: trend_1h=None, 5m vs tf conflict → vwap={}".format(
+                        pair, vwap_data["direction"]))
+                # kama vwap pia haipo - acha direction = b vs s kama ilivyo
     indicators_agree = 0
     checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
               (macd > 0, macd < 0), (bb_pos < 0.5, bb_pos > 0.5), (mom > 0, mom < 0), (candle > 0, candle < 0)]
@@ -8777,6 +8906,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
+
+        # Pata bei ya kuingia KABLA ya kutuma signal (kwa result tracking)
+        if is_non_otc:
+            entry_price = _fetch_current_price(pair)
+            logging.info("ENTRY PRICE {}: {}".format(pair, entry_price))
 
         save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
         if check["action"] != "fresh":
