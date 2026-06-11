@@ -2505,7 +2505,7 @@ def total_free_allowed(user_id):
 ALL_PAIRS = [
     "EUR/USD OTC", "EUR/USD", "GBP/USD OTC", "GBP/USD",
     "USD/JPY OTC", "USD/JPY", "USD/CHF OTC", "USD/CHF",
-    "AUD/USD OTC", "AUD/USD", "NZD/USD OTC", "NZD/USD",
+    "AUD/USD OTC", "AUD/USD", "NZD/USD OTC",
     "USD/CAD OTC", "USD/CAD", "EUR/GBP OTC", "EUR/GBP",
     "EUR/JPY OTC", "EUR/JPY", "EUR/AUD OTC", "EUR/AUD",
     "EUR/CAD OTC", "EUR/CAD", "EUR/CHF OTC", "EUR/CHF",
@@ -2516,9 +2516,8 @@ ALL_PAIRS = [
     "AUD/CHF OTC", "AUD/CHF", "AUD/NZD OTC",
     "NZD/JPY OTC", "CHF/JPY OTC", "CHF/JPY",
     "CAD/JPY OTC", "CAD/JPY", "CAD/CHF OTC", "CAD/CHF",
-    "CHF/NOK OTC", "USD/MXN OTC", "USD/MXN",
+    "CHF/NOK OTC", "USD/MXN OTC",
     "USD/SGD OTC", "USD/BRL OTC", "USD/BDT OTC",
-    "AUD/NZD", "EUR/NZD", "GBP/NZD", "NZD/JPY", "NZD/CAD", "NZD/CHF",
     "USD/NOK", "USD/SEK", "USD/DKK", "USD/TRY", "USD/ZAR", "USD/SGD",
     "EUR/NOK", "EUR/SEK", "EUR/PLN", "EUR/TRY",
     "GBP/NOK", "GBP/SEK",
@@ -2556,14 +2555,12 @@ ALL_PAIRS = [
 YAHOO_SYMBOLS = {
     "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "USDJPY=X",
     "USD/CHF": "USDCHF=X", "AUD/USD": "AUDUSD=X", "USD/CAD": "USDCAD=X",
-    "NZD/USD": "NZDUSD=X", "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
+    "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X", "AUD/JPY": "AUDJPY=X", "EUR/AUD": "EURAUD=X",
     "EUR/CAD": "EURCAD=X", "GBP/AUD": "GBPAUD=X", "GBP/CAD": "GBPCAD=X",
-    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X", "NZD/JPY": "NZDJPY=X",
+    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X",
     "EUR/CHF": "EURCHF=X", "CHF/JPY": "CHFJPY=X", "CAD/JPY": "CADJPY=X",
-    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X", "USD/MXN": "USDMXN=X",
-    "AUD/NZD": "AUDNZD=X", "EUR/NZD": "EURNZD=X", "GBP/NZD": "GBPNZD=X",
-    "NZD/JPY": "NZDJPY=X", "NZD/CAD": "NZDCAD=X", "NZD/CHF": "NZDCHF=X",
+    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X",
     "USD/NOK": "USDNOK=X", "USD/SEK": "USDSEK=X", "USD/DKK": "USDDKK=X",
     "USD/TRY": "USDTRY=X", "USD/ZAR": "USDZAR=X", "USD/SGD": "USDSGD=X",
     "EUR/NOK": "EURNOK=X", "EUR/SEK": "EURSEK=X", "EUR/PLN": "EURPLN=X",
@@ -3501,14 +3498,12 @@ _YF_PERIOD_TO_TD_SIZE = {
 _YF_SYM_TO_PAIR = {v: k for k, v in {
     "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "USDJPY=X",
     "USD/CHF": "USDCHF=X", "AUD/USD": "AUDUSD=X", "USD/CAD": "USDCAD=X",
-    "NZD/USD": "NZDUSD=X", "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
+    "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X", "AUD/JPY": "AUDJPY=X", "EUR/AUD": "EURAUD=X",
     "EUR/CAD": "EURCAD=X", "GBP/AUD": "GBPAUD=X", "GBP/CAD": "GBPCAD=X",
-    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X", "NZD/JPY": "NZDJPY=X",
+    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X",
     "EUR/CHF": "EURCHF=X", "CHF/JPY": "CHFJPY=X", "CAD/JPY": "CADJPY=X",
-    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X", "USD/MXN": "USDMXN=X",
-    "AUD/NZD": "AUDNZD=X", "EUR/NZD": "EURNZD=X", "GBP/NZD": "GBPNZD=X",
-    "NZD/CAD": "NZDCAD=X", "NZD/CHF": "NZDCHF=X",
+    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X",
     "USD/NOK": "USDNOK=X", "USD/SEK": "USDSEK=X", "USD/DKK": "USDDKK=X",
     "USD/TRY": "USDTRY=X", "USD/ZAR": "USDZAR=X", "USD/SGD": "USDSGD=X",
     "EUR/NOK": "EURNOK=X", "EUR/SEK": "EURSEK=X", "EUR/PLN": "EURPLN=X",
@@ -6156,18 +6151,16 @@ FINNHUB_FOREX_SYMBOLS = {
     "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
     "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
     "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
-    "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
+    "EUR/GBP": "OANDA:EUR_GBP",
     "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
     "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
     "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
     "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
-    "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
+    "AUD/CHF": "OANDA:AUD_CHF",
     "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
     "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
     "GBP/CHF": "OANDA:GBP_CHF",
-    "AUD/NZD": "OANDA:AUD_NZD", "EUR/NZD": "OANDA:EUR_NZD",
-    "GBP/NZD": "OANDA:GBP_NZD", "NZD/CAD": "OANDA:NZD_CAD",
-    "NZD/CHF": "OANDA:NZD_CHF", "USD/NOK": "OANDA:USD_NOK",
+    "USD/NOK": "OANDA:USD_NOK",
     "USD/SEK": "OANDA:USD_SEK", "USD/DKK": "OANDA:USD_DKK",
     "USD/TRY": "OANDA:USD_TRY", "USD/ZAR": "OANDA:USD_ZAR",
     "USD/SGD": "OANDA:USD_SGD", "EUR/NOK": "OANDA:EUR_NOK",
@@ -8641,7 +8634,7 @@ def pair_to_idx(pair):
 
 def is_market_closed():
     """
-    Returns True when non-OTC forex pairs are unavailable on Pocket Option:
+    Returns True when non-OTC forex pairs are unavailable:
     - Saturday or Sunday (UTC), OR
     - Weekday night closure: 23:45 - 03:15 EAT = 20:45 - 00:15 UTC
     When True → show OTC pairs for trading, non-OTC shown as (Closed).
@@ -8708,7 +8701,7 @@ def main_menu_keyboard(user_id=None):
     rows = [
         [InlineKeyboardButton("🌐 Global Scan  (All Pairs)", callback_data="global_scan")],
         [InlineKeyboardButton("📊 Select Pair", callback_data="choose_pair")],
-        [InlineKeyboardButton("🎯 Multi Scan  (4 or 6 Pairs)", callback_data="multi_scan_menu")],
+        [InlineKeyboardButton("🎯 Multi Scan", callback_data="multi_scan_menu")],
         [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
     ]
     if not lic:
@@ -8737,17 +8730,15 @@ def pairs_keyboard():
     """
     _MAJORS = [
         "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-        "AUD/USD", "NZD/USD", "USD/CAD",
+        "AUD/USD", "USD/CAD",
     ]
     _POPULAR_CROSSES = [
         "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
         "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
     ]
     _MINOR_CROSSES = [
-        "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
-        "NZD/JPY", "NZD/CAD", "NZD/CHF",
+        "AUD/JPY", "AUD/CAD", "AUD/CHF",
         "CHF/JPY", "CAD/JPY", "CAD/CHF",
-        "EUR/NZD", "GBP/NZD", "USD/MXN",
     ]
     _KNOWN_TIERS = set(_MAJORS + _POPULAR_CROSSES + _MINOR_CROSSES)
 
@@ -9211,7 +9202,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌐 Global Scan", callback_data="global_scan")],
                 [InlineKeyboardButton("📊 Select Pair", callback_data="choose_pair")],
-                [InlineKeyboardButton("🎯 Multi Scan (4-6 Pairs)", callback_data="multi_scan_menu")],
+                [InlineKeyboardButton("🎯 Multi Scan", callback_data="multi_scan_menu")],
                 [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
                 [InlineKeyboardButton("💬 Support", url=support_url)],
             ])
@@ -9367,15 +9358,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "multi_scan_menu":
-        # Button 3: Multi Scan - user selects 4 or 6 pairs
         if not is_licensed(user_id):
             await q.edit_message_text(
                 "🔒 *Multi Scan — Subscribers Only*\n\n"
-                "Multi Scan scans 4 or 6 pairs simultaneously and sends all their signals.\n\n"
-                "Upgrade to unlock:\n"
-                "✅ Multi scan — 4 or 6 pairs at once\n"
-                "✅ More signals at the same time\n"
-                "✅ Unlimited signals",
+                "Upgrade to unlock Multi Scan and more.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
@@ -9396,47 +9382,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return
-        # Show selection: 4 or 6 pairs
-        await q.edit_message_text(
-            "🎯 *Multi Scan*\n\n"
-            "Select the number of pairs to scan:\n\n"
-            "📊 *4 Pairs:* EUR/USD, GBP/USD, USD/JPY, AUD/USD\n"
-            "📊 *6 Pairs:* +EUR/JPY, GBP/JPY",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Scan 4 Pairs", callback_data="multi_scan_4")],
-                [InlineKeyboardButton("📊 Scan 6 Pairs", callback_data="multi_scan_6")],
-                [InlineKeyboardButton("🔙 Back", callback_data="restart_fresh")],
-            ])
-        )
-        return
-
-    if data in ("multi_scan_4", "multi_scan_6"):
-        if not is_licensed(user_id):
-            await q.edit_message_text(
-                "🔒 *Subscribers Only*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💎 Upgrade Now", callback_data="pay_info")],
-                ])
-            )
-            return
-        if is_market_closed():
-            await q.edit_message_text(
-                "🔒 *Market Closed*\n\nMulti Scan is not available right now.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="multi_scan_menu")],
-                ])
-            )
-            return
-        pairs_to_scan = MULTI_SCAN_4_PAIRS if data == "multi_scan_4" else MULTI_SCAN_6_PAIRS
-        n = len(pairs_to_scan)
-        # Stop any existing scan
         old_ev = _ACTIVE_SCANS.get(int(user_id))
         if old_ev is not None:
             old_ev.set()
-        asyncio.create_task(multi_scan_and_send(context.bot, chat, user_id, pairs_to_scan, context))
+        asyncio.create_task(multi_scan_and_send(context.bot, chat, user_id, MULTI_SCAN_6_PAIRS, context))
         return
 
     if data == "check_join":
@@ -9563,12 +9512,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             top5 = get_top5_pairs(non_otc_only=True)
             if len(top5) < 5:
                 _allowed = [
-                    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","NZD/USD","USD/CAD",
+                    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD",
                     "EUR/GBP","EUR/JPY","EUR/AUD","EUR/CAD","EUR/CHF",
                     "GBP/JPY","GBP/AUD","GBP/CAD","GBP/CHF",
-                    "AUD/JPY","AUD/CAD","AUD/CHF","AUD/NZD",
-                    "NZD/JPY","NZD/CAD","NZD/CHF",
-                    "CHF/JPY","CAD/JPY","CAD/CHF","EUR/NZD","GBP/NZD","USD/MXN",
+                    "AUD/JPY","AUD/CAD","AUD/CHF",
+                    "CHF/JPY","CAD/JPY","CAD/CHF",
                 ]
                 existing = {r["pair"] for r in top5}
                 for p in _allowed:
@@ -10640,15 +10588,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 AUTO_SCAN_PAIRS = {
     # ★ MAJOR PAIRS
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "AUD/USD", "NZD/USD", "USD/CAD",
+    "AUD/USD", "USD/CAD",
     # ✦ POPULAR CROSSES
     "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
     "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
     # ◆ MINOR CROSSES
-    "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
-    "NZD/JPY", "NZD/CAD", "NZD/CHF",
+    "AUD/JPY", "AUD/CAD", "AUD/CHF",
     "CHF/JPY", "CAD/JPY", "CAD/CHF",
-    "EUR/NZD", "GBP/NZD", "USD/MXN",
 }
 
 # Global scan: sawa na AUTO_SCAN_PAIRS — pairs zote za forex zinazoscan
@@ -10990,10 +10936,10 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m only
     FIXED_TF       = 1
-    SCAN_INTERVAL  = 45
+    SCAN_INTERVAL  = 15
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
-    COOLDOWN_SECS  = 75  # wait 75 seconds after signal (> 1m expiry)
+    COOLDOWN_SECS  = 0
 
     # Fix #1: Tumia int(user_id) consistently
     uid = int(user_id)
@@ -11228,7 +11174,6 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                             )
                         )
 
-                    await _wait(secs_to_close + 5)
 
             except Exception as _se:
                 logging.warning("auto_scan generate failed {}: {}".format(pair, _se))
@@ -11248,8 +11193,14 @@ async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timefra
     if entry_price is None:
         return
 
-    # Wait for candle to close before delegating
-    wait_secs = max(timeframe_mins * 60, secs_to_close) + 8
+    # Subiri mpaka candle ya 1m inayofuata ifunge (clock-aligned)
+    # Signal imetumwa wakati wowote → ingia candle ya `:00` ijayo → ifunge `:00` ijayo
+    now = datetime.utcnow()
+    secs_in_minute = now.second + now.microsecond / 1e6
+    # Sekunde zimebaki mpaka `:00` ijayo (candle open)
+    secs_to_next_open = 60 - secs_in_minute
+    # Subiri: mpaka candle ifunguke + dakika 1 nzima + buffer 5s
+    wait_secs = secs_to_next_open + 60 + 5
     await asyncio.sleep(wait_secs)
 
     # Determine result from closed candle (same logic as schedule_result_check)
@@ -11392,11 +11343,11 @@ async def global_scan_and_send(bot, chat, user_id, context):
       2. Ubora: indicators_agree × strength × trend confirmation
       3. Pair moja tu inatumwa kila scan cycle
     """
-    SCAN_INTERVAL  = 45   # seconds between scans
+    SCAN_INTERVAL  = 15   # seconds between scans
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
     FIXED_TF       = 1
-    COOLDOWN_SECS  = 75   # wait after signal
+    COOLDOWN_SECS  = 0   # no cooldown after signal
 
     uid = int(user_id)
 
@@ -11685,8 +11636,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
                     )
                 )
 
-            # Wait for expiry + buffer before next scan
-            await _wait(secs_to_close + COOLDOWN_SECS)
+            # Scan interval before next cycle
+            await _wait(SCAN_INTERVAL)
 
     finally:
         if _ACTIVE_SCANS.get(uid) is cancel_ev:
@@ -12598,12 +12549,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 _BG_SCAN_PAIRS = [
-    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","NZD/USD","USD/CAD",
+    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD",
     "EUR/GBP","EUR/JPY","EUR/AUD","EUR/CAD","EUR/CHF",
     "GBP/JPY","GBP/AUD","GBP/CAD","GBP/CHF",
-    "AUD/JPY","AUD/CAD","AUD/CHF","AUD/NZD",
-    "NZD/JPY","NZD/CAD","NZD/CHF",
-    "CHF/JPY","CAD/JPY","CAD/CHF","EUR/NZD","GBP/NZD","USD/MXN",
+    "AUD/JPY","AUD/CAD","AUD/CHF",
+    "CHF/JPY","CAD/JPY","CAD/CHF",
 ]
 
 _fp_pending: dict = {}
@@ -12878,7 +12828,7 @@ _prefetch_active_pairs: dict = {}   # pair → last_used unix timestamp
 _PREFETCH_ACTIVE_TTL  = 600         # sekunde 600 = dakika 10
 
 _PREFETCH_PAIRS_NONOTC = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD",
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD",
     "EUR/GBP", "EUR/JPY", "GBP/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
     "GBP/AUD", "GBP/CAD", "GBP/CHF", "AUD/JPY", "AUD/CAD", "CAD/JPY", "CHF/JPY",
 ]
@@ -12945,11 +12895,11 @@ async def signal_prefetch_engine():
                         pair, sig.get("direction", "?"), sig.get("timeframe", 0)))
                 except Exception as _pfe:
                     logging.warning("PREFETCH failed {}: {}".format(pair, _pfe))
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(2)  # gap kati ya pairs — punguza CPU pressure
 
         except Exception as e:
             logging.warning("signal_prefetch_engine error: {}".format(e))
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
 async def safe_generate_signal_cached(pair: str) -> tuple:
     """
@@ -12982,7 +12932,7 @@ async def background_learning_engine():
             await _bg_check_fingerprint_outcomes()
         except Exception as e:
             logging.warning("background_learning_engine error: {}".format(e))
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
 
 _virtual_trades: dict = {}
 
@@ -13317,7 +13267,7 @@ async def virtual_trading_engine():
                 logging.info("VTE: cycle {} - {} active trades".format(cycle, active))
         except Exception as e:
             logging.warning("VTE cycle error: {}".format(e))
-        await asyncio.sleep(5)
+        await asyncio.sleep(60)
 
 def get_optimal_tf(pair, fallback=None):
     """
@@ -13612,13 +13562,11 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
     _ALLOWED_NONOTC = [
         "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-        "AUD/USD", "NZD/USD", "USD/CAD",
+        "AUD/USD", "USD/CAD",
         "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
         "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
-        "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
-        "NZD/JPY", "NZD/CAD", "NZD/CHF",
+        "AUD/JPY", "AUD/CAD", "AUD/CHF",
         "CHF/JPY", "CAD/JPY", "CAD/CHF",
-        "EUR/NZD", "GBP/NZD", "USD/MXN",
     ]
     _ALLOWED_NONOTC_SET = set(_ALLOWED_NONOTC)
 
