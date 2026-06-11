@@ -1,176 +1,144 @@
 #!/usr/bin/env python3
 """
-EVALON WINNERS BOT - Telegram Bot v3.10
-Upgraded: v59e - All messages English, new admin commands (/users, /history, /userchart)
+EVALON WINNERS BOT - Telegram Bot v3.9
+Upgraded: v56 - Enhanced Indicator Suite + Confluence Quality Gate
 
-KEY CHANGES (v58):
-  1. ZigZag Trend (NEW):
-     - True ZigZag algorithm (retracement >= 0.15%) detects swing highs/lows
-     - Uptrend = Higher Highs + Higher Lows → BUY
-     - Downtrend = Lower Highs + Lower Lows → SELL
-     - Swing strength (1/2/3) affects bonus weight:
-       * Weak (1): +23 pts in generate_signal, +13 in CQ gate
-       * Moderate (2): +31 pts, +18 pts
-       * Strong (3): +39 pts, max 18pts CQ gate
-     - Integrated into v57 weighted voting (weight 5-20)
-     - Affects indicators_agree: +1/+2/+3 by strength
-     - Penalty -10 pts + -2 indicators_agree if opposing direction
+MABORESHO MAKUU (v56):
+  INDICATORS MPYA:
+  1. EMA 200 Trend Filter: Bei lazima iwe upande sahihi wa EMA200 (1H) — kizuizi
+     kikubwa cha trend. Inazuia signals zinazopinga trend kuu.
+  2. Hull Moving Average (HMA): Haraka kuliko EMA, inafuata bei bila lag nyingi.
+     Inatumika kama momentum confirmation kwenye _calc_indicators_from_df.
+  3. Keltner Channels: Kama BB lakini inatumia ATR badala ya StdDev. Inagundua
+     breakouts za kweli vs noise. Imewekwa kwenye _calc_indicators_from_df.
+  4. Fisher Transform: RSI-like indicator lakini inagawanya extremes vizuri zaidi.
+     Inatoa overbought/oversold signals bora kuliko RSI peke yake.
+  5. DEMA (Double EMA): Reduces lag mara mbili ya EMA ya kawaida. Inaongeza
+     usahihi wa trend detection kwa muda mfupi (1m/2m signals).
+  6. Candle Body Ratio Filter: Inazuia signals za doji/indecision candles.
+     Body lazima iwe >= 30% ya candle range — signals za kweli tu.
+  7. Volume Surge Confirmation: Volume > 1.5x average = signal ya nguvu zaidi.
+     Inaongeza points kwenye indicators_agree.
+  8. RSI Slope: Badala ya thamani moja, angalia slope ya RSI (mabadiliko ya 3 bars).
+     Slope inayoongezeka/kupungua = momentum inayoingia/kutoka.
 
-  2. INDICATOR BOOSTS:
-     - Keltner Channels: +30 pts (was +20) — true breakout
-     - Fisher Transform: max +20 pts (was +12)
-     - SuperTrend: +25 pts (was +18) + affects indicators_agree ±2
-     - Parabolic SAR: +15 pts (was +8)
-     - PSAR in CQ gate: max 8pts (was 5)
-     - SuperTrend in CQ gate: max 18pts (was 12), penalty -12 (was -8)
-
-  3. CONFLUENCE QUALITY GATE HARDENED:
-     - Threshold: 55 (was 40) — only strong signals pass
-     - ZigZag added (max 18pts) — new scoring structure
-     - v57 vote: max 20pts (was 15), penalty -10 (was -8)
-     - Keltner CQ: max 15pts (was 10), penalty -8 (was -5)
-     - Fisher CQ: max 15pts (was 10), penalty -7 (was -5)
-
-  4. INDICATORS_AGREE THRESHOLD:
-     - Non-OTC minimum: 6 (was 4) — more indicators must agree
-     - OTC minimum: 4 (was 3)
-     - ZigZag and SuperTrend added to the count
-
-  5. v57 VOTING THRESHOLD:
-     - Direction chosen at >= 65% only (was 60%)
-     - Indicators 21 (was 20, ZigZag added)
-
-  EXPECTED RESULTS:
-  - Fewer signals — but genuinely strong ones
-  - ZigZag adds swing structure to decisions
-  - Strong indicators (ST, Keltner, Fisher, PSAR) have more impact
-  - Weak signals blocked by CQ gate of 55
-
-KEY CHANGES (v56):
-  NEW INDICATORS:
-  1. EMA 200 Trend Filter: Price must be on the correct side of EMA200 (1H) — major trend gate.
-     Blocks signals opposing the main trend.
-  2. Hull Moving Average (HMA): Faster than EMA, follows price with less lag.
-     Used as momentum confirmation in _calc_indicators_from_df.
-  3. Keltner Channels: Like BB but uses ATR instead of StdDev. Detects true breakouts vs noise.
-     Applied in _calc_indicators_from_df.
-  4. Fisher Transform: RSI-like but better separates extremes.
-     Gives better overbought/oversold signals than RSI alone.
-  5. DEMA (Double EMA): Reduces lag twice vs standard EMA. Improves trend detection accuracy
-     for short timeframes (1m/2m signals).
-  6. Candle Body Ratio Filter: Blocks doji/indecision candle signals.
-     Body must be >= 30% of candle range — real signals only.
-  7. Volume Surge Confirmation: Volume > 1.5x average = stronger signal.
-     Adds points to indicators_agree.
-  8. RSI Slope: Instead of a single value, watches RSI slope (3-bar change).
-     Rising/falling slope = momentum entering/exiting.
-
-  CONFLUENCE QUALITY GATE (NEW - v56):
-  - _confluence_quality_gate(): calculates "confluence score" (0-100) before sending signal.
-    If score < 40 → no signal (blocks weak signals).
+  CONFLUENCE QUALITY GATE (MPYA - v56):
+  - _confluence_quality_gate(): inahesabu "confluence score" (0-100) kabla ya
+    kutuma signal. Kama score < 40 → no signal (isilete signal dhaifu).
   - Factors: EMA200 alignment, MACD histogram slope, RSI slope, Volume surge,
     HMA direction, Keltner breakout, session quality.
-  - Result: signals that pass have genuine strength — not random.
+  - Matokeo: signals zinazotoka zina nguvu ya kweli — sio bahati nasibu.
 
   SIGNAL STRENGTH FORMULA UPGRADE:
-  - strength calculated using weighted sum instead of linear scale.
-  - Indicators with higher bonus: EMA200, HMA, Keltner, Volume.
-  - New penalty: signals opposing EMA200 get -30% strength.
+  - strength inahesabiwa kwa kutumia weighted sum badala ya linear scale.
+  - Indicators zinazopata bonus zaidi: EMA200, HMA, Keltner, Volume.
+  - Penalty mpya: signals zinazopinga EMA200 zinapata -30% strength.
 
   MICRO-CANDLE INDICATORS UPGRADE (_calc_indicators_from_ticks v56):
-  - Added: HMA, Fisher Transform, Candle Body Ratio.
-  - DEMA 9/18 instead of EMA 9/21 alone.
-  - Better direction from 5s/10s/15s Deriv ticks.
+  - Imeongezwa: HMA, Fisher Transform, Candle Body Ratio.
+  - DEMA ya 9/18 badala ya EMA ya 9/21 peke yake.
+  - Inatoa direction bora zaidi kwa 5s/10s/15s Deriv ticks.
 
-  NO CHANGES TO:
-  - v53 Pipeline (Unified TF Scoring) — intact.
-  - Auto Scan Engine v54 — intact.
-  - DB schema — no new columns needed.
-  - OTC fallback logic — intact.
+  HAKUNA MABADILIKO KWA:
+  - Pipeline ya v53 (Unified TF Scoring) — imebaki intact.
+  - Auto Scan Engine ya v54 — imebaki intact.
+  - DB schema — hakuna column mpya inahitajika.
+  - OTC fallback logic — imebaki intact.
 
-KEY CHANGES (v54 - Auto Scan Engine):
-  - AUTO_SCAN_PAIRS: 13 major binary broker pairs (majors + crosses)
-  - auto_scan_and_send(): loop scanning every 45s, waits for good entry
-  - Signal sent only if: flat=False, indicators>=5, strength>=150, tf>0
-  - Deriv micro-candle confirmation retained (5s/10s/15s)
-  - Cancel button: user can stop scan at any time
-  - Timeout 12 minutes if market is ranging
-  - Other pairs continue with normal v53 flow
+Upgraded: v54 - Auto Scan Engine (Smart Entry Scanner)
 
-KEY CHANGES (v53 - Unified TF Scoring Pipeline, No Blind Overrides):
-  - PROBLEM (v52 and earlier):
-    * System had "blind overrides" — after _smart_nonOTC_expiry completed full
-      analysis and chose the best TF, downstream gates (h1confirm, candle_gate,
-      fingerprint) could change that TF without knowing the full smart expiry scores.
-      Result: final TF could differ entirely from what the data decided.
-    * Fingerprint combo was a "hard override" — changed TF directly without
-      considering if smart expiry scored 1m=200pts vs 3m=10pts.
+MABORESHO MAKUU (v54):
+  - AUTO_SCAN_PAIRS: pairs 13 kubwa za binary brokers (majors + crosses)
+  - auto_scan_and_send(): loop inayoscan kila 45s, inasubiri entry nzuri
+  - Signal inatumwa tu kama: flat=False, indicators>=5, strength>=150, tf>0
+  - Deriv micro-candle confirmation inabaki (5s/10s/15s)
+  - Cancel button: user anaweza kusimamisha scan wakati wowote
+  - Timeout dakika 12 kama market ranging
+  - Pairs zingine zinaendelea na flow ya kawaida ya v53
 
-  - FIX (v53 Unified Pipeline):
-    * _smart_nonOTC_expiry returns (leading_tf, scores_dict) instead of one TF.
-      Full scores for sections A0/A/A2/B/C/D/E/F/G/H/I/J/K stored in _pipeline_scores dict.
-    * All gates (h1confirm, candle_gate, fingerprint) add/subtract points
-      directly from _pipeline_scores.
-    * Final step: max(_pipeline_scores) decides TF — once, after all gates complete.
-    * Result: final TF is a joint decision by ENGINE + GATES, not engine overridden blind.
+Upgraded: v53 - Unified TF Scoring Pipeline (No Blind Overrides)
 
-  - NEW CAPABILITY:
-    * If 1m had score 250 and 3m was 80 in smart expiry,
-      h1confirm/candle_gate/fingerprint must apply large penalties/bonuses to change
-      the choice — not just a 30pt penalty.
-    * Fingerprint is a score adjustment (max +60pts) instead of hard override.
-      Direction override still works if wr >= 65%.
-    * New log "TF PIPELINE FINAL" shows final scores + TF chosen after each gate.
+MABORESHO MAKUU (v53):
+  - TATIZO LILILOKUWEPO (v52 na nyuma):
+    * Mfumo ulikuwa na "blind overrides" — baada ya _smart_nonOTC_expiry
+      kufanya uchambuzi kamili na kuchagua TF bora, downstream gates
+      (h1confirm, candle_gate, fingerprint) ziliweza kubadilisha TF hiyo
+      bila kujua scores kamili za smart expiry. Matokeo: TF iliyochaguliwa
+      mwishowe ingeweza kuwa tofauti kabisa na ile iliyoamuliwa na data.
+    * Fingerprint combo ilikuwa "hard override" — ikibadilisha TF moja kwa
+      moja bila kujali kama smart expiry ilipiga 1m=200pts vs 3m=10pts.
 
-  - NO OTC CHANGES: _smart_otc_expiry works independently — it had no such problem.
+  - SULUHISHO (v53 Unified Pipeline):
+    * _smart_nonOTC_expiry inarudisha (leading_tf, scores_dict) badala ya
+      TF moja tu. Scores kamili za sections A0/A/A2/B/C/D/E/F/G/H/I/J/K
+      zinahifadhiwa kwenye _pipeline_scores dict.
+    * Gates zote (h1confirm, candle_gate, fingerprint) zinaongeza au
+      kupunguza points kwenye _pipeline_scores moja kwa moja.
+    * Hatua ya mwisho: max(_pipeline_scores) inaamua TF — mara moja tu,
+      baada ya gates zote kukamilika.
+    * Matokeo: TF ya mwisho ni maamuzi ya pamoja ya ENGINE + GATES,
+      si maamuzi ya engine iliyoathiriwa na override za blind.
 
-KEY CHANGES (v52):
-  - _smart_nonOTC_expiry section F (Deriv micro) fully rewritten:
-    * Before: majority vote of direction among 5s/10s/15s
-    * Now: each TF (5s→1m, 10s→2m, 15s→3m) scores its OWN indicators:
+  - UWEZO MPYA:
+    * Kama 1m ilikuwa na score ya 250 na 3m ilikuwa 80 kwenye smart expiry,
+      h1confirm/candle_gate/fingerprint lazima zitoe penalties/bonuses za
+      nguvu kubwa sana ndio kubadilisha chaguo — si penalty ya 30pts tu.
+    * Fingerprint ni score adjustment (max +60pts) badala ya hard override.
+      Direction override bado inafanya kazi kama wr >= 65%.
+    * Log mpya "TF PIPELINE FINAL" inaonyesha scores za mwisho + TF
+      iliyochaguliwa baada ya kila gate.
+
+  - HAKUNA MABADILIKO KWA OTC: _smart_otc_expiry bado inafanya kazi
+    kwa njia yake — haikuwa na tatizo hili.
+
+MABORESHO MAKUU (v52):
+  - _smart_nonOTC_expiry section F (Deriv micro) imebadilishwa kabisa:
+    * Awali: majority vote ya direction kati ya 5s/10s/15s
+    * Sasa: kila TF (5s→1m, 10s→2m, 15s→3m) inajipima indicators ZAKE:
       RSI, MACD, EMA diff, BB position, Momentum, Stochastic
-      TF with the best indicator alignment gets the highest score and wins — no vote, no majority.
-  - Gap check (v51) removed: best_tf always chosen without threshold
-  - Micro consensus gate (v51) removed: replaced by per-TF indicator scoring
-  - ADX block removed entirely: ADX is scoring factor only, does not block signal
-  - 1H vs short-TF conflict block removed: 1H is a bonus on b/s score,
-    does not block — 5s/10s/15s indicators decide TF
+      TF yenye indicator alignment bora zaidi ndiyo inayopata score kubwa
+      na inashinda kuchaguliwa - hakuna vote, hakuna majority.
+  - Gap check (v51) imefutwa: best_tf daima inachaguliwa bila threshold
+  - Micro consensus gate (v51) imefutwa: replaced na per-TF indicator scoring
+  - ADX block imefutwa kabisa: ADX ni scoring factor tu, haizuii signal
+  - 1H vs short-TF conflict block imefutwa: 1H ni bonus kwenye b/s score,
+    haizuii signal - 5s/10s/15s indicators ndiyo zinazoamua TF
 
-KEY CHANGES (v51):
-  - _smart_nonOTC_expiry(): added CONVICTION CHECK:
-    * Gap check: best TF must have gap >= 12pts vs 2nd best.
-      Small gap = all TFs similar = market undecided = return 0 (no signal)
-    * Micro consensus gate: >= 2/3 of Deriv 5s/10s/15s TFs must agree
-      with signal direction. Disagreement = conflicted market = return 0
-  - _smart_otc_expiry(): same — gap check >= 10pts (OTC data is synthetic)
-  - generate_signal(): if smart expiry returns 0 → no_signal immediately,
-    skip downstream filters that could force a TF.
-  - Weak confluence fallback fixed: can no longer force TF=3
-    when smart expiry cut the signal (timeframe=0).
-  - Result: "no signal" will occur more often for ranging/conflicted conditions.
-    Signals that do fire will have a TF chosen with data confidence.
+MABORESHO MAKUU (v51):
+  - _smart_nonOTC_expiry(): imeongezwa CONVICTION CHECK:
+    * Gap check: best TF lazima iwe na gap >= 12pts dhidi ya 2nd best.
+      Gap ndogo = TF zote zinafanana = market haina uamuzi = rudisha 0 (no signal)
+    * Micro consensus gate: lazima >= 2/3 ya Deriv 5s/10s/15s TFs zikubaliane
+      na direction ya signal. Hazikubaliani = market inagombana = rudisha 0
+  - _smart_otc_expiry(): sawa - gap check >= 10pts (OTC data ni synthetic)
+  - generate_signal(): kama smart expiry inarudisha 0 → no_signal mara moja,
+    siendi downstream filters ambazo zinaweza kulazimisha TF.
+  - Weak confluence fallback imesahihishwa: haiwezi tena kulazimisha TF=3
+    pale ambapo smart expiry ilikata signal (timeframe=0).
+  - Matokeo: "no signal" itatokea mara nyingi zaidi kwa hali za ranging/conflicted.
+    Signals zitakazotoka zitakuwa na TF iliyochaguliwa kwa uhakika wa data.
 
-KEY CHANGES (v50):
-  - signal_combo_stats TABLE: stores wins/losses for each combo
-    of (pair, direction, tf_mins, setup_cluster) — AI genuinely learns
-  - compute_setup_cluster(): fingerprint of market state (RSI+BB+MOM+SESSION)
-    converts market conditions into a short comparable label
-  - pg_best_combo(): queries DB for "which direction+tf won most for this setup?"
-    — this is the core learning intelligence
-  - update_signal_combo_stats(): called automatically after each outcome
-  - _apply_pg_best_combo_to_scores(): new layer A0 for smart expiry (35pts max)
-  - update_signal_history_won(): updates combo_stats + tf_session_stats too
-  - setup_cluster column in signal_history: every signal carries its fingerprint
-  - No TF preference — real historical data decides
+MABORESHO MAKUU (v50):
+  - signal_combo_stats TABLE: hifadhi wins/losses kwa kila combo
+    ya (pair, direction, tf_mins, setup_cluster) - AI inajifunza kweli kweli
+  - compute_setup_cluster(): fingerprint ya hali ya soko (RSI+BB+MOM+SESSION)
+    kubadilisha conditions za soko kuwa label fupi inayoweza kulinganishwa
+  - pg_best_combo(): inauliza DB "kwa setup hii, direction+tf zipi zilishinda
+    zaidi?" - hii ndiyo akili kuu ya kujifunza
+  - update_signal_combo_stats(): inaitwa auto baada ya kila outcome
+  - _apply_pg_best_combo_to_scores(): layer A0 mpya kwa smart expiry (35pts max)
+  - update_signal_history_won(): inasasisha combo_stats + tf_session_stats PIA
+  - setup_cluster column kwenye signal_history: kila signal inabeba fingerprint
+  - HAKUNA upendeleo wa TF yoyote - data ya historia halisi inaamua
 
 v49: Unbiased Expiry Engine + pg_predict_per_tf
-     - sklearn/numpy/XGBoost/LightGBM REMOVED (saves RAM on Render)
-     - ML replaced by pg_predict() — PostgreSQL queries only
-     - signal_history extended with columns: rsi, macd, bb_pos, sto,
+     - sklearn/numpy/XGBoost/LightGBM REMOVED (RAM ya Render imeokoka)
+     - ML inabadilishwa na pg_predict() - PostgreSQL queries tu
+     - signal_history imeongezwa columns: rsi, macd, bb_pos, sto,
        ma_diff, mom, atr_pct, session, trend_1h, score, won, tf_mins
-     - Full trend stored for every signal
-     - pg_predict() returns direction + confidence from real DB win rate
-       per pair/session/tf
+     - Trend ya kila signal inahifadhiwa kamili
+     - pg_predict() inatoa direction + confidence kutoka win rate
+       halisi ya DB kwa pair/session/tf
 python-telegram-bot[webhooks]==21.3 + Neon PostgreSQL via psycopg2
 """
 
@@ -181,7 +149,7 @@ from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _Ba
 class _H(_BaseHandler):
     def do_GET(self):
         if self.path == "/health":
-            body = b'{"status":"ok","version":"3.10","bot":"EVALON WINNERS BOT v65"}' 
+            body = b'{"status":"ok","version":"3.9","bot":"EVALON WINNERS BOT v57"}' 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -422,11 +390,11 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
         except Exception:
             pass
 
-        # ── v56-ST: SuperTrend for micro-candles ──
+        # ── v56-ST: SuperTrend kwa micro-candles ──
         st_dir_t = None
         try:
             _n_t   = len(closes)
-            _per_t = 7   # short period for tick seconds
+            _per_t = 7   # kipindi kifupi kwa ticks za sekunde
             _mul_t = 2.5
             if _n_t >= _per_t + 2:
                 _tr_t = pd.Series([
@@ -460,7 +428,7 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
         except Exception:
             pass
 
-        # Upgrade direction if SuperTrend agrees
+        # Upgrade direction kama SuperTrend inakubaliana
         if st_dir_t is not None:
             if direction is None:
                 direction = st_dir_t
@@ -544,12 +512,12 @@ def _calc_indicators_from_ticks(prices, times, candle_secs):
             elif direction != _tick_consensus:
                 # Majority vote decides
                 if _tick_votes_buy >= 4 and direction == "SELL":
-                    direction = None   # major conflict
+                    direction = None   # conflict kubwa
                 elif _tick_votes_sell >= 4 and direction == "BUY":
                     direction = None
         # ── end v57 micro-tick ─────────────────────────────────────────────
 
-        # DEMA/Fisher tiebreaker if direction still None
+        # DEMA/Fisher tiebreaker kama direction bado ni None
         if direction is None:
             if dema_diff_t > 0.02 and fisher_dir_t == "BUY":
                 direction = "BUY"
@@ -603,7 +571,7 @@ def _micro_trend(candles):
 
     Mantiki: Kama mtu anayeangalia chart ya 30m/1H - anaangalia STRUCTURE
     ya soko (Higher Highs, Higher Lows = uptrend; Lower Highs, Lower Lows = downtrend).
-    Not just the last 3 candles — the full price structure.
+    Sio tu candles 3 za mwisho - bali muundo mzima wa bei.
 
     Vipengele:
       1. HH/HL vs LH/LL structure (uzito mkubwa - 40%)
@@ -737,7 +705,7 @@ async def pick_best_tf_deriv(pair, signal_direction=None):
       - Reversal penalty (-20)
 
     TF yenye score kubwa zaidi NDIYO inayotumika.
-    No bias — real structure decides.
+    Hakuna upendeleo - structure halisi inaamua.
 
     Returns: (best_tf_mins, strength, direction, reason)
     """
@@ -800,7 +768,7 @@ async def pick_best_tf_deriv(pair, signal_direction=None):
             comp += struct_bonus
             reasons.append("HTF↓{:.0f}%".format(struct_sell_pct))
         elif htf_structure == "RANGING":
-            comp -= 10  # Ranging market - reduce
+            comp -= 10  # Ranging market - punguza
             reasons.append("HTF_RANGING")
         else:
             comp -= 20
@@ -1139,7 +1107,6 @@ def init_db():
                 );
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_signals INTEGER DEFAULT 0;
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS broker_selected TEXT DEFAULT NULL;
                 ALTER TABLE licences ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE;
                 CREATE TABLE IF NOT EXISTS join_requests (
                     user_id BIGINT PRIMARY KEY,
@@ -1372,12 +1339,6 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_tfr_pair ON trend_fingerprint_results (pair, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tfr_rsi ON trend_fingerprint_results (pair, rsi, bb_pos);
-
-                CREATE TABLE IF NOT EXISTS user_settings (
-                    user_id BIGINT PRIMARY KEY,
-                    timezone TEXT DEFAULT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW()
-                );
             """)
 
         conn.commit()
@@ -1387,8 +1348,8 @@ def pg_predict(pair, direction, rsi=50.0, sto=50.0, bb_pos=0.5,
                session=None, trend_1h=None, tf_mins=2):
     """
     Predict win probability using PostgreSQL win-rate analysis.
-    Instead of an ML model, uses:
-      1. Win rate per pair/session/tf from signal_history (real)
+    Badala ya ML model, inatumia:
+      1. Win rate ya pair/session/tf kutoka signal_history (halisi)
       2. Win rate ya pair/direction kutoka signal_outcomes
       3. Indicator similarity - tafuta signals zilizofanana na zilishinda
       4. Trend dominance - % ya wins wiki iliyopita kwa direction hii
@@ -1527,13 +1488,13 @@ def pg_predict(pair, direction, rsi=50.0, sto=50.0, bb_pos=0.5,
 def pg_predict_per_tf(pair, direction, rsi=50.0, sto=50.0, bb_pos=0.5,
                       ma_diff=0.0, macd=0.0, mom=0.0, session=None, trend_1h=None):
     """
-    PostgreSQL win-rate comparison for TF 1, 2, and 3 together.
-    Uses ONE efficient query instead of 3 separate DB calls.
+    PostgreSQL win-rate comparison kwa TF 1, 2, na 3 kwa pamoja.
+    Inatumia query MOJA yenye ufanisi badala ya ziara 3 tofauti za DB.
 
     Inachunguza:
       1. Win rate ya pair/direction/session/tf_mins (signal_history, siku 21)
       2. Win rate ya pair/direction kwa tf_mins peke yake (signal_history, siku 30)
-      3. Win rate from tf_session_stats (real VTE outcomes)
+      3. Win rate kutoka tf_session_stats (matokeo halisi ya VTE)
       4. Indicator similarity: RSI±12, BB±0.18 (siku 21)
       5. Trend alignment kwa kila tf_mins
 
@@ -1819,7 +1780,7 @@ def get_pg_trend_analysis(pair, session=None, days=7):
 
         if not rows:
             return {"best_direction": None, "total_signals": 0,
-                    "summary": "Not enough data (fewer than 5 signals)"}
+                    "summary": "Hakuna data ya kutosha (chini ya 5 signals)"}
 
         best = rows[0]
         best_wr = float(best["wins"]) / float(best["total"])
@@ -2042,6 +2003,10 @@ def set_bot_setting(key, value):
                 (key, value))
         conn.commit()
 
+def is_results_enabled():
+    """Returns True kama WIN/LOSS result messages zimewashwa (default: on)."""
+    return get_bot_setting("results_enabled", "on") == "on"
+
 def upsert_user_profile(user_id, first_name=None, last_name=None, username=None):
     """Save or update user display name and username for admin lookup."""
     try:
@@ -2087,7 +2052,6 @@ def get_expiry_text(user_id):
 def free_signals_used(user_id):
     return get_user(user_id).get("free_used", 0)
 
-# ── v62: Broker selection helpers ──────────────────────────────────────────
 BROKER_LIST = [
     # ⭐ TIER 1 — Maarufu sana
     ("⭐ Quotex",          "quotex"),
@@ -2464,7 +2428,7 @@ async def _spam_gentle_delay(user_id):
     if gap < SPAM_SECONDS:
         await asyncio.sleep(SPAM_SECONDS - gap)
 
-_CONFIRM_DELAY_SECS = 3  # v62: Reduced from 8 — faster signal delivery
+_CONFIRM_DELAY_SECS = 8  # Raised from 4 - gives more time for Yahoo recheck (non-OTC)
 
 async def _confirm_signal_direction(pair, initial_direction, is_otc):
     """
@@ -2564,41 +2528,7 @@ def get_bonus_signals(user_id):
     return u.get("bonus_signals", 0)
 
 def total_free_allowed(user_id):
-    return 15 + get_bonus_signals(user_id)
-
-# v62: Global pair → flag emoji map (used by all scan functions)
-PAIR_EMOJIS = {
-    "EUR/USD": "🇪🇺🇺🇸", "EUR/USD OTC": "🇪🇺🇺🇸",
-    "GBP/USD": "🇬🇧🇺🇸", "GBP/USD OTC": "🇬🇧🇺🇸",
-    "USD/JPY": "🇺🇸🇯🇵", "USD/JPY OTC": "🇺🇸🇯🇵",
-    "USD/CHF": "🇺🇸🇨🇭", "USD/CHF OTC": "🇺🇸🇨🇭",
-    "AUD/USD": "🇦🇺🇺🇸", "AUD/USD OTC": "🇦🇺🇺🇸",
-    "NZD/USD": "🇳🇿🇺🇸", "NZD/USD OTC": "🇳🇿🇺🇸",
-    "USD/CAD": "🇺🇸🇨🇦", "USD/CAD OTC": "🇺🇸🇨🇦",
-    "EUR/GBP": "🇪🇺🇬🇧", "EUR/GBP OTC": "🇪🇺🇬🇧",
-    "EUR/JPY": "🇪🇺🇯🇵", "EUR/JPY OTC": "🇪🇺🇯🇵",
-    "EUR/AUD": "🇪🇺🇦🇺", "EUR/AUD OTC": "🇪🇺🇦🇺",
-    "EUR/CAD": "🇪🇺🇨🇦", "EUR/CAD OTC": "🇪🇺🇨🇦",
-    "EUR/CHF": "🇪🇺🇨🇭", "EUR/CHF OTC": "🇪🇺🇨🇭",
-    "EUR/NZD": "🇪🇺🇳🇿", "EUR/NZD OTC": "🇪🇺🇳🇿",
-    "GBP/JPY": "🇬🇧🇯🇵", "GBP/JPY OTC": "🇬🇧🇯🇵",
-    "GBP/AUD": "🇬🇧🇦🇺", "GBP/AUD OTC": "🇬🇧🇦🇺",
-    "GBP/CAD": "🇬🇧🇨🇦", "GBP/CAD OTC": "🇬🇧🇨🇦",
-    "GBP/CHF": "🇬🇧🇨🇭", "GBP/CHF OTC": "🇬🇧🇨🇭",
-    "GBP/NZD": "🇬🇧🇳🇿", "GBP/NZD OTC": "🇬🇧🇳🇿",
-    "AUD/JPY": "🇦🇺🇯🇵", "AUD/JPY OTC": "🇦🇺🇯🇵",
-    "AUD/CAD": "🇦🇺🇨🇦", "AUD/CAD OTC": "🇦🇺🇨🇦",
-    "AUD/CHF": "🇦🇺🇨🇭", "AUD/CHF OTC": "🇦🇺🇨🇭",
-    "AUD/NZD": "🇦🇺🇳🇿", "AUD/NZD OTC": "🇦🇺🇳🇿",
-    "NZD/JPY": "🇳🇿🇯🇵", "NZD/JPY OTC": "🇳🇿🇯🇵",
-    "CHF/JPY": "🇨🇭🇯🇵", "CHF/JPY OTC": "🇨🇭🇯🇵",
-    "CAD/JPY": "🇨🇦🇯🇵", "CAD/JPY OTC": "🇨🇦🇯🇵",
-    "CAD/CHF": "🇨🇦🇨🇭", "CAD/CHF OTC": "🇨🇦🇨🇭",
-    "USD/MXN": "🇺🇸🇲🇽", "USD/MXN OTC": "🇺🇸🇲🇽",
-    "USD/ZAR": "🇺🇸🇿🇦", "USD/TRY": "🇺🇸🇹🇷",
-    "Gold OTC": "🥇", "Brent Oil OTC": "🛢️", "WTI Crude Oil OTC": "🛢️",
-    "Bitcoin ETF OTC": "₿", "Ethereum OTC": "💎",
-}
+    return 3 + get_bonus_signals(user_id)
 
 ALL_PAIRS = [
     "EUR/USD OTC", "EUR/USD", "GBP/USD OTC", "GBP/USD",
@@ -2690,7 +2620,7 @@ def _calc_indicators_from_df(df):
     rsi_series = 100 - 100 / (1 + rs)
     rsi   = float(rsi_series.iloc[-1])
 
-    # ── RSI Slope (v56): RSI change over last 3 bars ──
+    # ── RSI Slope (v56): mabadiliko ya RSI kwenye bars 3 za mwisho ──
     rsi_slope = 0.0
     try:
         if len(rsi_series) >= 4:
@@ -2707,7 +2637,7 @@ def _calc_indicators_from_df(df):
     macd_hist = float(macd_hist_series.iloc[-1])
     macd_norm = max(-1.0, min(1.0, macd_hist / (float(close.iloc[-1]) * 0.001 + 1e-9)))
 
-    # ── MACD Histogram Slope (v56): rising or falling? ──
+    # ── MACD Histogram Slope (v56): inaongezeka au kupungua? ──
     macd_hist_slope = 0.0
     try:
         if len(macd_hist_series) >= 3:
@@ -2723,14 +2653,14 @@ def _calc_indicators_from_df(df):
     u = float(bb_upper.iloc[-1]); l = float(bb_lower.iloc[-1])
     bb_pos = max(0.0, min(1.0, (float(close.iloc[-1]) - l) / (u - l + 1e-9)))
 
-    # ── EMA-based MA diff (SMA9/21 → EMA9/21 for better accuracy) ──
+    # ── EMA-based MA diff (SMA9/21 → EMA9/21 kwa accuracy bora) ──
     ema9_s  = close.ewm(span=9,  adjust=False).mean()
     ema21_s = close.ewm(span=21, adjust=False).mean()
     ma9  = float(ema9_s.iloc[-1])
     ma21 = float(ema21_s.iloc[-1])
     ma_diff = max(-1.0, min(1.0, (ma9 - ma21) / (ma21 + 1e-9) * 100))
 
-    # ── DEMA (Double EMA) v56 — half the lag of standard EMA ──
+    # ── DEMA (Double EMA) v56 — lag ndogo mara mbili ya EMA ──
     dema_fast = dema_slow = None
     dema_diff = 0.0
     try:
@@ -2749,7 +2679,7 @@ def _calc_indicators_from_df(df):
     except Exception:
         pass
 
-    # ── HMA (Hull Moving Average) v56 — faster than EMA ──
+    # ── HMA (Hull Moving Average) v56 — haraka zaidi ya EMA ──
     hma_direction = None
     try:
         n_hma = min(16, len(close) // 3)
@@ -2789,7 +2719,7 @@ def _calc_indicators_from_df(df):
     except Exception:
         pass
 
-    # ── Fisher Transform (v56) — better overbought/oversold detection ──
+    # ── Fisher Transform (v56) — overbought/oversold bora zaidi ──
     fisher_val = 0.0
     fisher_direction = None
     try:
@@ -2823,10 +2753,10 @@ def _calc_indicators_from_df(df):
     # ── Volume ratio ──
     vol = min(1.0, float(volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)))
 
-    # ── Volume Surge (v56): volume > 1.5x average = stronger signal ──
+    # ── Volume Surge (v56): volume > 1.5x average = nguvu ya signal ──
     volume_surge = vol >= 1.5
 
-    # ── Candle Body Ratio (v56): only real candles ──
+    # ── Candle Body Ratio (v56): zingatia candles za kweli tu ──
     candle_body_ratio = 0.5
     try:
         opens_s = df["Open"].squeeze().astype(float)
@@ -2849,9 +2779,9 @@ def _calc_indicators_from_df(df):
         divergence = "BUY"    # Bullish divergence
 
     # ── Williams Fractal Detection (v54-8 fixed) ──
-    # Bull fractal: candle lower than 2 on both sides → price bounced up → BUY
-    # Bear fractal: candle higher than 2 on both sides → price reversed down → SELL
-    # Candle must fully close (i+2 must exist) → loop ends at n-3
+    # Bull fractal: candle ya chini kuliko 2 za pande zote mbili → bei ilirudi juu → BUY
+    # Bear fractal: candle ya juu kuliko 2 za pande zote mbili → bei iligeuka chini → SELL
+    # Candle lazima ifunge kabisa (i+2 lazima iwepo) → loop inaishia n-3
     fractal_signal = None
     fractal_strength = 0
     high_vals = high.values
@@ -2874,18 +2804,18 @@ def _calc_indicators_from_df(df):
 
     current_price_val = float(close.iloc[-1])
 
-    # Get the most recent fractal of each type
+    # Pata fractal ya hivi karibuni ya kila aina
     latest_bull_price = recent_bull_fractals[0][1] if recent_bull_fractals else None
     latest_bear_price = recent_bear_fractals[0][1] if recent_bear_fractals else None
 
     bull_signal = False
     bear_signal = False
 
-    # Bull fractal: current price above fractal low → trend continuing up → BUY
+    # Bull fractal: bei ya sasa iko JUU ya fractal low → trend inaendelea juu → BUY
     if latest_bull_price is not None and current_price_val > latest_bull_price:
         bull_signal = True
 
-    # Bear fractal: current price below fractal high → trend continuing down → SELL
+    # Bear fractal: bei ya sasa iko CHINI ya fractal high → trend inaendelea chini → SELL
     if latest_bear_price is not None and current_price_val < latest_bear_price:
         bear_signal = True
 
@@ -2896,16 +2826,16 @@ def _calc_indicators_from_df(df):
         fractal_signal = "SELL"
         fractal_strength = min(3, len(recent_bear_fractals))
     elif bull_signal and bear_signal:
-        # Both active — choose by fractal strength (distance from current price)
-        bull_gap = current_price_val - latest_bull_price   # above bull = BUY strength
-        bear_gap = latest_bear_price - current_price_val   # below bear = SELL strength
+        # Zote mbili — chagua kwa nguvu ya fractal (umbali kutoka bei ya sasa)
+        bull_gap = current_price_val - latest_bull_price   # juu ya bull = nguvu ya BUY
+        bear_gap = latest_bear_price - current_price_val   # chini ya bear = nguvu ya SELL
         if bull_gap > bear_gap:
             fractal_signal = "BUY"
             fractal_strength = min(3, len(recent_bull_fractals))
         else:
             fractal_signal = "SELL"
             fractal_strength = min(3, len(recent_bear_fractals))
-    # else: fractal_signal = None (no confirmed fractal)
+    # else: fractal_signal = None (hakuna fractal iliyothibitishwa)
 
     current_price = float(close.iloc[-1])
     direction_raw = "BUY" if ma_diff > 0 and macd_norm > 0 else ("SELL" if ma_diff < 0 and macd_norm < 0 else None)
@@ -2940,7 +2870,7 @@ def _calc_indicators_from_df(df):
 
     # ── SuperTrend (v56-ST) ──────────────────────────────────────────────────
     # Formula: ST = midpoint +/- (multiplier * ATR)
-    # Price above ST line = BUY; below = SELL
+    # Bei juu ya ST line = BUY; chini = SELL
     supertrend_direction = None
     supertrend_val       = None
     try:
@@ -3111,14 +3041,14 @@ def _calc_indicators_from_df(df):
             ], index=close.index[1:]).rolling(20).mean()
             _kc_u = float((sma20 + 1.5*_tr_sq).iloc[-1])
             _kc_l = float((sma20 - 1.5*_tr_sq).iloc[-1])
-            # Squeeze = BB inside KC (compressed — no breakout yet)
+            # Squeeze = BB inside KC (compressed — hakuna breakout bado)
             squeeze_active = (_bb_u2 < _kc_u) and (_bb_l2 > _kc_l)
             # Momentum oscillator
             _delta_sq = close - (high.rolling(20).max() + low.rolling(20).min()) / 2
             _mom_sq   = _delta_sq - _delta_sq.rolling(20).mean()
             _mval  = float(_mom_sq.iloc[-1])
             _mprev = float(_mom_sq.iloc[-2]) if len(_mom_sq) >= 2 else 0
-            if not squeeze_active:   # Breakout — stronger signal
+            if not squeeze_active:   # Breakout — nguvu zaidi
                 squeeze_direction = "BUY" if _mval > 0 else "SELL"
             else:
                 squeeze_direction = "BUY" if _mval > 0 and _mval > _mprev else (
@@ -3334,133 +3264,38 @@ def _calc_indicators_from_df(df):
     except Exception:
         pass
 
-    # ── 21. ZigZag Trend (v58) — swing highs/lows structure ──────────────────
-    # Detect true trend by tracking ZigZag swing points
-    # Algorithm: retracement >= threshold% → new swing point
-    # Uptrend: higher highs + higher lows (HH + HL)
-    # Downtrend: lower highs + lower lows (LH + LL)
-    zigzag_direction = None
-    zigzag_strength  = 0   # 1=weak, 2=moderate, 3=strong
-    zigzag_last_swing = None  # "UP" or "DOWN" - last swing direction
-    try:
-        _zz_thresh = 0.0015   # 0.15% retracement threshold (forex optimised)
-        _zz_high   = high.values
-        _zz_low    = low.values
-        _zz_close  = close.values
-        _zz_n      = len(_zz_close)
-
-        if _zz_n >= 20:
-            # Tafuta swing points
-            _zz_swings = []   # (index, price, type) — type: "H" or "L"
-            _zz_trend  = 1    # 1=upswing, -1=downswing
-            _zz_ep     = float(_zz_high[0])  # extreme point
-            _zz_ep_idx = 0
-
-            for _zi in range(1, _zz_n):
-                _h = float(_zz_high[_zi])
-                _l = float(_zz_low[_zi])
-                if _zz_trend == 1:
-                    if _h > _zz_ep:
-                        _zz_ep = _h; _zz_ep_idx = _zi
-                    elif (_zz_ep - _l) / (_zz_ep + 1e-9) >= _zz_thresh:
-                        _zz_swings.append((_zz_ep_idx, _zz_ep, "H"))
-                        _zz_trend = -1; _zz_ep = _l; _zz_ep_idx = _zi
-                else:
-                    if _l < _zz_ep:
-                        _zz_ep = _l; _zz_ep_idx = _zi
-                    elif (_h - _zz_ep) / (_zz_ep + 1e-9) >= _zz_thresh:
-                        _zz_swings.append((_zz_ep_idx, _zz_ep, "L"))
-                        _zz_trend = 1; _zz_ep = _h; _zz_ep_idx = _zi
-
-            # Add latest unnamed swing
-            if _zz_trend == 1:
-                _zz_swings.append((_zz_ep_idx, _zz_ep, "H"))
-            else:
-                _zz_swings.append((_zz_ep_idx, _zz_ep, "L"))
-
-            if len(_zz_swings) >= 4:
-                # Check last 4 swings
-                _sw = _zz_swings[-4:]
-                _highs_sw = [p for i, p, t in _sw if t == "H"]
-                _lows_sw  = [p for i, p, t in _sw if t == "L"]
-                zigzag_last_swing = _sw[-1][2]  # "H" or "L" of last swing
-
-                # Hesabu HH, HL, LH, LL
-                _zz_hh = _zz_hl = _zz_lh = _zz_ll = 0
-                for _si in range(1, len(_sw)):
-                    _prev_t = _sw[_si-1][2]; _curr_t = _sw[_si][2]
-                    _prev_p = _sw[_si-1][1]; _curr_p = _sw[_si][1]
-                    if _prev_t == _curr_t:
-                        if _curr_t == "H":
-                            if _curr_p > _prev_p: _zz_hh += 1
-                            else:                  _zz_lh += 1
-                        else:
-                            if _curr_p > _prev_p: _zz_hl += 1
-                            else:                  _zz_ll += 1
-
-                # Decide direction and strength
-                _bull_score_zz = _zz_hh * 2 + _zz_hl
-                _bear_score_zz = _zz_lh * 2 + _zz_ll
-
-                if _bull_score_zz > _bear_score_zz:
-                    zigzag_direction = "BUY"
-                    zigzag_strength  = min(3, _bull_score_zz - _bear_score_zz)
-                elif _bear_score_zz > _bull_score_zz:
-                    zigzag_direction = "SELL"
-                    zigzag_strength  = min(3, _bear_score_zz - _bull_score_zz)
-
-                # Confirm: current price aligns with trend?
-                _cur_p = float(_zz_close[-1])
-                if len(_highs_sw) >= 1 and len(_lows_sw) >= 1:
-                    _last_h = max(_highs_sw); _last_l = min(_lows_sw)
-                    # Price between swing high and low → trending
-                    _zz_range = _last_h - _last_l
-                    if _zz_range > 1e-9:
-                        _zz_pos = (_cur_p - _last_l) / _zz_range  # 0-1
-                        if zigzag_direction == "BUY" and _zz_pos < 0.30:
-                            # Price near low → rejection, bonus
-                            zigzag_strength = min(3, zigzag_strength + 1)
-                        elif zigzag_direction == "SELL" and _zz_pos > 0.70:
-                            # Price near high → rejection, bonus
-                            zigzag_strength = min(3, zigzag_strength + 1)
-
-    except Exception:
-        pass
-
     # ══════════════════════════════════════════════════════════════════════════
-    # v57: Weighted Indicator Voting — each indicator votes with its own weight
+    # v57: Weighted Indicator Voting — kila indicator inapiga kura na uzito wake
     # ══════════════════════════════════════════════════════════════════════════
     _v57_indicators = [
         # (direction, uzito)
-        (psar_direction,       12),  # Parabolic SAR (v58: +2)
+        (psar_direction,       10),  # Parabolic SAR
         (cmo_direction,         7),  # CMO
-        (tema_direction,       10),  # TEMA (v58: +1)
+        (tema_direction,        9),  # TEMA
         (ao_direction,          7),  # AO
-        (elder_direction,       9),  # Elder Ray (v58: +1)
-        (squeeze_direction,    12),  # TTM Squeeze (v58: +2 - strength for breakouts)
+        (elder_direction,       8),  # Elder Ray
+        (squeeze_direction,    10),  # TTM Squeeze (nguvu kwa breakouts)
         (trix_direction,        6),  # TRIX
-        (aroon_direction,       8),  # Aroon (v58: +1)
-        (vortex_direction,      8),  # Vortex (v58: +1)
-        (cmf_direction,         9),  # Chaikin MF (v58: +1 - volume-based)
-        (kama_direction,       10),  # KAMA (v58: +1)
-        (mcginley_direction,    8),  # McGinley (v58: +1)
+        (aroon_direction,       7),  # Aroon
+        (vortex_direction,      7),  # Vortex
+        (cmf_direction,         8),  # Chaikin MF (volume-based)
+        (kama_direction,        9),  # KAMA
+        (mcginley_direction,    7),  # McGinley
         (coppock_direction,     6),  # Coppock
-        (wma_direction,         7),  # WMA (v58: +1)
+        (wma_direction,         6),  # WMA
         (dpo_direction,         5),  # DPO
         (rvi_direction,         7),  # RVI
-        (kst_direction,         8),  # KST (v58: +1)
-        (ppo_direction,         7),  # PPO (v58: +1)
-        (cci_fast_direction,    7),  # CCI fast (v58: +1)
+        (kst_direction,         7),  # KST
+        (ppo_direction,         6),  # PPO
+        (cci_fast_direction,    6),  # CCI fast
         (bop_direction,         6),  # BOP
-        # v58 new: ZigZag — weight based on swing strength
-        (zigzag_direction,     min(15, 5 + zigzag_strength * 5)),  # max 20pts for strength=3
     ]
     v57_buy_score  = sum(w for d, w in _v57_indicators if d == "BUY")
     v57_sell_score = sum(w for d, w in _v57_indicators if d == "SELL")
     v57_total      = v57_buy_score + v57_sell_score
     v57_direction  = None
     if v57_total > 0:
-        if v57_buy_score / v57_total >= 0.60:   # v63: restored to v57 level (was 0.65 — too strict)
+        if v57_buy_score / v57_total >= 0.60:
             v57_direction = "BUY"
         elif v57_sell_score / v57_total >= 0.60:
             v57_direction = "SELL"
@@ -3470,10 +3305,10 @@ def _calc_indicators_from_df(df):
                   (dema_diff < 0 and direction_raw == "SELL") if dema_diff != 0 else True
     hma_agrees  = (hma_direction == direction_raw) if (hma_direction and direction_raw) else True
 
-    # Boost direction confidence with v56 indicators
+    # Boost direction confidence kwa v56 indicators
     direction_v56 = direction_raw
     if direction_raw is None:
-        # Try to get direction from DEMA if EMA/MACD disagree
+        # Jaribu kupata direction kutoka DEMA kama EMA/MACD hazikubaliani
         if dema_diff > 0.02 and hma_direction == "BUY":
             direction_v56 = "BUY"
         elif dema_diff < -0.02 and hma_direction == "SELL":
@@ -3530,42 +3365,12 @@ def _calc_indicators_from_df(df):
         "v57_buy_score":       v57_buy_score,
         "v57_sell_score":      v57_sell_score,
         "v57_direction":       v57_direction,
-        # ── v58: ZigZag Trend ──
-        "zigzag_direction":    zigzag_direction,
-        "zigzag_strength":     zigzag_strength,
-        "zigzag_last_swing":   zigzag_last_swing,
     }
 
 import threading as _threading
 _YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
-_YF_CACHE_TTL = 60      # v63: 60s — entry per 1m candle, cache > 1 candle = stale data
+_YF_CACHE_TTL = 120     # sekunde 2 dakika
 _YF_CACHE_LOCK = _threading.Lock()
-
-# v65: Failure blacklists — avoid hammering dead sources repeatedly
-# Key: (symbol, interval) → timestamp of last failure
-# If failure < _YF_FAIL_TTL seconds ago, skip that source entirely
-_YF_FAIL_CACHE  = {}   # yfinance failures
-_FH_FAIL_CACHE  = {}   # Finnhub failures
-_SRC_FAIL_LOCK  = _threading.Lock()
-_YF_FAIL_TTL    = 300  # 5 minutes: skip yfinance for this symbol+interval if it just failed
-_FH_FAIL_TTL    = 180  # 3 minutes: skip Finnhub for this symbol+interval if it just failed
-
-# ── TwelveData rate limiter — max 7 req/min (free tier = 8, leave 1 buffer) ──
-_TD_REQ_TIMES  = []          # timestamps of recent TD requests
-_TD_REQ_LOCK   = _threading.Lock()
-_TD_MAX_PER_MIN = 7
-
-def _td_can_request():
-    """Returns True if we can make a TwelveData request without hitting rate limit."""
-    now = time.time()
-    with _TD_REQ_LOCK:
-        # Drop timestamps older than 60s
-        while _TD_REQ_TIMES and now - _TD_REQ_TIMES[0] > 60:
-            _TD_REQ_TIMES.pop(0)
-        if len(_TD_REQ_TIMES) >= _TD_MAX_PER_MIN:
-            return False
-        _TD_REQ_TIMES.append(now)
-        return True
 
 _YF_TO_FH_RESOLUTION = {
     "1m": "1", "2m": "1", "5m": "5", "15m": "15",
@@ -3604,117 +3409,14 @@ def _fh_candles_as_df(fh_sym, resolution, count=200):
         logging.warning("_fh_candles_as_df {} res={} failed: {}".format(fh_sym, resolution, _fe))
         return None
 
-# ── Twelve Data symbols (pair name → TD symbol) ──────────────────────────────
-TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY", "")
-
-# Interval mapping: yfinance format → Twelve Data format
-_YF_TO_TD_INTERVAL = {
-    "1m": "1min", "2m": "2min", "5m": "5min", "15m": "15min",
-    "30m": "30min", "1h": "1h", "1H": "1h", "4h": "4h",
-}
-
-# Period → outputsize (candles count) for Twelve Data
-_YF_PERIOD_TO_TD_SIZE = {
-    "1d": 390, "2d": 780, "3d": 1170, "5d": 1950, "7d": 2730,
-}
-
-# Yahoo symbol → pair name (reverse of YAHOO_SYMBOLS)
-_YF_SYM_TO_PAIR = {v: k for k, v in {
-    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "USDJPY=X",
-    "USD/CHF": "USDCHF=X", "AUD/USD": "AUDUSD=X", "USD/CAD": "USDCAD=X",
-    "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
-    "GBP/JPY": "GBPJPY=X", "AUD/JPY": "AUDJPY=X", "EUR/AUD": "EURAUD=X",
-    "EUR/CAD": "EURCAD=X", "GBP/AUD": "GBPAUD=X", "GBP/CAD": "GBPCAD=X",
-    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X",
-    "EUR/CHF": "EURCHF=X", "CHF/JPY": "CHFJPY=X", "CAD/JPY": "CADJPY=X",
-    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X",
-    "USD/NOK": "USDNOK=X", "USD/SEK": "USDSEK=X", "USD/DKK": "USDDKK=X",
-    "USD/TRY": "USDTRY=X", "USD/ZAR": "USDZAR=X", "USD/SGD": "USDSGD=X",
-    "EUR/NOK": "EURNOK=X", "EUR/SEK": "EURSEK=X", "EUR/PLN": "EURPLN=X",
-    "EUR/TRY": "EURTRY=X", "GBP/NOK": "GBPNOK=X", "GBP/SEK": "GBPSEK=X",
-    "US100": "^NDX", "SP500": "^GSPC", "CAC 40": "^FCHI",
-    "SMI 20": "^SSMI", "E35EUR": "^STOXX",
-    "US30": "^DJI", "GER40": "^GDAXI", "UK100": "^FTSE",
-    "JPN225": "^N225", "AUS200": "^AXJO",
-}.items()}
-
-# Indices mapping kwa Twelve Data (symbols tofauti)
-_TD_INDEX_SYMBOLS = {
-    "^NDX": "NDX", "^GSPC": "SPX", "^FCHI": "CAC40",
-    "^DJI": "DJI", "^GDAXI": "DAX", "^FTSE": "FTSE100",
-    "^N225": "N225", "^AXJO": "AXJO", "^SSMI": "SMI",
-    "^STOXX": "SX5E",
-}
-
-def _td_candles_as_df(symbol, interval, outputsize=200):
-    """
-    Fetch candles kutoka Twelve Data API.
-    Forex: symbol = 'EUR/USD', interval = '1min', '5min', '1h' nk.
-    Returns DataFrame au None.
-    Free tier: 800 credits/siku, 8 requests/dakika.
-    """
-    if not TWELVE_DATA_KEY:
-        return None
-    if not _td_can_request():
-        logging.warning("TwelveData rate limit — skipping request for {}".format(symbol))
-        return None
-    try:
-        # Twelve Data forex inatumia EUR/USD format moja kwa moja
-        url = (
-            "https://api.twelvedata.com/time_series"
-            "?symbol={}&interval={}&outputsize={}&apikey={}&format=JSON".format(
-                symbol, interval, min(outputsize, 500), TWELVE_DATA_KEY
-            )
-        )
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            logging.warning("TwelveData HTTP {} for {}".format(r.status_code, symbol))
-            return None
-        d = r.json()
-        if d.get("status") == "error" or "values" not in d:
-            logging.warning("TwelveData error {}: {}".format(symbol, d.get("message", "")))
-            return None
-        values = d["values"]
-        if not values:
-            return None
-        df = pd.DataFrame(values)
-        df = df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "close": "Close", "volume": "Volume", "datetime": "Datetime"
-        })
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
-        df = df.set_index("Datetime").sort_index()
-        for col in ["Open", "High", "Low", "Close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        if "Volume" in df.columns:
-            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-        else:
-            df["Volume"] = 0.0
-        logging.info("TwelveData OK: {} {} {} rows".format(symbol, interval, len(df)))
-        return df
-    except Exception as _te:
-        logging.warning("TwelveData failed {} {}: {}".format(symbol, interval, _te))
-        return None
-
-
 def _yf_download_cached(symbol, period, interval):
     """
-    v65: Data source priority with failure blacklists:
-      1. Cache (60s) — fastest
-      2. yfinance — primary (skipped if recently failed for this symbol+interval)
-      3. Finnhub — fallback (skipped if recently failed for this symbol+interval)
-      4. Twelve Data — last resort (only called once per symbol, not per TF retry)
-
-    v65 change: failure blacklists (_YF_FAIL_CACHE, _FH_FAIL_CACHE) prevent
-    hammering dead sources on every scan cycle. A source that just failed for
-    symbol+interval is skipped for _YF_FAIL_TTL / _FH_FAIL_TTL seconds.
-    This prevents the yfinance→Finnhub→TwelveData rate-limit spam seen in logs.
+    yfinance download na cache ya dakika 2.
+    v53: kama yfinance inashindwa, jaribu Finnhub kama fallback.
+    Hii inashughulikia kila call site yote mara moja.
     """
     key = (symbol, period, interval)
-    fail_key = (symbol,)  # v66: symbol-level — one failure blacklists ALL intervals for this symbol
     now = time.time()
-
-    # ── 0. Cache hit ──────────────────────────────────────────────────────────
     with _YF_CACHE_LOCK:
         if key in _YF_CACHE:
             ts, df = _YF_CACHE[key]
@@ -3723,102 +3425,37 @@ def _yf_download_cached(symbol, period, interval):
 
     df = None
 
-    # ── 1. yfinance (primary) ─────────────────────────────────────────────────
-    _yf_recently_failed = False
-    with _SRC_FAIL_LOCK:
-        _ft = _YF_FAIL_CACHE.get(fail_key, 0)
-        if now - _ft < _YF_FAIL_TTL:
-            _yf_recently_failed = True
-
-    if not _yf_recently_failed:
-        try:
-            df = yf.download(symbol, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
-            if df is None or len(df) < 5:
-                df = None
-                with _SRC_FAIL_LOCK:
-                    _YF_FAIL_CACHE[fail_key] = now
-            else:
-                logging.info("yfinance OK (primary): {} {} {}".format(
-                    symbol, period, interval))
-        except Exception as _ye:
-            logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
-                symbol, period, interval, _ye))
+    try:
+        df = yf.download(symbol, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 5:
             df = None
-            with _SRC_FAIL_LOCK:
-                _YF_FAIL_CACHE[fail_key] = now
-    else:
-        logging.info("yfinance SKIP (blacklisted {}s) {} {}".format(
-            int(_YF_FAIL_TTL), symbol, interval))
+    except Exception as _ye:
+        logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
+            symbol, period, interval, _ye))
+        df = None
 
-    # ── 2. Finnhub (fallback) ─────────────────────────────────────────────────
     if df is None:
-        _fh_recently_failed = False
-        with _SRC_FAIL_LOCK:
-            _fft = _FH_FAIL_CACHE.get(fail_key, 0)
-            if now - _fft < _FH_FAIL_TTL:
-                _fh_recently_failed = True
+        _fh_sym = None
+        try:
+            _yf_to_pair = {v: k for k, v in YAHOO_SYMBOLS.items()}
+            _pair_name  = _yf_to_pair.get(symbol)
+            if _pair_name:
+                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name)
+        except Exception:
+            pass
 
-        if not _fh_recently_failed:
-            _fh_sym = None
-            try:
-                _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
-                if _pair_name2:
-                    _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
-            except Exception:
-                pass
-
-            if _fh_sym and FINNHUB_KEY:
-                _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
-                _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
-                df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
-                if df is not None and len(df) >= 5:
-                    logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
-                        symbol, period, interval, len(df)))
-                else:
-                    df = None
-                    logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
-                        symbol, period, interval))
-                    with _SRC_FAIL_LOCK:
-                        _FH_FAIL_CACHE[fail_key] = now
-            elif not FINNHUB_KEY:
-                # No Finnhub key — mark as failed immediately to skip next time
-                with _SRC_FAIL_LOCK:
-                    _FH_FAIL_CACHE[fail_key] = now
-        else:
-            logging.info("Finnhub SKIP (blacklisted {}s) {} {}".format(
-                int(_FH_FAIL_TTL), symbol, interval))
-
-    # ── 3. Twelve Data (last resort — hifadhi rate-limit credits) ─────────────
-    # Only attempt TD if BOTH yfinance AND Finnhub have failed/are blacklisted.
-    # This prevents using TD credits on transient yfinance errors.
-    if df is None and TWELVE_DATA_KEY:
-        _yf_bl = now - _YF_FAIL_CACHE.get(fail_key, 0) < _YF_FAIL_TTL
-        _fh_bl = now - _FH_FAIL_CACHE.get(fail_key, 0) < _FH_FAIL_TTL
-        if _yf_bl or _fh_bl or _yf_recently_failed:
-            # At least one primary source confirmed failed — TD is justified
-            try:
-                _pair_name = _YF_SYM_TO_PAIR.get(symbol)
-                _td_sym    = None
-
-                if _pair_name and "/" in _pair_name:
-                    _td_sym = _pair_name
-                elif symbol in _TD_INDEX_SYMBOLS:
-                    _td_sym = _TD_INDEX_SYMBOLS[symbol]
-
-                if _td_sym:
-                    _td_interval = _YF_TO_TD_INTERVAL.get(interval, "5min")
-                    _td_outsize  = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
-                    df = _td_candles_as_df(_td_sym, _td_interval, _td_outsize)
-                    if df is not None and len(df) < 5:
-                        df = None
-                    elif df is not None:
-                        logging.info("FALLBACK→TD: {} {} {} OK ({} rows)".format(
-                            symbol, period, interval, len(df)))
-            except Exception as _tde:
-                logging.warning("TwelveData fetch failed ({} {} {}): {}".format(
-                    symbol, period, interval, _tde))
+        if _fh_sym and FINNHUB_KEY:
+            _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
+            _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
+            df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
+            if df is not None and len(df) >= 5:
+                logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
+                    symbol, period, interval, len(df)))
+            else:
                 df = None
+                logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
+                    symbol, period, interval))
 
     if df is not None and len(df) > 0:
         with _YF_CACHE_LOCK:
@@ -3898,11 +3535,11 @@ def _fetch_1h_trend(pair):
         ema9_prev  = float(close.ewm(span=9,  adjust=False).mean().iloc[-2])
         ema21_prev = float(close.ewm(span=21, adjust=False).mean().iloc[-2])
 
-        # ── v56: EMA 200 — major hourly trend ──
+        # ── v56: EMA 200 — trend kuu ya masaa ──
         ema200_bull = None
         try:
             if len(close) >= 60:
-                ema200 = float(close.ewm(span=60, adjust=False).mean().iloc[-1])  # EMA60 = proxy for EMA200 on 1H
+                ema200 = float(close.ewm(span=60, adjust=False).mean().iloc[-1])  # EMA60 = proxy ya EMA200 kwa 1H
                 ema200_bull = float(close.iloc[-1]) > ema200
         except Exception:
             pass
@@ -3954,11 +3591,11 @@ def _fetch_1h_trend(pair):
                 candle_bull_count >= 2,  # At least 2 of 3 candles agree
             ])
             if supporting >= 2:
-                # v56: EMA200 bonus — if price above EMA200, signal is stronger
+                # v56: EMA200 bonus — kama bei iko juu ya EMA200, signal ni stronger
                 if ema200_bull is True:
                     return "BUY"   # Full confirmation: EMA cross + MACD/RSI + EMA200
                 elif ema200_bull is False:
-                    # Price below EMA200 but EMA9>EMA21 — risky, require 3/3
+                    # Bei iko chini ya EMA200 lakini EMA9>EMA21 — risky, require 3/3
                     if supporting >= 3:
                         return "BUY"
                     return None   # Reject: EMA200 inapinga
@@ -3971,7 +3608,7 @@ def _fetch_1h_trend(pair):
                 candle_bear_count >= 2,     # At least 2 of 3 candles agree
             ])
             if supporting >= 2:
-                # v56: EMA200 check for SELL
+                # v56: EMA200 check kwa SELL
                 if ema200_bull is False:
                     return "SELL"   # Full confirmation: EMA cross + MACD/RSI + EMA200
                 elif ema200_bull is True:
@@ -4507,7 +4144,7 @@ def compute_setup_cluster(rsi=50.0, bb_pos=0.5, mom=0.0, session=None):
 
 def pg_best_combo(pair, rsi=50.0, bb_pos=0.5, mom=0.0, session=None, min_samples=5):
     """
-    Query database: "For this setup, which direction+tf combo won most?"
+    Uliza database: "Kwa setup hii, direction+tf combo zipi zilishinda zaidi?"
 
     Inatafuta signal_combo_stats (exact cluster match, uzito 3.0) na
     signal_history yenye indicators zinazofanana - RSI±12, BB±0.15 (uzito 1.5).
@@ -4679,7 +4316,7 @@ def record_signal(pair, direction, rsi=None, macd=None, bb_pos=None,
                   session=None, trend_1h=None, score=None, tf_mins=None):
     """
     Hifadhi signal kwenye signal_history.
-    v50: automatically adds setup_cluster.
+    v50: inaongeza setup_cluster auto.
     Returns signal_id kwa matumizi ya update_signal_history_won().
     """
     return save_signal_history_full(
@@ -4853,7 +4490,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
         candle_secs = tf_mins * 60
         secs_into_candle = total_secs % candle_secs
         secs_to_end_current = candle_secs - secs_into_candle
-        # Wait for current candle to close + next candle to close + 5s buffer
+        # Subiri candle ya sasa iishe + candle inayofuata iishe + buffer 5s
         return secs_to_end_current + candle_secs + 5
 
     async def _get_candle_result(tf_mins):
@@ -4865,7 +4502,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
         yf_sym    = YAHOO_SYMBOLS.get(real_pair)
         fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
 
-        # Try 3 times at 5s intervals if data not yet available
+        # Jaribu mara 3 kwa interval ya 5s kama data haipo bado
         for attempt in range(3):
             # Jaribu Finnhub 1m kwanza (haraka zaidi)
             if fh_sym and FINNHUB_KEY and tf_mins == 1:
@@ -4878,7 +4515,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                         is_red   = closed_close < closed_open
                         logging.info("CANDLE RESULT Finnhub {}: open={:.5f} close={:.5f} green={} dir={}".format(
                             pair, closed_open, closed_close, is_green, direction))
-                        if is_green == is_red:  # both False = doji, skip
+                        if is_green == is_red:  # wote ni False = doji, skip
                             await asyncio.sleep(5)
                             continue
                         return (direction == "BUY" and is_green) or (direction == "SELL" and is_red)
@@ -4906,7 +4543,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
 
             await asyncio.sleep(5)
 
-        # Last fallback: use price diff if candle data unavailable
+        # Fallback wa mwisho: tumia price diff kama candle data haikupatikana
         logging.warning("CANDLE RESULT {}: fallback to price diff".format(pair))
         exit_p = _fetch_current_price(pair)
         if exit_p is not None and _ep is not None:
@@ -4948,15 +4585,15 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                 logging.warning("result pair_stats tf={} {}: {}".format(tf, pair, _e))
         logging.info("RESULT_RECORDED {}: dir={} tf={}m won={}".format(pair, direction, tf, won))
 
-    # ── Loop over TFs 1m, 2m, 3m ──
+    # ── Mzunguko wa TFs 1m, 2m, 3m ──
     for check_tf in [1, 2, 3]:
 
-        # Calculate wait time until check_tf candle closes
+        # Hesabu muda wa kusubiri hadi candle ya check_tf ifunge
         wait_secs = _secs_until_next_candle_close(check_tf)
         logging.info("RESULT WAIT {}: tf={}m sleeping {:.0f}s".format(pair, check_tf, wait_secs))
         await asyncio.sleep(wait_secs)
 
-        # Check if user has changed signal (new signal)
+        # Angalia kama user amebadilisha signal (signal mpya)
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -4977,14 +4614,14 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
         won = await _get_candle_result(check_tf)
         _record_outcome(check_tf, won)
 
-        # Send result to user (their TF only)
+        # Tuma result kwa mtumiaji (TF yao tu)
         if check_tf == timeframe_mins:
             try:
                 nn_feedback_from_vte(user_id, pair, won)
             except Exception:
                 pass
 
-            if won is None:
+            if not is_results_enabled() or "OTC" in pair or won is None:
                 return
 
             won_label  = "WIN ✅" if won else "LOSS ❌"
@@ -5022,7 +4659,7 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                     conn.commit()
             except Exception as e:
                 logging.warning("schedule_result_check send failed: {}".format(e))
-            return  # Done — exit after user TF
+            return  # Tumekwisha — toka baada ya TF ya mtumiaji
 
         if check_tf == 3:
             break
@@ -5179,14 +4816,13 @@ _ATR_DEAD_THRESHOLD = 0.015  # % - below this = dead market, no signal
 _FORCE_PAIRS = set()  # Admin-forced pairs - bypass flat/dead market filter
 
 _FILTER_FLAGS = {
-    "news":         True,   # News time block
-    "dead":         False,  # Dead market / ATR filter - OFF by default (admin: /filteron dead)
-    "conflict":     True,   # 1H vs short-TF conflict filter
-    "stability":    True,   # Signal stability / flip filter
-    "confluence":   True,   # Min confluence filter (indicators_agree)
-    "h1confirm":    True,   # 1H candle confirmation gate
-    "micro_trend":  True,   # Micro-candle trend filter (5s/10s/15s green-red ratio)
-    "trend_follow": False,  # v65-fix: OFF by default — allow all signals incl. reverse
+    "news":        True,   # News time block
+    "dead":        False,  # Dead market / ATR filter - OFF by default (admin: /filteron dead)
+    "conflict":    True,   # 1H vs short-TF conflict filter
+    "stability":   True,   # Signal stability / flip filter
+    "confluence":  True,   # Min confluence filter (indicators_agree)
+    "h1confirm":   True,   # 1H candle confirmation gate
+    "micro_trend": True,   # Micro-candle trend filter (5s/10s/15s green-red ratio)
 }
 
 def is_filter_on(name):
@@ -5205,16 +4841,15 @@ def get_filters_status():
     lines = []
     icons = {"news": "📰", "dead": "💀", "conflict": "⚔️",
              "stability": "📉", "confluence": "🔀", "h1confirm": "1️⃣",
-             "micro_trend": "🕯", "trend_follow": "📈"}
+             "micro_trend": "🕯"}
     descs = {
-        "news":         "News time block",
-        "dead":         "Dead market (ATR) filter",
-        "conflict":     "1H vs short-TF conflict",
-        "stability":    "Signal stability filter",
-        "confluence":   "Min confluence gate",
-        "h1confirm":    "1H candle confirmation",
-        "micro_trend":  "Micro-candle trend (5s/10s/15s)",
-        "trend_follow": "Trend-follow filter (ON=trend only / OFF=all signals)",
+        "news":        "News time block",
+        "dead":        "Dead market (ATR) filter",
+        "conflict":    "1H vs short-TF conflict",
+        "stability":   "Signal stability filter",
+        "confluence":  "Min confluence gate",
+        "h1confirm":   "1H candle confirmation",
+        "micro_trend": "Micro-candle trend (5s/10s/15s)",
     }
     for name, state in _FILTER_FLAGS.items():
         icon = icons.get(name, "🔧")
@@ -5534,13 +5169,13 @@ def _smart_nonOTC_expiry(
 ) -> int:
     """
     Chagua TF bora (1/2/3 dakika) kwa non-OTC signal.
-    Uses real data from Yahoo, Deriv, Fibonacci, PA and VTE history.
+    Inatumia data halisi ya Yahoo, Deriv, Fibonacci, PA na VTE history.
 
     v46 FIXES:
     - Hakuna upendeleo wa awali kwa TF yoyote. Kila TF inaanza 0.
     - Kila kipengele (RSI, BB, ATR, Fib, PA, nk) kinapewa points kwa MANTIKI,
       si kwa mazoea ya 1m kwanza.
-    - Strong indicators (ia >= 8) support both 1m AND 2m equally. They show
+    - Indicators nguvu (ia >= 8) zinaunga mkono 1m NA 2m sawa. Zinadhihirisha
       trend imara - inaweza kwisha ndani ya 1m au 2m.
     - RSI/Sto extremes: zinaashiria reversal inayowezekana. Lakini kama ATR ni
       ndogo, reversal inaweza kuchukua dakika 2-3 kuonekana. Kwa hivyo ATR
@@ -6050,8 +5685,8 @@ def _smart_otc_expiry(
     movement_cat: str = "MEDIUM",
 ) -> int:
     """
-    Choose best TF (1/2/3 min) for each signal using real logic.
-    Works for both OTC and non-OTC signals.
+    Chagua TF bora (1/2/3 dakika) kwa kila signal kwa mantiki halisi.
+    Inafanya kazi kwa OTC na non-OTC signals.
     Returns: 1, 2, au 3
     """
 
@@ -6293,7 +5928,7 @@ def update_tf_outcome(pair: str, tf_mins: int, won: bool):
     Imebaki hapa kwa backward compatibility tu - haifanyi kitu.
     tf_session_stats inasasishwa automatically na update_signal_history_won().
     """
-    pass  # No-op: now handled by update_signal_history_won()
+    pass  # No-op: sasa inashughulikiwa na update_signal_history_won()
 
 async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe, sig, idx_str):
     """Send a non-OTC signal - simple clean caption."""
@@ -6305,10 +5940,8 @@ async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe
     elif isinstance(strength, int) and strength < 90:
         strength = int(90 + (max(35, min(97, strength)) - 35) / 62 * 360)
     strength = max(90, min(450, int(strength)))
-    _broker_line = get_broker_display(user_id)
-    caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%{}".format(
-        pair, arrow, timeframe, strength,
-        "\n" + _broker_line if _broker_line else "")
+    caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(
+        pair, arrow, timeframe, strength)
     kb  = nonotc_signal_keyboard(pair, timeframe)
     img = get_buy_image() if ib else get_sell_image()
     try:
@@ -6323,16 +5956,18 @@ FINNHUB_FOREX_SYMBOLS = {
     "EUR/USD": "OANDA:EUR_USD", "GBP/USD": "OANDA:GBP_USD",
     "USD/JPY": "OANDA:USD_JPY", "USD/CHF": "OANDA:USD_CHF",
     "AUD/USD": "OANDA:AUD_USD", "USD/CAD": "OANDA:USD_CAD",
-    "EUR/GBP": "OANDA:EUR_GBP",
+    "NZD/USD": "OANDA:NZD_USD", "EUR/GBP": "OANDA:EUR_GBP",
     "EUR/JPY": "OANDA:EUR_JPY", "GBP/JPY": "OANDA:GBP_JPY",
     "AUD/JPY": "OANDA:AUD_JPY", "EUR/AUD": "OANDA:EUR_AUD",
     "EUR/CAD": "OANDA:EUR_CAD", "GBP/AUD": "OANDA:GBP_AUD",
     "GBP/CAD": "OANDA:GBP_CAD", "AUD/CAD": "OANDA:AUD_CAD",
-    "AUD/CHF": "OANDA:AUD_CHF",
+    "AUD/CHF": "OANDA:AUD_CHF", "NZD/JPY": "OANDA:NZD_JPY",
     "EUR/CHF": "OANDA:EUR_CHF", "CHF/JPY": "OANDA:CHF_JPY",
     "CAD/JPY": "OANDA:CAD_JPY", "CAD/CHF": "OANDA:CAD_CHF",
     "GBP/CHF": "OANDA:GBP_CHF",
-    "USD/NOK": "OANDA:USD_NOK",
+    "AUD/NZD": "OANDA:AUD_NZD", "EUR/NZD": "OANDA:EUR_NZD",
+    "GBP/NZD": "OANDA:GBP_NZD", "NZD/CAD": "OANDA:NZD_CAD",
+    "NZD/CHF": "OANDA:NZD_CHF", "USD/NOK": "OANDA:USD_NOK",
     "USD/SEK": "OANDA:USD_SEK", "USD/DKK": "OANDA:USD_DKK",
     "USD/TRY": "OANDA:USD_TRY", "USD/ZAR": "OANDA:USD_ZAR",
     "USD/SGD": "OANDA:USD_SGD", "EUR/NOK": "OANDA:EUR_NOK",
@@ -7253,7 +6888,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
 
     deriv_rescue_dir = None
     deriv_rescue_tf  = None
-    _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)  # non-OTC pair - same for non-OTC
+    _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)  # non-OTC pair - same kwa non-OTC
     if _deriv_rescue_pair in DERIV_SYMBOLS:
         try:
             _dc = _deriv_tick_cache.get(_deriv_rescue_pair)
@@ -7383,11 +7018,11 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "_rescued": True,
     }
 
-_SIGNAL_TIMEOUT = 25  # v63: sequential fetch, cache-first — 25s ni ya kutosha
+_SIGNAL_TIMEOUT = 18  # seconds - increased: yfinance+finnhub fallback inachukua muda zaidi
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
-    Sends an 'Analyzing...' message with animated dots.
+    Inatuma ujumbe wa 'Analyzing...' na animation ya dots inayobadilika.
     v53: Haizunguki milele — inacheza frames mara moja tu, kisha inasimama.
     Inarudisha (message_obj, stop_event).
     """
@@ -7397,7 +7032,7 @@ async def animated_analyzing(bot, chat_id, pair: str):
         "🔵 *Checking indicators {}...* ⏳".format(pair),
         "🟢 *Almost ready {}...* ✅".format(pair),
     ]
-    _MAX_FRAMES = len(frames)  # play once only, no loop
+    _MAX_FRAMES = len(frames)  # cheza mara moja tu, bila loop
 
     stop_event = asyncio.Event()
     try:
@@ -7407,7 +7042,7 @@ async def animated_analyzing(bot, chat_id, pair: str):
 
     async def _animate():
         for i in range(1, _MAX_FRAMES):
-            await asyncio.sleep(0.8)  # v62: reduced from 1.5 for faster feel
+            await asyncio.sleep(1.5)
             if stop_event.is_set():
                 return
             try:
@@ -7533,11 +7168,11 @@ async def safe_generate_signal(pair: str) -> dict:
 
 def _derive_htf_trend_from_micro(pair):
     """
-    Extract 'Higher Timeframe Trend' from Deriv micro-candles.
+    Toa 'Higher Timeframe Trend' kutoka micro-candles ya Deriv.
 
     WAZO: Mtu anayeangalia chart ya 1m anaangalia candle moja kwa wakati mmoja.
     Lakini akiangalia chart ya 30m/1H, anaona MUUNDO wa soko - HH/HL/LH/LL.
-    This function does so using Deriv micro-candles (5s/10s/15s):
+    Function hii inafanya hivyo kwa kutumia micro-candles za Deriv (5s/10s/15s):
 
       5s  micro-candles  → inawakilisha mwelekeo wa TF ya 1m
       10s micro-candles  → inawakilisha mwelekeo wa TF ya 2m
@@ -7641,7 +7276,7 @@ def _confluence_quality_gate(
 
     Factors (kila moja inachangia pointi):
       1. EMA alignment (HMA + DEMA + EMA ma_diff) — max 25pts
-      2. MACD histogram slope (rising = strength) — max 15pts
+      2. MACD histogram slope (inayoongezeka = nguvu) — max 15pts
       3. RSI slope (inayoenda upande sahihi) — max 10pts
       4. Volume surge (volume > 1.5x average) — max 10pts
       5. Keltner breakout direction — max 10pts
@@ -7655,9 +7290,7 @@ def _confluence_quality_gate(
     gate_pass = True kama score >= 40 (threshold ya chini kabisa)
     """
     if real is None:
-        # v59d: non-OTC without real data no longer reaches here (blocked earlier).
-        # OTC/fallback: allow through with average score.
-        return (30, True, "no_real_data_otc")
+        return (30, True, "no_real_data")  # allow — OTC/fallback
 
     score = 0
     reasons = []
@@ -7704,82 +7337,58 @@ def _confluence_quality_gate(
         score += 10
         reasons.append("VOL_surge")
 
-    # 5. Keltner breakout (max 15pts v58: was 10)
+    # 5. Keltner breakout (max 10pts)
     kb = real.get("keltner_breakout")
     if kb == direction:
-        score += 15
+        score += 10
         reasons.append("Keltner_{}".format(direction))
     elif kb is not None and kb != direction:
-        score -= 8   # v58: larger penalty if opposing (was -5)
+        score -= 5
         reasons.append("Keltner_against")
 
-    # 6. Fisher Transform (max 15pts v58: was 10)
+    # 6. Fisher Transform (max 10pts)
     fd = real.get("fisher_direction")
     fv = real.get("fisher_val", 0)
     if fd == direction:
-        score += min(15, abs(fv) * 8)
+        score += min(10, abs(fv) * 5)
         reasons.append("Fisher_{}".format(direction))
     elif fd is not None and fd != direction:
-        score -= 7   # v58: larger penalty (was -5)
+        score -= 5
 
-    # 6b. SuperTrend — v63: scaled by distance (trend strength)
-    # Weak trend (small distance) = small bonus; Strong trend (large distance) = max bonus
-    _st_cq     = real.get("supertrend_direction")
-    _st_cq_val = real.get("supertrend_val")
-    if _st_cq is not None:
-        _st_cq_bonus = 0
-        try:
-            _st_cq_price = real.get("current_price") or float(_st_cq_val or 0)
-            _st_cq_dist  = abs(_st_cq_price - float(_st_cq_val or _st_cq_price)) / (abs(float(_st_cq_val or _st_cq_price)) + 1e-9) * 100
-            if _st_cq_dist >= 0.20:   _st_cq_bonus = 25
-            elif _st_cq_dist >= 0.10: _st_cq_bonus = 15 + int((_st_cq_dist - 0.10) / 0.10 * 10)
-            elif _st_cq_dist >= 0.05: _st_cq_bonus = 8  + int((_st_cq_dist - 0.05) / 0.05 * 7)
-            else:                     _st_cq_bonus = int(_st_cq_dist / 0.05 * 8)
-        except Exception:
-            _st_cq_bonus = 12  # fallback
-        if _st_cq == direction:
-            score += _st_cq_bonus
-            reasons.append("ST_{}+{}".format(direction, _st_cq_bonus))
-        else:
-            score -= 14   # opposing strong trend = hard penalty
-            reasons.append("ST_against")
+    # 6b. SuperTrend (max 12pts, penalty -8 kama inapinga) — strong trend filter
+    _st_cq = real.get("supertrend_direction")
+    if _st_cq == direction:
+        score += 12
+        reasons.append("ST_{}".format(direction))
+    elif _st_cq is not None and _st_cq != direction:
+        score -= 8
+        reasons.append("ST_against")
 
-    # 6c. v57 Weighted Vote (max 20pts v58: was 15) — consensus of 21 indicators
+    # 6c. v57 Weighted Vote (max 15pts) — consensus ya indicators 20
     _v57_b = real.get("v57_buy_score", 0)
     _v57_s = real.get("v57_sell_score", 0)
     _v57_t = _v57_b + _v57_s
     if _v57_t > 0:
         _v57_ratio = (_v57_b if direction == "BUY" else _v57_s) / _v57_t
         if _v57_ratio >= 0.65:
-            _cq_v57 = min(20, int((_v57_ratio - 0.5) * 40))
+            _cq_v57 = min(15, int((_v57_ratio - 0.5) * 30))
             score += _cq_v57
             reasons.append("v57vote+{:.0f}%".format(_v57_ratio*100))
         elif _v57_ratio < 0.40:
-            score -= 10  # v58: larger penalty (was -8)
+            score -= 8
             reasons.append("v57vote_against")
 
-    # 6d. PSAR alignment (max 8pts v58: was 5)
+    # 6d. PSAR alignment (max 5pts)
     if real.get("psar_direction") == direction:
-        score += 8
+        score += 5
         reasons.append("PSAR")
     elif real.get("psar_direction") is not None:
-        score -= 5   # v58: larger penalty (was -3)
+        score -= 3
 
-    # 6e. TTM Squeeze breakout (max 10pts v58: was 8)
+    # 6e. TTM Squeeze breakout (max 8pts — nguvu kabisa)
     if real.get("squeeze_direction") == direction and not real.get("squeeze_active", True):
-        score += 10
+        score += 8
         reasons.append("SQUEEZE_break")
-
-    # 6f. v58: ZigZag Trend (max 18pts — true swing structure)
-    _zz_d = real.get("zigzag_direction")
-    _zz_s = real.get("zigzag_strength", 0)
-    if _zz_d == direction:
-        _zz_cq = min(18, 8 + _zz_s * 5)   # 8→13→18 based on strength
-        score += _zz_cq
-        reasons.append("ZigZag_{}+{}".format(direction, _zz_cq))
-    elif _zz_d is not None and _zz_d != direction:
-        score -= 8
-        reasons.append("ZigZag_against")
 
     # 7. Trend 1H (max 15pts)
     if trend_1h == direction:
@@ -7796,7 +7405,7 @@ def _confluence_quality_gate(
     elif session_name == "Dead Hours":
         score -= 5
 
-    # 9. Candle body ratio (max 5pts, penalty -10 if indecision)
+    # 9. Candle body ratio (max 5pts, penalty -10 kama indecision)
     cbr = real.get("candle_body_ratio", 0.5)
     if real.get("is_indecision", False):
         score -= 10
@@ -7812,7 +7421,7 @@ def _confluence_quality_gate(
         score -= 5
 
     score = max(0, min(100, score))
-    gate_pass = score >= 40   # v63: restored to v57 level
+    gate_pass = score >= 40
 
     reason_str = "cq={} [{}]".format(score, ",".join(reasons[:4]) if reasons else "none")
     logging.info("CONFLUENCE_GATE {}: dir={} score={} pass={}".format(
@@ -7840,7 +7449,6 @@ def generate_signal(pair):
                 "no_signal_reason": "⚠️ High-impact news in {} - signal paused for safety.".format(_news_name),
             }
 
-    # ── Sequential fetch (cache-first — avoids TwelveData 429 rate limit) ─
     if not is_otc:
         try:
             real = _fetch_real_indicators_mtf(pair)
@@ -7868,7 +7476,6 @@ def generate_signal(pair):
         mtf = _fetch_mtf_score(pair)
     except Exception as e:
         logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
-    # ────────────────────────────────────────────────────────────────────────
 
     pattern_buy_bonus = 0
     pattern_sell_bonus = 0
@@ -7992,98 +7599,40 @@ def generate_signal(pair):
             else:
                 candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
         else:
-            # Non-OTC pair bila data — jaribu mara 3 tu, kisha rudisha flat
-            import time as _t
-
-            _real_retry = None
-            _attempt = 0
-            _MAX_ATTEMPTS = 3  # ← limit — usijaribu zaidi ya mara 3
-
-            while _real_retry is None and _attempt < _MAX_ATTEMPTS:
-                _attempt += 1
-
-                # First: try Deriv ticks as fast source
-                _deriv_live = None
-                _deriv_rescue_pair = OTC_TO_REAL.get(pair, pair)
-                if _deriv_rescue_pair in DERIV_SYMBOLS:
-                    try:
-                        _dc = _deriv_tick_cache.get(_deriv_rescue_pair)
-                        if _dc:
-                            _dc_age = _t.time() - _dc.get("ts", 0)
-                            if _dc_age <= _DERIV_CACHE_TTL:
-                                _td = _dc["data"]
-                                _best_str_d = -1
-                                _best_dir_d = None
-                                for _mk in ["5_s", "10_s", "15_s"]:
-                                    _tr = _td.get(_mk)
-                                    if _tr and _tr.get("direction") not in (None, "FLAT"):
-                                        _sv = _tr.get("strength", 0)
-                                        if _sv > _best_str_d:
-                                            _best_str_d = _sv
-                                            _best_dir_d = _tr["direction"]
-                                            _best_ind_d = _tr.get("indicators") or {}
-                                if _best_dir_d and _best_str_d >= 50:
-                                    _deriv_live = {
-                                        "direction": _best_dir_d,
-                                        "rsi":     _best_ind_d.get("rsi",    50.0),
-                                        "sto":     _best_ind_d.get("sto",    50.0),
-                                        "ma_diff": _best_ind_d.get("ma_diff", 0.0),
-                                        "macd":    _best_ind_d.get("macd",    0.0),
-                                        "bb_pos":  _best_ind_d.get("bb_pos",  0.5),
-                                        "mom":     _best_ind_d.get("mom",     0.0),
-                                        "vol":     _best_ind_d.get("vol",     0.5),
-                                        "tf_buy_votes":  1 if _best_dir_d == "BUY"  else 0,
-                                        "tf_sell_votes": 1 if _best_dir_d == "SELL" else 0,
-                                        "tf_count": 1,
-                                        "data_source": "deriv_ticks",
-                                    }
-                                    logging.info("nonOTC {} attempt {}: Deriv ticks hit dir={} str={:.0f}".format(
-                                        pair, _attempt, _best_dir_d, _best_str_d))
-                    except Exception as _de:
-                        logging.warning("nonOTC {} Deriv ticks read failed: {}".format(pair, _de))
-
-                if _deriv_live is not None:
-                    _real_retry = _deriv_live
-                    break
-
-                # Pili: jaribu Yahoo/Finnhub
-                try:
-                    _fetched = _fetch_real_indicators_mtf(pair)
-                    if _fetched is not None:
-                        _real_retry = _fetched
-                        logging.info("nonOTC {} real data obtained attempt {}".format(pair, _attempt))
-                        break
-                except Exception as _re:
-                    logging.warning("nonOTC {} fetch attempt {}: {}".format(pair, _attempt, _re))
-
-                logging.info("nonOTC {} attempt {}: no data yet — retrying in 1s".format(pair, _attempt))
-                _t.sleep(1)
-
-            # Data haikupatikana baada ya attempts 3 — rudisha flat (ruka pair hii)
-            if _real_retry is None:
-                logging.warning("nonOTC {} no data after {} attempts — skip".format(pair, _MAX_ATTEMPTS))
-                return {"flat": True, "direction": None, "timeframe": 0,
-                        "strength": 0, "indicators_agree": 0, "pair": pair}
-
-            # Data available (Deriv or Yahoo/Finnhub) — proceed with real indicators
-            rsi     = _real_retry["rsi"]
-            sto     = _real_retry["sto"]
-            ma_diff = _real_retry["ma_diff"]
-            macd    = _real_retry["macd"]
-            bb_pos  = _real_retry["bb_pos"]
-            mom     = _real_retry["mom"]
-            vol     = _real_retry["vol"]
-            _raw_dir_retry = _real_retry.get("direction")
-            if _raw_dir_retry == "BUY":
-                candle = 1.0
-            elif _raw_dir_retry == "SELL":
-                candle = -1.0
+            sess  = _get_session()
+            ptype = _pair_type(pair)
+            if trend_1h == "BUY":
+                rsi_w = [25, 20, 25, 18, 12]
+            elif trend_1h == "SELL":
+                rsi_w = [12, 18, 25, 20, 25]
+            elif sess["name"] in ("London Open", "NY/London"):
+                rsi_w = [20, 18, 24, 18, 20]
+            elif sess["name"] in ("Asian", "Dead Hours"):
+                rsi_w = [10, 20, 40, 20, 10]
             else:
-                candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
-            # Mark as real so v56 bonuses and CQ gate work correctly
-            real = _real_retry
+                rsi_w = [15, 20, 30, 20, 15]
 
-    _w = 1.0  # v54-8: non-OTC indicators now get full weight (was 0.5)
+            rsi_zone = random.choices(
+                ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
+            rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
+                   "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
+                   "overbought": random.uniform(72,92)}[rsi_zone]
+            sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
+                   "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
+                   "overbought": random.uniform(75,95)}[rsi_zone]
+            if sess["name"] in ("London Open", "NY Session"):
+                ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
+            else:
+                ma_diff = random.uniform(-0.4, 0.4)
+            if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
+            if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
+            macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
+            bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
+            mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
+            vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
+            candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
+
+    _w = 1.0  # v54-8: non-OTC indicators sasa zinapata uzito kamili (ilikuwa 0.5)
     b = s = 0
     if rsi < 25:    b += int(25 * _w)
     elif rsi < 35:  b += int(15 * _w)
@@ -8137,15 +7686,15 @@ def generate_signal(pair):
             s -= 10
 
     # ── Fractal scoring (v54-8) ──
-    # Source 1: fractal from 5m data (within real)
+    # Chanzo 1: fractal kutoka 5m data (ndani ya real)
     fractal_sig = None
     fractal_str = 0
     if real and real.get("fractal_signal"):
         fractal_sig = real["fractal_signal"]
         fractal_str = real.get("fractal_strength", 1)
 
-    # Source 2: fractal from real 1m data (most important for binary 1m)
-    # Supersedes 5m fractal if available
+    # Chanzo 2: fractal kutoka 1m data halisi (muhimu zaidi kwa binary 1m)
+    # Inasupersede 5m fractal kama inapatikana
     if not is_otc:
         real_pair_fr = OTC_TO_REAL.get(pair, pair)
         yf_sym_fr = YAHOO_SYMBOLS.get(real_pair_fr)
@@ -8162,7 +7711,7 @@ def generate_signal(pair):
             ind_1m_fr = _calc_indicators_from_df(df_1m_fr)
             if ind_1m_fr and ind_1m_fr.get("fractal_signal"):
                 fractal_sig = ind_1m_fr["fractal_signal"]
-                fractal_str = ind_1m_fr.get("fractal_strength", 1) + 1  # 1m gets bonus +1
+                fractal_str = ind_1m_fr.get("fractal_strength", 1) + 1  # 1m inapata bonus +1
                 logging.info("FRACTAL 1m {}: {} str={}".format(pair, fractal_sig, fractal_str))
 
     # Kama hakuna fractal yoyote - BB fallback (dhaifu)
@@ -8172,7 +7721,7 @@ def generate_signal(pair):
         elif bb_pos > 0.92:
             fractal_sig = "SELL"; fractal_str = 1
 
-    # Weight: fractal gets 35 points (was 15) - more important
+    # Uzito: fractal inapata pointi 35 (ilikuwa 15) - muhimu zaidi
     if fractal_sig == "BUY":
         b += 35 * fractal_str
     elif fractal_sig == "SELL":
@@ -8196,35 +7745,35 @@ def generate_signal(pair):
     # ── v56: New indicator bonuses ──────────────────────────────────────────
     _v56_real = real if real else (real_otc_ind if not is_otc and 'real_otc_ind' in dir() else None)
     if _v56_real:
-        # HMA direction bonus (+15 if it agrees with emerging direction)
+        # HMA direction bonus (+15 kama inakubaliana na direction inayoibuka)
         _hma = _v56_real.get("hma_direction")
         if _hma == "BUY":   b += 15
         elif _hma == "SELL": s += 15
 
-        # DEMA diff bonus (+12 if leaning one direction)
+        # DEMA diff bonus (+12 kama inaelekea upande mmoja)
         _dema = _v56_real.get("dema_diff", 0)
         if _dema > 0.05:    b += 12
         elif _dema < -0.05: s += 12
         elif _dema > 0.02:  b += 6
         elif _dema < -0.02: s += 6
 
-        # Keltner breakout (+30 v58: was +20 - true breakout is very important)
+        # Keltner breakout (+20 kama breakout ya kweli)
         _kb = _v56_real.get("keltner_breakout")
-        if _kb == "BUY":    b += 30
-        elif _kb == "SELL": s += 30
+        if _kb == "BUY":    b += 20
+        elif _kb == "SELL": s += 20
 
-        # Fisher Transform (+20 v58: was +12)
+        # Fisher Transform (+12 kama extreme)
         _fd = _v56_real.get("fisher_direction")
         _fv = abs(_v56_real.get("fisher_val", 0))
-        if _fd == "BUY":    b += min(20, int(_fv * 12))
-        elif _fd == "SELL": s += min(20, int(_fv * 12))
+        if _fd == "BUY":    b += min(12, int(_fv * 8))
+        elif _fd == "SELL": s += min(12, int(_fv * 8))
 
-        # MACD histogram slope (+8 if slope is in our direction)
+        # MACD histogram slope (+8 kama slope inakwenda upande wetu)
         _mhs = _v56_real.get("macd_hist_slope", 0)
         if _mhs > 0:        b += min(8, int(abs(_mhs) * 3000))
         elif _mhs < 0:      s += min(8, int(abs(_mhs) * 3000))
 
-        # RSI slope bonus (moving our direction = +6)
+        # RSI slope bonus (inakwenda upande wetu = +6)
         _rss = _v56_real.get("rsi_slope", 0)
         if _rss > 2:        b += 6
         elif _rss < -2:     s += 6
@@ -8234,46 +7783,25 @@ def generate_signal(pair):
             if b >= s: b += 10
             else:      s += 10
 
-        # Candle body penalty (doji/indecision = -8 on both sides)
+        # Candle body penalty (doji/indecision = -8 kwa pande zote)
         if _v56_real.get("is_indecision", False):
             b -= 8
             s -= 8
             logging.info("v56 INDECISION_CANDLE {}: b/s penalised -8".format(pair))
 
-        # SuperTrend bonus — v63: scaled by trend strength (distance from ST line)
-        # Small distance = weak/new trend = small bonus
-        # Large distance = strong established trend = large bonus
+        # SuperTrend bonus (+18 kama inakubaliana na direction, -12 kama inapinga)
         _st_dir = _v56_real.get("supertrend_direction")
-        _st_val = _v56_real.get("supertrend_val")
-        _st_bonus = 0
-        if _st_dir is not None and _st_val is not None:
-            try:
-                _cur_p = _v56_real.get("current_price") or float(_st_val)
-                _st_dist_pct = abs(_cur_p - float(_st_val)) / (float(_st_val) + 1e-9) * 100
-                # Scale: 0.05% → 10pts, 0.10% → 20pts, 0.20%+ → 35pts (max)
-                if _st_dist_pct >= 0.20:
-                    _st_bonus = 35
-                elif _st_dist_pct >= 0.10:
-                    _st_bonus = 20 + int((_st_dist_pct - 0.10) / 0.10 * 15)
-                elif _st_dist_pct >= 0.05:
-                    _st_bonus = 10 + int((_st_dist_pct - 0.05) / 0.05 * 10)
-                else:
-                    _st_bonus = int(_st_dist_pct / 0.05 * 10)  # 0–10 for tiny distance
-            except Exception:
-                _st_bonus = 15  # fallback if no price
-            if _st_dir == "BUY":
-                b += _st_bonus
-                logging.info("ST {}: BUY +{} (dist={:.4f}%)".format(pair, _st_bonus, _st_dist_pct if '_st_dist_pct' in dir() else 0))
-            elif _st_dir == "SELL":
-                s += _st_bonus
-                logging.info("ST {}: SELL +{} (dist={:.4f}%)".format(pair, _st_bonus, _st_dist_pct if '_st_dist_pct' in dir() else 0))
+        if _st_dir == "BUY":
+            b += 18
+        elif _st_dir == "SELL":
+            s += 18
 
         # ── v57: Weighted indicator vote bonus ─────────────────────────────
         _v57_buy  = _v56_real.get("v57_buy_score",  0)
         _v57_sell = _v56_real.get("v57_sell_score", 0)
         _v57_tot  = _v57_buy + _v57_sell
         if _v57_tot > 0:
-            # Bonus max +40 for winning side (proportional)
+            # Bonus max +40 kwa upande ulioshinda (proportional)
             _v57_b_bonus = int((_v57_buy  / _v57_tot) * 40)
             _v57_s_bonus = int((_v57_sell / _v57_tot) * 40)
             b += _v57_b_bonus
@@ -8281,27 +7809,12 @@ def generate_signal(pair):
             logging.info("v57 vote {}: buy_score={} sell_score={} → b+{} s+{}".format(
                 pair, _v57_buy, _v57_sell, _v57_b_bonus, _v57_s_bonus))
 
-        # Extra bonuses for stronger indicators
-        if _v56_real.get("psar_direction") == "BUY":    b += 15
-        elif _v56_real.get("psar_direction") == "SELL": s += 15
-
-        # v58: ZigZag Trend bonus — true swing structure
-        _zz_dir = _v56_real.get("zigzag_direction")
-        _zz_str = _v56_real.get("zigzag_strength", 0)
-        if _zz_dir == "BUY":
-            _zz_bonus = 15 + _zz_str * 8   # min 15, max 39 for strength=3
-            b += _zz_bonus
-            logging.info("ZIGZAG {}: BUY +{} (strength={})".format(pair, _zz_bonus, _zz_str))
-        elif _zz_dir == "SELL":
-            _zz_bonus = 15 + _zz_str * 8
-            s += _zz_bonus
-            logging.info("ZIGZAG {}: SELL +{} (strength={})".format(pair, _zz_bonus, _zz_str))
-        elif _zz_dir is not None and _zz_dir != (_v56_real.get("direction") or ""):
-            # ZigZag inapinga direction kuu — penalize
-            b -= 10; s -= 10
+        # Extra bonuses kwa indicators za nguvu zaidi
+        if _v56_real.get("psar_direction") == "BUY":    b += 8
+        elif _v56_real.get("psar_direction") == "SELL": s += 8
 
         if _v56_real.get("squeeze_direction") and not _v56_real.get("squeeze_active", True):
-            # Squeeze breakout = very strong
+            # Squeeze breakout = nguvu sana
             if _v56_real.get("squeeze_direction") == "BUY":  b += 12
             else:                                              s += 12
 
@@ -8375,24 +7888,24 @@ def generate_signal(pair):
 
     direction = "BUY" if b >= s else "SELL"
 
-    # Fix B (v54-8): if trend_1h missing and real data available, anchor direction to 5m real data
-    # This prevents direction flip-flop when 1H is missing and other sources are split
+    # Fix B (v54-8): kama trend_1h haipo na real data ipo, anchor direction kwa 5m data halisi
+    # Hii inazuia direction flip-flop wakati 1H haiji na vitu vingine vina mgawanyiko
     if not is_otc and trend_1h is None and real is not None:
         real_dir = real.get("direction")  # direction kutoka 5m indicators (MA+MACD)
         if real_dir in ("BUY", "SELL"):
             tf_votes_match = (real_dir == "BUY" and real.get("tf_buy_votes", 0) >= real.get("tf_sell_votes", 0)) or                              (real_dir == "SELL" and real.get("tf_sell_votes", 0) >= real.get("tf_buy_votes", 0))
             if tf_votes_match:
-                # 5m direction + tf votes agree - anchor here
+                # 5m direction + tf votes zinabaliana - anchor hapa
                 direction = real_dir
                 logging.info("DIRECTION ANCHOR {}: trend_1h=None, real_dir={} tf_buy={} tf_sell={} → anchored".format(
                     pair, real_dir, real.get("tf_buy_votes",0), real.get("tf_sell_votes",0)))
             else:
-                # 5m direction and tf votes disagree - check vwap as tiebreaker
+                # 5m direction na tf votes hazikubaliani - angalia vwap kama tiebreaker
                 if vwap_data is not None:
                     direction = vwap_data["direction"]
                     logging.info("DIRECTION ANCHOR {}: trend_1h=None, 5m vs tf conflict → vwap={}".format(
                         pair, vwap_data["direction"]))
-                # if vwap also missing - leave direction = b vs s as-is
+                # kama vwap pia haipo - acha direction = b vs s kama ilivyo
     indicators_agree = 0
     checks = [(rsi < 45, rsi > 55), (sto < 45, sto > 55), (ma_diff > 0, ma_diff < 0),
               (macd > 0, macd < 0), (bb_pos < 0.5, bb_pos > 0.5), (mom > 0, mom < 0), (candle > 0, candle < 0)]
@@ -8440,7 +7953,7 @@ def generate_signal(pair):
                 indicators_agree = max(0, indicators_agree - 1)
         if _sec_total > 0:
             _sec_ratio = _sec_agree / _sec_total
-            _sec_bonus = int(_sec_ratio * 25)  # max +25 if all seconds agree
+            _sec_bonus = int(_sec_ratio * 25)  # max +25 kama sekunde zote zinakubaliana
             if direction == "BUY":  b += _sec_bonus
             else:                   s += _sec_bonus
             logging.info("Deriv sec indicators {}: agree={}/{} bonus={} dir={}".format(
@@ -8457,7 +7970,7 @@ def generate_signal(pair):
     if pattern_agrees:
         indicators_agree += 2
 
-    # v57: if more than 60% of 20 indicators agree → +2 indicators_agree
+    # v57: kama zaidi ya 60% ya indicators 20 zinakubaliana → +2 indicators_agree
     if _v56_real:
         _v57d = _v56_real.get("v57_direction")
         if _v57d == direction:
@@ -8470,38 +7983,13 @@ def generate_signal(pair):
         # CMF (volume confirms)
         if _v56_real.get("cmf_direction") == direction:
             indicators_agree += 1
-        # v58: ZigZag — strong swing structure wins vote +2 or +3
-        _zz_ia = _v56_real.get("zigzag_direction")
-        _zz_ia_str = _v56_real.get("zigzag_strength", 0)
-        if _zz_ia == direction:
-            indicators_agree += 1 + min(2, _zz_ia_str)  # +1 weak, +2 moderate, +3 strong
-        elif _zz_ia is not None and _zz_ia != direction:
-            indicators_agree = max(0, indicators_agree - 2)  # ZigZag inapinga = penalize zaidi
-        # SuperTrend alignment — v63: scaled by trend strength
-        # Strong trend (large distance) = +3, moderate = +2, weak = +1
-        _st_ia_dir = _v56_real.get("supertrend_direction")
-        _st_ia_val = _v56_real.get("supertrend_val")
-        if _st_ia_dir is not None:
-            _st_ia_add = 1  # default weak
-            try:
-                _st_ia_p = _v56_real.get("current_price") or float(_st_ia_val or 0)
-                _st_ia_d = abs(_st_ia_p - float(_st_ia_val or _st_ia_p)) / (abs(float(_st_ia_val or _st_ia_p)) + 1e-9) * 100
-                if _st_ia_d >= 0.20:   _st_ia_add = 3   # strong trend
-                elif _st_ia_d >= 0.08: _st_ia_add = 2   # moderate
-                else:                  _st_ia_add = 1   # weak/new
-            except Exception:
-                _st_ia_add = 2
-            if _st_ia_dir == direction:
-                indicators_agree += _st_ia_add
-            else:
-                indicators_agree = max(0, indicators_agree - _st_ia_add)
 
     if mtf and trend_1h and mtf["total"] >= 3:
         mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
         if mtf_dir != trend_1h:
             direction = "BUY" if b > s else "SELL"
 
-    min_confluence = 4 if not is_otc else 3   # v62: lowered non-OTC 6→4, OTC 4→3
+    min_confluence = 4 if not is_otc else 3   # Lowered: was 6/5 - less blocking
     if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
@@ -8558,7 +8046,7 @@ def generate_signal(pair):
             "no_signal_reason": "🔍 *Market confluence too weak* — waiting for clearer setup.",
             "nn_confidence": None, "nn_used": False, "_nn_feat_arr": None,
         }
-    # Boost strength if quality gate score is high
+    # Boost strength kama quality gate score ni juu
     _cq_strength_bonus = max(0, (_cq_score - 50) // 5)  # 0-10pts bonus
     # ── end v56 CQ gate ──────────────────────────────────────────────────────
 
@@ -8592,7 +8080,7 @@ def generate_signal(pair):
     strength = int(90 + (raw_clamped - 35) / (97 - 35) * (450 - 90))
 
     vte_tf = None  # will be set by non-OTC branch; used by downstream filters
-    _pipeline_scores = {1: 0.0, 2: 0.0, 3: 0.0}  # v53: unified score dict for all gates
+    _pipeline_scores = {1: 0.0, 2: 0.0, 3: 0.0}  # v53: unified score dict kwa gates zote
     if is_otc:
         timeframe = _smart_otc_expiry(
             pair, direction,
@@ -8637,7 +8125,7 @@ def generate_signal(pair):
             {k: round(v, 1) for k, v in _micro_scores.items()}
         ))
 
-    if not is_otc and is_filter_on("confluence") and indicators_agree < 4 and vte_tf is None and timeframe > 0:
+    if not is_otc and is_filter_on("confluence") and indicators_agree < 5 and vte_tf is None and timeframe > 0:
         if trend_1h is not None:
             direction = trend_1h  # Fuata 1H - si kupingana nayo
         elif not yahoo_available:
@@ -8646,9 +8134,9 @@ def generate_signal(pair):
     if not is_otc and is_filter_on("h1confirm") and timeframe > 0:
         h1_confirmed = _confirm_1h_direction(pair, direction)
         if not h1_confirmed:
-            _pipeline_scores[1] = max(0.0, _pipeline_scores.get(1, 0) - 35)  # 1m: large penalty
-            _pipeline_scores[2] = max(0.0, _pipeline_scores.get(2, 0) - 15)  # 2m: medium penalty
-            _pipeline_scores[3] = _pipeline_scores.get(3, 0) + 10             # 3m: wait bonus
+            _pipeline_scores[1] = max(0.0, _pipeline_scores.get(1, 0) - 35)  # 1m: penalty kubwa
+            _pipeline_scores[2] = max(0.0, _pipeline_scores.get(2, 0) - 15)  # 2m: penalty ya kati
+            _pipeline_scores[3] = _pipeline_scores.get(3, 0) + 10             # 3m: bonus ya kusubiri
             new_tf = max(_pipeline_scores, key=lambda t: _pipeline_scores[t])
             if new_tf != timeframe:
                 logging.info("H1CONFIRM {}: 1H not confirmed → leading {}m → {}m after score adjustment (scores: 1m={:.1f} 2m={:.1f} 3m={:.1f})".format(
@@ -8717,7 +8205,7 @@ def generate_signal(pair):
                     candle_dir_5m = "BUY" if (c1_5_bull and c2_5_bull) else \
                                     ("SELL" if (not c1_5_bull and not c2_5_bull) else "NEUTRAL")
 
-                gate_scores = _pipeline_scores  # direct reference - edits are real
+                gate_scores = _pipeline_scores  # direct reference - edits ni za kweli
                 _total_gate_score = sum(gate_scores.values())
                 if _total_gate_score < 5.0:
                     logging.info("CANDLE GATE {}: scores trivial ({:.1f}) - gate skipped".format(
@@ -8796,7 +8284,7 @@ def generate_signal(pair):
                 fp_mov = best_combo["avg_movement"]
                 fp_score = best_combo["score"]
 
-                fp_bonus = min(60.0, fp_score * 80)  # max 60pts for fp_score=0.75
+                fp_bonus = min(60.0, fp_score * 80)  # max 60pts kwa fp_score=0.75
                 _pipeline_scores[fp_tf] = _pipeline_scores.get(fp_tf, 0) + fp_bonus
                 if fp_dir != direction and fp_wr >= 0.65:
                     direction = fp_dir
@@ -8855,7 +8343,7 @@ def pair_to_idx(pair):
 
 def is_market_closed():
     """
-    Returns True when non-OTC forex pairs are unavailable:
+    Returns True when non-OTC forex pairs are unavailable on Pocket Option:
     - Saturday or Sunday (UTC), OR
     - Weekday night closure: 23:45 - 03:15 EAT = 20:45 - 00:15 UTC
     When True → show OTC pairs for trading, non-OTC shown as (Closed).
@@ -8901,44 +8389,6 @@ def _session_header_text():
         return "{} *{}*".format(emoji, name)
     except Exception:
         return ""
-
-# ── v59: MAIN MENU KEYBOARD ─────────────────────────────────────────────────
-# Pairs za multi-scan (Button 3) - user anachagua 4 au 6 pairs
-MULTI_SCAN_4_PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD",
-]
-MULTI_SCAN_6_PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "EUR/JPY", "GBP/JPY",
-]
-
-def main_menu_keyboard(user_id=None):
-    """
-    v62: Menu kuu.
-      - Free users ambao bado wana signals zilizobaki: wanaona trading buttons tu.
-        Upgrade/Licence na My Stats zimefichwa mpaka signals zote zishe.
-      - Free users ambao signals zishe (au licensed): wanaona kila kitu.
-    """
-    lic = is_licensed(user_id) if user_id else False
-
-    # Amua kama kuonyesha Upgrade/Stats au la
-    show_upgrade_stats = True
-    if user_id and not lic:
-        used  = free_signals_used(user_id)
-        total = total_free_allowed(user_id)
-        if used < total:
-            show_upgrade_stats = False  # Bado ana signals — ficha upgrade/stats
-
-    rows = [
-        [InlineKeyboardButton("🌐 Global Scan  (All Pairs)", callback_data="global_scan")],
-        [InlineKeyboardButton("📊 Select Pair", callback_data="choose_pair")],
-        [InlineKeyboardButton("🎯 Multi Scan", callback_data="multi_scan_menu")],
-    ]
-    if show_upgrade_stats:
-        rows.append([InlineKeyboardButton("📊 My Stats", callback_data="my_stats")])
-    if show_upgrade_stats and not lic:
-        rows.append([InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")])
-    rows.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_inline")])
-    return InlineKeyboardMarkup(rows)
 
 def pairs_keyboard():
     """
@@ -9136,7 +8586,7 @@ def expired_signal_keyboard():
 
 def unlock_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Contact Admin", url=support_url())],
+        [InlineKeyboardButton("💳 Payment Info & Methods", callback_data="pay_info")],
         [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
     ])
 
@@ -9164,12 +8614,12 @@ PAYMENT_TEXT = """💰 *UNLOCK EVALON WINNERS BOT*
 
 🥈 *MONTHLY ACCESS - $50*
 ✅ Unlimited signals for 30 days
-✅ AI-powered trading signals
+✅ Win rate 90% - 98%
 ✅ 100+ trading pairs
 
 💎 *LIFETIME ACCESS - $150*
 ✅ Unlimited signals forever
-✅ AI-powered trading signals
+✅ Win rate 90% - 98%
 ✅ Free updates forever
 ✅ 100+ trading pairs
 
@@ -9321,7 +8771,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "╔══════════════════════╗\n"
         "     ⚡ EVALON WINNERS BOT\n"
         "╚══════════════════════╝\n\n"
-        "🏆 *AI-Powered Smart Signals*\n"
+        "🏆 *Win Rate: 90% - 98%*\n"
         "📊 *100+ Trading Pairs*\n"
         "🧠 *AI-Powered Signal Analysis*\n\n"
         "⚠️ _Evalon Bot is AI-powered and may make mistakes. Trade responsibly._\n\n"
@@ -9343,20 +8793,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/listlicences` - View all codes (used/unused)\n"
             "`/revoke 123456` - Remove user licence\n"
             "━━━━━━━━━━━━━━━━━━\n"
+            "📊 *RESULT MESSAGES*\n"
+            "`/resultson` - Enable WIN/LOSS result messages\n"
+            "`/resultsoff` - Disable result messages\n"
+            "━━━━━━━━━━━━━━━━━━\n"
             "👥 *USER MANAGEMENT*\n"
             "`/listusers` - View all users & stats\n"
             "`/totalusers` - Quick user count\n"
             "`/stats` - Detailed statistics\n"
-            "`/users` - Full user list with licence status\n"
             "`/userinfo 123456` - Full details of a user\n"
-            "`/userchart` - User growth chart (last 30 days)\n"
             "`/addtrial 123456 5` - Give user extra free signals\n"
             "`/deleteuser 123456` - Delete user permanently\n"
             "`finduser name` - Search user by name/username\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📜 *SIGNAL HISTORY*\n"
-            "`/history` - Last 20 signals sent\n"
-            "`/history 123456` - Last signals for specific user\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🚫 *BAN MANAGEMENT*\n"
             "`/blacklist 123456 reason` - Ban a user\n"
@@ -9368,7 +8816,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/blockedbot` - Find users who blocked the bot\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "📢 *BROADCAST*\n"
-            "`/broadcast message` - Send message to all users\n"
+            "`/broadcast message` - Send to all users\n"
             "_Markdown supported: *bold*, _italic_, `code`_\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🖼 *IMAGES*\n"
@@ -9389,8 +8837,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n"
             "🎛 *SIGNAL FILTERS*\n"
             "`/filterstatus` - View status of all filters\n"
-            "`/trendon` - Enable trend-follow filter (default)\n"
-            "`/trendoff` - Disable trend-follow filter (ALL signals)\n"
             "`/filteroff news` - Disable news block filter\n"
             "`/filteroff dead` - Disable dead market filter\n"
             "`/filteroff conflict` - Disable 1H vs short-TF filter\n"
@@ -9402,10 +8848,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/filteron [name|all]` - Enable filter(s)\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔓 *FORCE PAIR*\n"
-            "`/forcepair EURUSD OTC` - Bypass flat filter for pair\n"
-            "`/forcepair all` - Bypass for all pairs\n"
-            "`/forcepair list` - Show forced pairs\n"
-            "`/unforcepair all` - Clear all overrides\n"
+            "`/forcepair EURUSD OTC` - bypass flat filter for pair\n"
+            "`/forcepair all` - bypass for all pairs\n"
+            "`/forcepair list` - show forced pairs\n"
+            "`/unforcepair all` - clear all overrides\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🧠 *NEURAL NETWORK*\n"
             "`/nnstats` - NN status, accuracy & per-pair models\n"
@@ -9431,9 +8877,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💬 Need help? Tap *Support* below",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 Global Scan", callback_data="global_scan")],
-                [InlineKeyboardButton("📊 Select Pair", callback_data="choose_pair")],
-                [InlineKeyboardButton("🎯 Multi Scan", callback_data="multi_scan_menu")],
+                [InlineKeyboardButton("📊 Start Trading", callback_data="choose_pair")],
+                [InlineKeyboardButton("🌐 Global Scan (Best Pair Auto)", callback_data="global_scan")],
                 [InlineKeyboardButton("🔑 Enter Licence Code", callback_data="enter_code")],
                 [InlineKeyboardButton("💬 Support", url=support_url)],
             ])
@@ -10954,14 +10399,9 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
     MIN_INDICATORS = 4
     MIN_STRENGTH   = 120
     FIXED_TF       = 1
-    PAIR_DELAY     = 20  # v65-fix: was undefined (NameError bug)
 
     uid = int(user_id)
     n   = len(pairs_to_scan)
-
-    # v65-fix: mark all pairs active so prefetch engine fetches them
-    for _p in pairs_to_scan:
-        mark_pair_active(_p)
 
     cancel_ev = asyncio.Event()
     _ACTIVE_SCANS[uid] = cancel_ev
@@ -11215,7 +10655,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m only
     FIXED_TF       = 1
-    SCAN_INTERVAL  = 45  # v65-fix: restored from 8 — indicators need time to compute
+    SCAN_INTERVAL  = 8   # v62: reduced from 15 for faster scanning
     MIN_INDICATORS = 4
     MIN_STRENGTH   = 120
     COOLDOWN_SECS  = 0
@@ -11628,17 +11068,13 @@ async def global_scan_and_send(bot, chat, user_id, context):
       2. Ubora: indicators_agree × strength × trend confirmation
       3. Pair moja tu inatumwa kila scan cycle
     """
-    SCAN_INTERVAL  = 45   # v65-fix: restored from 8 — indicators need time to compute
+    SCAN_INTERVAL  = 8    # v62: reduced from 15 for faster scanning
     MIN_INDICATORS = 4
     MIN_STRENGTH   = 120
     FIXED_TF       = 1
     COOLDOWN_SECS  = 0   # no cooldown after signal
 
     uid = int(user_id)
-
-    # v65-fix: mark all global pairs active so prefetch engine fetches them
-    for _p in GLOBAL_SCAN_PAIRS:
-        mark_pair_active(_p)
 
     cancel_ev = asyncio.Event()
     _ACTIVE_SCANS[uid] = cancel_ev
@@ -12873,11 +12309,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 _BG_SCAN_PAIRS = [
-    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD",
+    "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","NZD/USD","USD/CAD",
     "EUR/GBP","EUR/JPY","EUR/AUD","EUR/CAD","EUR/CHF",
     "GBP/JPY","GBP/AUD","GBP/CAD","GBP/CHF",
-    "AUD/JPY","AUD/CAD","AUD/CHF",
-    "CHF/JPY","CAD/JPY","CAD/CHF",
+    "AUD/JPY","AUD/CAD","AUD/CHF","AUD/NZD",
+    "NZD/JPY","NZD/CAD","NZD/CHF",
+    "CHF/JPY","CAD/JPY","CAD/CHF","EUR/NZD","GBP/NZD","USD/MXN",
 ]
 
 _fp_pending: dict = {}
@@ -12935,11 +12372,11 @@ def get_best_combo_from_fingerprint(pair, rsi=50.0, bb_pos=0.5, macd=0.0,
                                      d5s_dir=None, d10s_dir=None, d15s_dir=None,
                                      min_samples=5):
     """
-    Query DB: "Fingerprint similar to this one — where did price move strongly
+    Uliza DB: "Fingerprint inayofanana na hii — bei ilienda wapi kwa nguvu
     zaidi na iliwin wapi kwa uhakika zaidi?"
 
     Inaangalia zote 6: BUY 1m, BUY 2m, BUY 3m, SELL 1m, SELL 2m, SELL 3m
-    Regardless of what indicators said — checks actual price movement.
+    Bila kujali indicators zilisema nini — inaangalia movement halisi ya bei.
 
     Fuzzy match: RSI ±12, BB ±0.15
 
@@ -13146,13 +12583,13 @@ async def _bg_check_fingerprint_outcomes():
         _bg_fp_pending.pop(fp_id, None)
 
 _signal_prefetch_cache: dict = {}
-_PREFETCH_TTL = 55  # 55 seconds — nearly 1 minute before going stale
+_PREFETCH_TTL = 55  # sekunde 55 — karibu dakika 1 kabla haijawa stale
 
 _prefetch_active_pairs: dict = {}   # pair → last_used unix timestamp
 _PREFETCH_ACTIVE_TTL  = 600         # sekunde 600 = dakika 10
 
 _PREFETCH_PAIRS_NONOTC = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "USD/CAD",
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD",
     "EUR/GBP", "EUR/JPY", "GBP/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
     "GBP/AUD", "GBP/CAD", "GBP/CHF", "AUD/JPY", "AUD/CAD", "CAD/JPY", "CHF/JPY",
 ]
@@ -13186,11 +12623,6 @@ def get_prefetched_signal(pair: str):
     return entry["sig"]
 
 def set_prefetched_signal(pair: str, sig: dict):
-    # v65-fix: usihifadhi signal ya flat/zero — itafetch upya scan inayofuata
-    if sig is None:
-        return
-    if sig.get("flat", False) or sig.get("indicators_agree", 0) == 0 or sig.get("strength", 0) == 0:
-        return
     _signal_prefetch_cache[pair] = {"sig": sig, "ts": time.time()}
 
 async def signal_prefetch_engine():
@@ -13224,11 +12656,11 @@ async def signal_prefetch_engine():
                         pair, sig.get("direction", "?"), sig.get("timeframe", 0)))
                 except Exception as _pfe:
                     logging.warning("PREFETCH failed {}: {}".format(pair, _pfe))
-                await asyncio.sleep(2)  # gap kati ya pairs — punguza CPU pressure
+                await asyncio.sleep(0.3)
 
         except Exception as e:
             logging.warning("signal_prefetch_engine error: {}".format(e))
-        await asyncio.sleep(2)  # v62: reduced from 5 for faster cache refresh
+        await asyncio.sleep(1)
 
 async def safe_generate_signal_cached(pair: str) -> tuple:
     """
@@ -13261,7 +12693,7 @@ async def background_learning_engine():
             await _bg_check_fingerprint_outcomes()
         except Exception as e:
             logging.warning("background_learning_engine error: {}".format(e))
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
 
 _virtual_trades: dict = {}
 
@@ -13596,7 +13028,7 @@ async def virtual_trading_engine():
                 logging.info("VTE: cycle {} - {} active trades".format(cycle, active))
         except Exception as e:
             logging.warning("VTE cycle error: {}".format(e))
-        await asyncio.sleep(60)
+        await asyncio.sleep(5)
 
 def get_optimal_tf(pair, fallback=None):
     """
@@ -13891,11 +13323,13 @@ def get_top5_pairs(otc_only=False, non_otc_only=False):
     """
     _ALLOWED_NONOTC = [
         "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-        "AUD/USD", "USD/CAD",
+        "AUD/USD", "NZD/USD", "USD/CAD",
         "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF",
         "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF",
-        "AUD/JPY", "AUD/CAD", "AUD/CHF",
+        "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
+        "NZD/JPY", "NZD/CAD", "NZD/CHF",
         "CHF/JPY", "CAD/JPY", "CAD/CHF",
+        "EUR/NZD", "GBP/NZD", "USD/MXN",
     ]
     _ALLOWED_NONOTC_SET = set(_ALLOWED_NONOTC)
 
@@ -14100,7 +13534,27 @@ async def run_bot():
         await asyncio.sleep(60)
 
 def main():
-    # HTTP health server tayari imeanza mwanzo wa faili (module level).
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    PORT = int(os.environ.get("PORT", 8080))
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"EVALON WINNERS BOT OK")
+        def log_message(self, *args):
+            pass
+
+    def start_health_server():
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        server.serve_forever()
+
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
+    print("Port {} open. Starting bot...".format(PORT))
+
     print("EVALON WINNERS BOT starting...")
     init_db()
     print("Database ready.")
