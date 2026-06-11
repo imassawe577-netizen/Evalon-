@@ -1139,6 +1139,7 @@ def init_db():
                 );
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_signals INTEGER DEFAULT 0;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS broker_selected TEXT DEFAULT NULL;
                 ALTER TABLE licences ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE;
                 CREATE TABLE IF NOT EXISTS join_requests (
                     user_id BIGINT PRIMARY KEY,
@@ -2086,6 +2087,44 @@ def get_expiry_text(user_id):
 def free_signals_used(user_id):
     return get_user(user_id).get("free_used", 0)
 
+# ── v62: Broker selection helpers ──────────────────────────────────────────
+BROKER_LIST = [
+    ("Quotex",        "quotex"),
+    ("Pocket Option", "pocket_option"),
+    ("IQ Option",     "iq_option"),
+    ("Binomo",        "binomo"),
+    ("Olymp Trade",   "olymp_trade"),
+    ("Deriv",         "deriv"),
+    ("ExpertOption",  "expertoption"),
+    ("Raceoption",    "raceoption"),
+    ("Binarycent",    "binarycent"),
+    ("Bullex",        "bullex"),
+    ("Finmax",        "finmax"),
+    ("BinaryCom",     "binarycom"),
+]
+
+def get_broker_selected(user_id):
+    """Returns broker string or None if not yet selected."""
+    return get_user(user_id).get("broker_selected", None)
+
+def set_broker_selected(user_id, broker):
+    """Save user's chosen broker to DB."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET broker_selected = %s WHERE user_id = %s",
+                (broker, user_id)
+            )
+        conn.commit()
+
+def broker_selection_keyboard():
+    """Build inline keyboard for broker selection."""
+    rows = []
+    for name, cb in BROKER_LIST:
+        rows.append([InlineKeyboardButton(name, callback_data="broker_select_{}".format(cb))])
+    return InlineKeyboardMarkup(rows)
+# ───────────────────────────────────────────────────────────────────────────
+
 def use_free_signal(user_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -2400,7 +2439,7 @@ async def _spam_gentle_delay(user_id):
     if gap < SPAM_SECONDS:
         await asyncio.sleep(SPAM_SECONDS - gap)
 
-_CONFIRM_DELAY_SECS = 8  # Raised from 4 - gives more time for Yahoo recheck (non-OTC)
+_CONFIRM_DELAY_SECS = 3  # v62: Reduced from 8 — faster signal delivery
 
 async def _confirm_signal_direction(pair, initial_direction, is_otc):
     """
@@ -2501,6 +2540,40 @@ def get_bonus_signals(user_id):
 
 def total_free_allowed(user_id):
     return 15 + get_bonus_signals(user_id)
+
+# v62: Global pair → flag emoji map (used by all scan functions)
+PAIR_EMOJIS = {
+    "EUR/USD": "🇪🇺🇺🇸", "EUR/USD OTC": "🇪🇺🇺🇸",
+    "GBP/USD": "🇬🇧🇺🇸", "GBP/USD OTC": "🇬🇧🇺🇸",
+    "USD/JPY": "🇺🇸🇯🇵", "USD/JPY OTC": "🇺🇸🇯🇵",
+    "USD/CHF": "🇺🇸🇨🇭", "USD/CHF OTC": "🇺🇸🇨🇭",
+    "AUD/USD": "🇦🇺🇺🇸", "AUD/USD OTC": "🇦🇺🇺🇸",
+    "NZD/USD": "🇳🇿🇺🇸", "NZD/USD OTC": "🇳🇿🇺🇸",
+    "USD/CAD": "🇺🇸🇨🇦", "USD/CAD OTC": "🇺🇸🇨🇦",
+    "EUR/GBP": "🇪🇺🇬🇧", "EUR/GBP OTC": "🇪🇺🇬🇧",
+    "EUR/JPY": "🇪🇺🇯🇵", "EUR/JPY OTC": "🇪🇺🇯🇵",
+    "EUR/AUD": "🇪🇺🇦🇺", "EUR/AUD OTC": "🇪🇺🇦🇺",
+    "EUR/CAD": "🇪🇺🇨🇦", "EUR/CAD OTC": "🇪🇺🇨🇦",
+    "EUR/CHF": "🇪🇺🇨🇭", "EUR/CHF OTC": "🇪🇺🇨🇭",
+    "EUR/NZD": "🇪🇺🇳🇿", "EUR/NZD OTC": "🇪🇺🇳🇿",
+    "GBP/JPY": "🇬🇧🇯🇵", "GBP/JPY OTC": "🇬🇧🇯🇵",
+    "GBP/AUD": "🇬🇧🇦🇺", "GBP/AUD OTC": "🇬🇧🇦🇺",
+    "GBP/CAD": "🇬🇧🇨🇦", "GBP/CAD OTC": "🇬🇧🇨🇦",
+    "GBP/CHF": "🇬🇧🇨🇭", "GBP/CHF OTC": "🇬🇧🇨🇭",
+    "GBP/NZD": "🇬🇧🇳🇿", "GBP/NZD OTC": "🇬🇧🇳🇿",
+    "AUD/JPY": "🇦🇺🇯🇵", "AUD/JPY OTC": "🇦🇺🇯🇵",
+    "AUD/CAD": "🇦🇺🇨🇦", "AUD/CAD OTC": "🇦🇺🇨🇦",
+    "AUD/CHF": "🇦🇺🇨🇭", "AUD/CHF OTC": "🇦🇺🇨🇭",
+    "AUD/NZD": "🇦🇺🇳🇿", "AUD/NZD OTC": "🇦🇺🇳🇿",
+    "NZD/JPY": "🇳🇿🇯🇵", "NZD/JPY OTC": "🇳🇿🇯🇵",
+    "CHF/JPY": "🇨🇭🇯🇵", "CHF/JPY OTC": "🇨🇭🇯🇵",
+    "CAD/JPY": "🇨🇦🇯🇵", "CAD/JPY OTC": "🇨🇦🇯🇵",
+    "CAD/CHF": "🇨🇦🇨🇭", "CAD/CHF OTC": "🇨🇦🇨🇭",
+    "USD/MXN": "🇺🇸🇲🇽", "USD/MXN OTC": "🇺🇸🇲🇽",
+    "USD/ZAR": "🇺🇸🇿🇦", "USD/TRY": "🇺🇸🇹🇷",
+    "Gold OTC": "🥇", "Brent Oil OTC": "🛢️", "WTI Crude Oil OTC": "🛢️",
+    "Bitcoin ETF OTC": "₿", "Ethereum OTC": "💎",
+}
 
 ALL_PAIRS = [
     "EUR/USD OTC", "EUR/USD", "GBP/USD OTC", "GBP/USD",
@@ -7211,7 +7284,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "_rescued": True,
     }
 
-_SIGNAL_TIMEOUT = 30  # seconds - loop ya nonOTC inaweza kuchukua muda zaidi
+_SIGNAL_TIMEOUT = 15  # v62: reduced from 30 — faster fallback on slow data
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
@@ -7235,7 +7308,7 @@ async def animated_analyzing(bot, chat_id, pair: str):
 
     async def _animate():
         for i in range(1, _MAX_FRAMES):
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.8)  # v62: reduced from 1.5 for faster feel
             if stop_event.is_set():
                 return
             try:
@@ -8692,19 +8765,29 @@ MULTI_SCAN_6_PAIRS = [
 
 def main_menu_keyboard(user_id=None):
     """
-    v59: Menu kuu mpya yenye buttons 3 tu:
-      1. 🌐 Global Scan  - scan pairs ZOTE, signals za mchanganyiko
-      2. 📊 Select Pair  - mtu achague pair moja
-      3. 🎯 Multi Scan   - scan pairs 4 au 6 tu
+    v62: Menu kuu.
+      - Free users ambao bado wana signals zilizobaki: wanaona trading buttons tu.
+        Upgrade/Licence na My Stats zimefichwa mpaka signals zote zishe.
+      - Free users ambao signals zishe (au licensed): wanaona kila kitu.
     """
     lic = is_licensed(user_id) if user_id else False
+
+    # Amua kama kuonyesha Upgrade/Stats au la
+    show_upgrade_stats = True
+    if user_id and not lic:
+        used  = free_signals_used(user_id)
+        total = total_free_allowed(user_id)
+        if used < total:
+            show_upgrade_stats = False  # Bado ana signals — ficha upgrade/stats
+
     rows = [
         [InlineKeyboardButton("🌐 Global Scan  (All Pairs)", callback_data="global_scan")],
         [InlineKeyboardButton("📊 Select Pair", callback_data="choose_pair")],
         [InlineKeyboardButton("🎯 Multi Scan", callback_data="multi_scan_menu")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
     ]
-    if not lic:
+    if show_upgrade_stats:
+        rows.append([InlineKeyboardButton("📊 My Stats", callback_data="my_stats")])
+    if show_upgrade_stats and not lic:
         rows.append([InlineKeyboardButton("💎 Upgrade / Licence", callback_data="pay_info")])
     rows.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_inline")])
     return InlineKeyboardMarkup(rows)
@@ -9316,6 +9399,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🏆 Smart AI Signal Analysis\n"
             "📊 100+ Trading Pairs\n\n"
             "Choose how you want to get a signal:",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(user_id)
+        )
+        return
+
+    # v62: Broker selection callback
+    if data.startswith("broker_select_"):
+        broker_key = data[len("broker_select_"):]
+        # Get display name from BROKER_LIST
+        broker_name = broker_key.replace("_", " ").title()
+        for name, cb in BROKER_LIST:
+            if cb == broker_key:
+                broker_name = name
+                break
+        set_broker_selected(user_id, broker_key)
+        user  = get_user(user_id)
+        lic   = is_licensed(user_id)
+        plan  = user.get("licence_type", "").capitalize() if lic else "Free"
+        await q.edit_message_text(
+            "✅ *Broker selected: {}*\n\n"
+            "⚡ *EVALON WINNERS BOT*\n\n"
+            "👤 Plan: *{}*\n\n"
+            "Select how you want to trade:".format(broker_name, plan),
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(user_id)
         )
@@ -10708,11 +10814,11 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
         scan_msg = await bot.send_message(
             chat_id=chat,
             text=(
-                "🎯 *Multi Scan Started* — {} pairs\n\n"
-                "📡 Pairs: *{}*\n"
-                "⚡ Kila pair itascaniwa moja kwa moja\.\n\n"
-                "_Tap Stop to end the session\._"
-            ).format(n, ", ".join(pairs_to_scan).replace("/", "\/")),
+                "🎯 *Multi Scan Started*\n\n"
+                "📡 Scanning market continuously\\.\n"
+                "⚡ Every strong signal will be sent automatically\\.\n\n"
+                "_Tap Stop to end the session\\._"
+            ),
             parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
@@ -10723,6 +10829,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
 
     round_count     = 0
     signal_count    = 0
+    dot_tick        = 0   # v62: fast dot counter
     scan_wins_ref   = [0]
     scan_losses_ref = [0]
 
@@ -10766,12 +10873,15 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                 continue
 
             round_count += 1
-            anim = ["🎯", "📡", "🔍", "⚡"][round_count % 4]
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][round_count % 8]
 
             # ── SEQUENTIAL SCAN: pair moja kwa wakati ──────────────────────────
             for pair_idx, pair in enumerate(active_pairs):
                 if _is_cancelled():
                     break
+                dot_tick += 1
+                anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
+                _pemoji = PAIR_EMOJIS.get(pair, "📊")
 
                 # Update status message — inaonyesha pair inayoscaniwa sasa
                 try:
@@ -10779,14 +10889,10 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                         chat_id=chat,
                         message_id=scan_msg.message_id,
                         text=(
-                            "{} *Multi Scanning* — {}/{} pairs\n\n"
-                            "Round \#{} \| Signals: {}\n\n"
-                            "🔍 _Scanning: {}_"
-                        ).format(
-                            anim, pair_idx + 1, len(active_pairs),
-                            round_count, signal_count,
-                            pair.replace("/", "\/")
-                        ),
+                            "{} *Multi Scanning*\n\n"
+                            "🔍 *{}* {}\n\n"
+                            "_Analysing market\\.\\.\\._"
+                        ).format(anim, pair.replace("/", "\\/"), _pemoji),
                         parse_mode="MarkdownV2",
                         reply_markup=stop_kb
                     )
@@ -10936,7 +11042,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m only
     FIXED_TF       = 1
-    SCAN_INTERVAL  = 15
+    SCAN_INTERVAL  = 8   # v62: reduced from 15 for faster scanning
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
     COOLDOWN_SECS  = 0
@@ -10989,11 +11095,11 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
         scan_msg = await bot.send_message(
             chat_id=chat,
             text=(
-                "🔍 *Auto Scan Started* — {} {}\n\n"
+                "🔍 *Auto Scan Started*\n\n"
                 "📡 Scanning market continuously\\.\\.\\.\n"
                 "⚡ Every strong signal will be sent automatically\\.\n\n"
                 "_Tap Stop to end the session\\._"
-            ).format(pair, emoji),
+            ),
             parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
@@ -11004,6 +11110,7 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
 
     scan_count    = 0
     signal_count  = 0
+    dot_tick      = 0   # v62: fast-changing dot counter
     scan_wins_ref    = [0]  # list so it is mutable inside nested function
     scan_losses_ref  = [0]
 
@@ -11032,7 +11139,8 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                     continue
 
             scan_count += 1
-            anim = ["🔍", "🔎", "📡", "🔍"][scan_count % 4]
+            dot_tick   += 1
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
 
             # Block auto_scan if market is closed
             if is_market_closed():
@@ -11058,10 +11166,10 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "{} *Scanning* — {} {}\n\n"
-                        "Scan \\#{} \\| Signals: {}\n\n"
+                        "{} *Scanning*\n\n"
+                        "🔍 *{}* {}\n\n"
                         "_Analysing market\\.\\.\\._"
-                    ).format(anim, pair, emoji, scan_count, signal_count),
+                    ).format(anim, pair.replace("/", "\\/"), emoji),
                     parse_mode="MarkdownV2",
                     reply_markup=stop_kb
                 )
@@ -11343,7 +11451,7 @@ async def global_scan_and_send(bot, chat, user_id, context):
       2. Ubora: indicators_agree × strength × trend confirmation
       3. Pair moja tu inatumwa kila scan cycle
     """
-    SCAN_INTERVAL  = 15   # seconds between scans
+    SCAN_INTERVAL  = 8    # v62: reduced from 15 for faster scanning
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
     FIXED_TF       = 1
@@ -11372,11 +11480,11 @@ async def global_scan_and_send(bot, chat, user_id, context):
             chat_id=chat,
             text=(
                 "🌐 *Global Scan Started*\n\n"
-                "📡 Scanning *{}* pairs simultaneously\\.\n"
+                "📡 Scanning market continuously\\.\n"
                 "⚡ Best trend\\-follow signal will be sent automatically\\.\n\n"
                 "_Only trend\\-following signals \\(BUY with uptrend / SELL with downtrend\\)\\._\n\n"
                 "_Tap Stop to end the session\\._"
-            ).format(len(GLOBAL_SCAN_PAIRS)),
+            ),
             parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
@@ -11387,6 +11495,7 @@ async def global_scan_and_send(bot, chat, user_id, context):
 
     scan_count    = 0
     signal_count  = 0
+    dot_tick      = 0   # v62: fast dot counter
     scan_wins_ref   = [0]
     scan_losses_ref = [0]
 
@@ -11424,7 +11533,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
                     continue
 
             scan_count += 1
-            anim = ["🌐", "📡", "🔍", "⚡"][scan_count % 4]
+            dot_tick   += 1
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
 
             active_pairs = _get_active_pairs()
             if not active_pairs:
@@ -11450,10 +11560,9 @@ async def global_scan_and_send(bot, chat, user_id, context):
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "{} *Global Scanning* — {} pairs\n\n"
-                        "Scan \\#{} \\| Signals sent: {}\n\n"
+                        "{} *Global Scanning*\n\n"
                         "_Analysing all pairs\\.\\.\\. picking best trend signal\\._"
-                    ).format(anim, len(active_pairs), scan_count, signal_count),
+                    ).format(anim),
                     parse_mode="MarkdownV2",
                     reply_markup=stop_kb
                 )
@@ -11465,6 +11574,22 @@ async def global_scan_and_send(bot, chat, user_id, context):
             for _sp in active_pairs:
                 if _is_cancelled():
                     break
+                try:
+                    dot_tick += 1
+                    anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
+                    _pemoji = PAIR_EMOJIS.get(_sp, "📊")
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "{} *Global Scanning*\n\n"
+                            "🔍 *{}* {}\n\n"
+                            "_Analysing all pairs\\.\\.\\. picking best trend signal\\._"
+                        ).format(anim, _sp.replace("/", "\\/"), _pemoji),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
                 try:
                     _sr = await safe_generate_signal_cached(_sp)
                     results.append((_sp, _sr))
@@ -12402,6 +12527,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lic   = is_licensed(user_id)
         plan  = user.get("licence_type", "").capitalize() if lic else "Free"
 
+        # v62: User mpya — mpe broker selection mara ya kwanza tu
+        if not get_broker_selected(user_id):
+            await update.message.reply_text(
+                "⚡ *EVALON WINNERS BOT*\n\n"
+                "👋 Welcome! Before you start trading, please select your binary broker:\n\n"
+                "🏦 *Choose your broker:*\n"
+                "_This helps the bot optimize signals for your platform._",
+                parse_mode="Markdown",
+                reply_markup=broker_selection_keyboard()
+            )
+            return
+
         await update.message.reply_text(
             "⚡ *EVALON WINNERS BOT*\n\n"
             "👤 Plan: *{}*\n\n"
@@ -12899,7 +13036,7 @@ async def signal_prefetch_engine():
 
         except Exception as e:
             logging.warning("signal_prefetch_engine error: {}".format(e))
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)  # v62: reduced from 5 for faster cache refresh
 
 async def safe_generate_signal_cached(pair: str) -> tuple:
     """
