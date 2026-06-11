@@ -10954,9 +10954,14 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
     MIN_INDICATORS = 4
     MIN_STRENGTH   = 120
     FIXED_TF       = 1
+    PAIR_DELAY     = 20  # v65-fix: was undefined (NameError bug)
 
     uid = int(user_id)
     n   = len(pairs_to_scan)
+
+    # v65-fix: mark all pairs active so prefetch engine fetches them
+    for _p in pairs_to_scan:
+        mark_pair_active(_p)
 
     cancel_ev = asyncio.Event()
     _ACTIVE_SCANS[uid] = cancel_ev
@@ -11630,6 +11635,10 @@ async def global_scan_and_send(bot, chat, user_id, context):
     COOLDOWN_SECS  = 0   # no cooldown after signal
 
     uid = int(user_id)
+
+    # v65-fix: mark all global pairs active so prefetch engine fetches them
+    for _p in GLOBAL_SCAN_PAIRS:
+        mark_pair_active(_p)
 
     cancel_ev = asyncio.Event()
     _ACTIVE_SCANS[uid] = cancel_ev
@@ -13177,6 +13186,11 @@ def get_prefetched_signal(pair: str):
     return entry["sig"]
 
 def set_prefetched_signal(pair: str, sig: dict):
+    # v65-fix: usihifadhi signal ya flat/zero — itafetch upya scan inayofuata
+    if sig is None:
+        return
+    if sig.get("flat", False) or sig.get("indicators_agree", 0) == 0 or sig.get("strength", 0) == 0:
+        return
     _signal_prefetch_cache[pair] = {"sig": sig, "ts": time.time()}
 
 async def signal_prefetch_engine():
