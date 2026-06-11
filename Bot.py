@@ -2089,18 +2089,29 @@ def free_signals_used(user_id):
 
 # ── v62: Broker selection helpers ──────────────────────────────────────────
 BROKER_LIST = [
-    ("Quotex",        "quotex"),
-    ("Pocket Option", "pocket_option"),
-    ("IQ Option",     "iq_option"),
-    ("Binomo",        "binomo"),
-    ("Olymp Trade",   "olymp_trade"),
-    ("Deriv",         "deriv"),
-    ("ExpertOption",  "expertoption"),
-    ("Raceoption",    "raceoption"),
-    ("Binarycent",    "binarycent"),
-    ("Bullex",        "bullex"),
-    ("Finmax",        "finmax"),
-    ("BinaryCom",     "binarycom"),
+    # ⭐ TIER 1 — Maarufu sana
+    ("⭐ Quotex",          "quotex"),
+    ("⭐ Pocket Option",   "pocket_option"),
+    ("⭐ IQ Option",       "iq_option"),
+    ("⭐ Binolla",         "binolla"),
+    ("⭐ Olymp Trade",     "olymp_trade"),
+    ("⭐ Deriv",           "deriv"),
+    # 🔥 TIER 2 — Maarufu
+    ("🔥 Binomo",          "binomo"),
+    ("🔥 ExpertOption",    "expertoption"),
+    ("🔥 IQCent",          "iqcent"),
+    ("🔥 Raceoption",      "raceoption"),
+    ("🔥 Binarycent",      "binarycent"),
+    ("🔥 Videforex",       "videforex"),
+    ("🔥 Binarymate",      "binarymate"),
+    # 💼 TIER 3 — Zingine
+    ("💼 Bullex",          "bullex"),
+    ("💼 Finmax",          "finmax"),
+    ("💼 BinaryCom",       "binarycom"),
+    ("💼 Capitalcore",     "capitalcore"),
+    ("💼 Nadex",           "nadex"),
+    ("💼 Binaryx",         "binaryx"),
+    ("💼 Spectre",         "spectre"),
 ]
 
 def get_broker_selected(user_id):
@@ -2118,10 +2129,13 @@ def set_broker_selected(user_id, broker):
         conn.commit()
 
 def broker_selection_keyboard():
-    """Build inline keyboard for broker selection."""
+    """Build inline keyboard for broker selection — 2 per row."""
     rows = []
-    for name, cb in BROKER_LIST:
-        rows.append([InlineKeyboardButton(name, callback_data="broker_select_{}".format(cb))])
+    buttons = [InlineKeyboardButton(name, callback_data="broker_select_{}".format(cb))
+               for name, cb in BROKER_LIST]
+    # Pack 2 per row
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i+2])
     return InlineKeyboardMarkup(rows)
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -7700,7 +7714,7 @@ def _confluence_quality_gate(
         score -= 5
 
     score = max(0, min(100, score))
-    gate_pass = score >= 55   # v58: threshold raised from 40 → 55 (strong signals only)
+    gate_pass = score >= 42   # v62: lowered from 55 → 42 for more signals
 
     reason_str = "cq={} [{}]".format(score, ",".join(reasons[:4]) if reasons else "none")
     logging.info("CONFLUENCE_GATE {}: dir={} score={} pass={}".format(
@@ -8353,7 +8367,7 @@ def generate_signal(pair):
         if mtf_dir != trend_1h:
             direction = "BUY" if b > s else "SELL"
 
-    min_confluence = 6 if not is_otc else 4   # v58: raised non-OTC 4→6, OTC 3→4
+    min_confluence = 4 if not is_otc else 3   # v62: lowered non-OTC 6→4, OTC 4→3
     if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
@@ -8489,7 +8503,7 @@ def generate_signal(pair):
             {k: round(v, 1) for k, v in _micro_scores.items()}
         ))
 
-    if not is_otc and is_filter_on("confluence") and indicators_agree < 5 and vte_tf is None and timeframe > 0:
+    if not is_otc and is_filter_on("confluence") and indicators_agree < 4 and vte_tf is None and timeframe > 0:
         if trend_1h is not None:
             direction = trend_1h  # Fuata 1H - si kupingana nayo
         elif not yahoo_available:
@@ -10787,8 +10801,8 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
       - RAM inatumika x1 tu (si x6) → hakuna OOM
       - Round moja (pairs zote) inaisha ndani ya sekunde ~30-60 → inaanza tena
     """
-    MIN_INDICATORS = 5
-    MIN_STRENGTH   = 150
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
     FIXED_TF       = 1
 
     uid = int(user_id)
@@ -11043,8 +11057,8 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m only
     FIXED_TF       = 1
     SCAN_INTERVAL  = 8   # v62: reduced from 15 for faster scanning
-    MIN_INDICATORS = 5
-    MIN_STRENGTH   = 150
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
     COOLDOWN_SECS  = 0
 
     # Fix #1: Tumia int(user_id) consistently
@@ -11452,8 +11466,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
       3. Pair moja tu inatumwa kila scan cycle
     """
     SCAN_INTERVAL  = 8    # v62: reduced from 15 for faster scanning
-    MIN_INDICATORS = 5
-    MIN_STRENGTH   = 150
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
     FIXED_TF       = 1
     COOLDOWN_SECS  = 0   # no cooldown after signal
 
