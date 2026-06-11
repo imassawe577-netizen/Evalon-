@@ -7753,7 +7753,7 @@ def generate_signal(pair):
                     logging.warning("nonOTC {} fetch attempt {}: {}".format(pair, _attempt, _re))
 
                 logging.info("nonOTC {} attempt {}: no data yet — retrying in 1s".format(pair, _attempt))
-                await asyncio.sleep(1)  # async sleep — haiblock thread nyingine
+                _t.sleep(1)
 
             # Data haikupatikana baada ya attempts 3 — rudisha flat (ruka pair hii)
             if _real_retry is None:
