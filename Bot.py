@@ -1371,6 +1371,12 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_tfr_pair ON trend_fingerprint_results (pair, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tfr_rsi ON trend_fingerprint_results (pair, rsi, bb_pos);
+
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id BIGINT PRIMARY KEY,
+                    timezone TEXT DEFAULT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
             """)
 
         conn.commit()
@@ -7088,7 +7094,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "_rescued": True,
     }
 
-_SIGNAL_TIMEOUT = 18  # seconds - increased: yfinance+finnhub fallback inachukua muda zaidi
+_SIGNAL_TIMEOUT = 30  # seconds - loop ya nonOTC inaweza kuchukua muda zaidi
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
@@ -7746,8 +7752,8 @@ def generate_signal(pair):
                 except Exception as _re:
                     logging.warning("nonOTC {} fetch attempt {}: {}".format(pair, _attempt, _re))
 
-                logging.info("nonOTC {} attempt {}: no data yet — retrying in 5s".format(pair, _attempt))
-                _t.sleep(5)
+                logging.info("nonOTC {} attempt {}: no data yet — retrying in 1s".format(pair, _attempt))
+                _t.sleep(1)
 
             # Data available (Deriv or Yahoo/Finnhub) — proceed with real indicators
             rsi     = _real_retry["rsi"]
@@ -13667,27 +13673,7 @@ async def run_bot():
         await asyncio.sleep(60)
 
 def main():
-    import threading
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    PORT = int(os.environ.get("PORT", 8080))
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"EVALON WINNERS BOT OK")
-        def log_message(self, *args):
-            pass
-
-    def start_health_server():
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        server.serve_forever()
-
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
-    print("Port {} open. Starting bot...".format(PORT))
-
+    # HTTP health server tayari imeanza mwanzo wa faili (module level).
     print("EVALON WINNERS BOT starting...")
     init_db()
     print("Database ready.")
