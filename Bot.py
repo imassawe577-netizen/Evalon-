@@ -181,7 +181,7 @@ from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler as _Ba
 class _H(_BaseHandler):
     def do_GET(self):
         if self.path == "/health":
-            body = b'{"status":"ok","version":"3.10","bot":"EVALON WINNERS BOT v59"}' 
+            body = b'{"status":"ok","version":"3.10","bot":"EVALON WINNERS BOT v65"}' 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -3541,6 +3541,15 @@ _YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
 _YF_CACHE_TTL = 60      # v63: 60s — entry per 1m candle, cache > 1 candle = stale data
 _YF_CACHE_LOCK = _threading.Lock()
 
+# v65: Failure blacklists — avoid hammering dead sources repeatedly
+# Key: (symbol, interval) → timestamp of last failure
+# If failure < _YF_FAIL_TTL seconds ago, skip that source entirely
+_YF_FAIL_CACHE  = {}   # yfinance failures
+_FH_FAIL_CACHE  = {}   # Finnhub failures
+_SRC_FAIL_LOCK  = _threading.Lock()
+_YF_FAIL_TTL    = 300  # 5 minutes: skip yfinance for this symbol+interval if it just failed
+_FH_FAIL_TTL    = 180  # 3 minutes: skip Finnhub for this symbol+interval if it just failed
+
 # ── TwelveData rate limiter — max 7 req/min (free tier = 8, leave 1 buffer) ──
 _TD_REQ_TIMES  = []          # timestamps of recent TD requests
 _TD_REQ_LOCK   = _threading.Lock()
@@ -3690,14 +3699,22 @@ def _td_candles_as_df(symbol, interval, outputsize=200):
 
 def _yf_download_cached(symbol, period, interval):
     """
-    v64: Data source priority (restored to v54 order):
-      1. Cache (dakika 2) — haraka zaidi
-      2. yfinance — primary
-      3. Finnhub — fallback (yfinance ikishindwa)
-      4. Twelve Data — last resort (hifadhi rate-limit credits)
+    v65: Data source priority with failure blacklists:
+      1. Cache (60s) — fastest
+      2. yfinance — primary (skipped if recently failed for this symbol+interval)
+      3. Finnhub — fallback (skipped if recently failed for this symbol+interval)
+      4. Twelve Data — last resort (only called once per symbol, not per TF retry)
+
+    v65 change: failure blacklists (_YF_FAIL_CACHE, _FH_FAIL_CACHE) prevent
+    hammering dead sources on every scan cycle. A source that just failed for
+    symbol+interval is skipped for _YF_FAIL_TTL / _FH_FAIL_TTL seconds.
+    This prevents the yfinance→Finnhub→TwelveData rate-limit spam seen in logs.
     """
     key = (symbol, period, interval)
+    fail_key = (symbol, interval)  # blacklist key (period-agnostic per symbol+TF)
     now = time.time()
+
+    # ── 0. Cache hit ──────────────────────────────────────────────────────────
     with _YF_CACHE_LOCK:
         if key in _YF_CACHE:
             ts, df = _YF_CACHE[key]
@@ -3707,65 +3724,101 @@ def _yf_download_cached(symbol, period, interval):
     df = None
 
     # ── 1. yfinance (primary) ─────────────────────────────────────────────────
-    try:
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df is None or len(df) < 5:
+    _yf_recently_failed = False
+    with _SRC_FAIL_LOCK:
+        _ft = _YF_FAIL_CACHE.get(fail_key, 0)
+        if now - _ft < _YF_FAIL_TTL:
+            _yf_recently_failed = True
+
+    if not _yf_recently_failed:
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            if df is None or len(df) < 5:
+                df = None
+                with _SRC_FAIL_LOCK:
+                    _YF_FAIL_CACHE[fail_key] = now
+            else:
+                logging.info("yfinance OK (primary): {} {} {}".format(
+                    symbol, period, interval))
+        except Exception as _ye:
+            logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
+                symbol, period, interval, _ye))
             df = None
-        else:
-            logging.info("yfinance OK (primary): {} {} {}".format(
-                symbol, period, interval))
-    except Exception as _ye:
-        logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
-            symbol, period, interval, _ye))
-        df = None
+            with _SRC_FAIL_LOCK:
+                _YF_FAIL_CACHE[fail_key] = now
+    else:
+        logging.info("yfinance SKIP (blacklisted {}s) {} {}".format(
+            int(_YF_FAIL_TTL), symbol, interval))
 
     # ── 2. Finnhub (fallback) ─────────────────────────────────────────────────
     if df is None:
-        _fh_sym = None
-        try:
-            _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
-            if _pair_name2:
-                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
-        except Exception:
-            pass
+        _fh_recently_failed = False
+        with _SRC_FAIL_LOCK:
+            _fft = _FH_FAIL_CACHE.get(fail_key, 0)
+            if now - _fft < _FH_FAIL_TTL:
+                _fh_recently_failed = True
 
-        if _fh_sym and FINNHUB_KEY:
-            _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
-            _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
-            df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
-            if df is not None and len(df) >= 5:
-                logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
-                    symbol, period, interval, len(df)))
-            else:
-                df = None
-                logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
-                    symbol, period, interval))
+        if not _fh_recently_failed:
+            _fh_sym = None
+            try:
+                _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
+                if _pair_name2:
+                    _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
+            except Exception:
+                pass
 
-    # ── 3. Twelve Data (last resort — hifadhi rate-limit) ────────────────────
-    if df is None and TWELVE_DATA_KEY:
-        try:
-            _pair_name = _YF_SYM_TO_PAIR.get(symbol)
-            _td_sym    = None
-
-            if _pair_name and "/" in _pair_name:
-                _td_sym = _pair_name
-            elif symbol in _TD_INDEX_SYMBOLS:
-                _td_sym = _TD_INDEX_SYMBOLS[symbol]
-
-            if _td_sym:
-                _td_interval = _YF_TO_TD_INTERVAL.get(interval, "5min")
-                _td_outsize  = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
-                df = _td_candles_as_df(_td_sym, _td_interval, _td_outsize)
-                if df is not None and len(df) < 5:
-                    df = None
-                elif df is not None:
-                    logging.info("FALLBACK→TD: {} {} {} OK ({} rows)".format(
+            if _fh_sym and FINNHUB_KEY:
+                _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
+                _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
+                df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
+                if df is not None and len(df) >= 5:
+                    logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
                         symbol, period, interval, len(df)))
-        except Exception as _tde:
-            logging.warning("TwelveData fetch failed ({} {} {}): {}".format(
-                symbol, period, interval, _tde))
-            df = None
+                else:
+                    df = None
+                    logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
+                        symbol, period, interval))
+                    with _SRC_FAIL_LOCK:
+                        _FH_FAIL_CACHE[fail_key] = now
+            elif not FINNHUB_KEY:
+                # No Finnhub key — mark as failed immediately to skip next time
+                with _SRC_FAIL_LOCK:
+                    _FH_FAIL_CACHE[fail_key] = now
+        else:
+            logging.info("Finnhub SKIP (blacklisted {}s) {} {}".format(
+                int(_FH_FAIL_TTL), symbol, interval))
+
+    # ── 3. Twelve Data (last resort — hifadhi rate-limit credits) ─────────────
+    # Only attempt TD if BOTH yfinance AND Finnhub have failed/are blacklisted.
+    # This prevents using TD credits on transient yfinance errors.
+    if df is None and TWELVE_DATA_KEY:
+        _yf_bl = now - _YF_FAIL_CACHE.get(fail_key, 0) < _YF_FAIL_TTL
+        _fh_bl = now - _FH_FAIL_CACHE.get(fail_key, 0) < _FH_FAIL_TTL
+        if _yf_bl or _fh_bl or _yf_recently_failed:
+            # At least one primary source confirmed failed — TD is justified
+            try:
+                _pair_name = _YF_SYM_TO_PAIR.get(symbol)
+                _td_sym    = None
+
+                if _pair_name and "/" in _pair_name:
+                    _td_sym = _pair_name
+                elif symbol in _TD_INDEX_SYMBOLS:
+                    _td_sym = _TD_INDEX_SYMBOLS[symbol]
+
+                if _td_sym:
+                    _td_interval = _YF_TO_TD_INTERVAL.get(interval, "5min")
+                    _td_outsize  = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
+                    df = _td_candles_as_df(_td_sym, _td_interval, _td_outsize)
+                    if df is not None and len(df) < 5:
+                        df = None
+                    elif df is not None:
+                        logging.info("FALLBACK→TD: {} {} {} OK ({} rows)".format(
+                            symbol, period, interval, len(df)))
+            except Exception as _tde:
+                logging.warning("TwelveData fetch failed ({} {} {}): {}".format(
+                    symbol, period, interval, _tde))
+                df = None
 
     if df is not None and len(df) > 0:
         with _YF_CACHE_LOCK:
