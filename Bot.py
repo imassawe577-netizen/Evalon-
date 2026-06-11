@@ -3538,8 +3538,25 @@ def _calc_indicators_from_df(df):
 
 import threading as _threading
 _YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
-_YF_CACHE_TTL = 120     # sekunde 2 dakika
+_YF_CACHE_TTL = 60      # v63: 60s — entry per 1m candle, cache > 1 candle = stale data
 _YF_CACHE_LOCK = _threading.Lock()
+
+# ── TwelveData rate limiter — max 7 req/min (free tier = 8, leave 1 buffer) ──
+_TD_REQ_TIMES  = []          # timestamps of recent TD requests
+_TD_REQ_LOCK   = _threading.Lock()
+_TD_MAX_PER_MIN = 7
+
+def _td_can_request():
+    """Returns True if we can make a TwelveData request without hitting rate limit."""
+    now = time.time()
+    with _TD_REQ_LOCK:
+        # Drop timestamps older than 60s
+        while _TD_REQ_TIMES and now - _TD_REQ_TIMES[0] > 60:
+            _TD_REQ_TIMES.pop(0)
+        if len(_TD_REQ_TIMES) >= _TD_MAX_PER_MIN:
+            return False
+        _TD_REQ_TIMES.append(now)
+        return True
 
 _YF_TO_FH_RESOLUTION = {
     "1m": "1", "2m": "1", "5m": "5", "15m": "15",
@@ -3628,6 +3645,9 @@ def _td_candles_as_df(symbol, interval, outputsize=200):
     Free tier: 800 credits/siku, 8 requests/dakika.
     """
     if not TWELVE_DATA_KEY:
+        return None
+    if not _td_can_request():
+        logging.warning("TwelveData rate limit — skipping request for {}".format(symbol))
         return None
     try:
         # Twelve Data forex inatumia EUR/USD format moja kwa moja
@@ -7311,7 +7331,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "_rescued": True,
     }
 
-_SIGNAL_TIMEOUT = 20  # v63: parallel fetch max ~12s + processing ~5s
+_SIGNAL_TIMEOUT = 25  # v63: sequential fetch, cache-first — 25s ni ya kutosha
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
@@ -7768,40 +7788,34 @@ def generate_signal(pair):
                 "no_signal_reason": "⚠️ High-impact news in {} - signal paused for safety.".format(_news_name),
             }
 
-    # ── v63: Parallel fetch — all data sources run simultaneously ──────────
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
-    _fetch_results = {}
-
-    def _safe_fetch(name, fn, arg):
-        try:
-            return name, fn(arg)
-        except Exception as _e:
-            logging.warning("generate_signal {} failed {}: {}".format(name, arg, _e))
-            return name, None
-
-    _ftasks = [
-        ("trend_1h",  _fetch_1h_trend,  pair),
-        ("vwap_data", _fetch_vwap_trend, pair),
-        ("mtf",       _fetch_mtf_score,  pair),
-    ]
+    # ── Sequential fetch (cache-first — avoids TwelveData 429 rate limit) ─
     if not is_otc:
-        _ftasks.append(("real", _fetch_real_indicators_mtf, pair))
+        try:
+            real = _fetch_real_indicators_mtf(pair)
+            if real is None:
+                yahoo_available = False
+        except Exception as e:
+            logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
+            real = None
+            yahoo_available = False
 
-    with ThreadPoolExecutor(max_workers=4) as _pool:
-        _futs = {_pool.submit(_safe_fetch, n, fn, p): n for n, fn, p in _ftasks}
-        for _fut in _asc(_futs, timeout=12):
-            try:
-                _n, _v = _fut.result()
-                _fetch_results[_n] = _v
-            except Exception:
-                pass
+    trend_1h = None
+    try:
+        trend_1h = _fetch_1h_trend(pair)
+    except Exception as e:
+        logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
 
-    real      = _fetch_results.get("real", None)
-    trend_1h  = _fetch_results.get("trend_1h", None)
-    vwap_data = _fetch_results.get("vwap_data", None)
-    mtf       = _fetch_results.get("mtf", None)
-    if not is_otc and real is None:
-        yahoo_available = False
+    vwap_data = None
+    try:
+        vwap_data = _fetch_vwap_trend(pair)
+    except Exception as e:
+        logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
+
+    mtf = None
+    try:
+        mtf = _fetch_mtf_score(pair)
+    except Exception as e:
+        logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
     # ────────────────────────────────────────────────────────────────────────
 
     pattern_buy_bonus = 0
