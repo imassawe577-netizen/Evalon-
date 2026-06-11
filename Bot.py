@@ -2128,6 +2128,17 @@ def set_broker_selected(user_id, broker):
             )
         conn.commit()
 
+_BROKER_KEY_TO_NAME = {cb: name for name, cb in BROKER_LIST}
+
+def get_broker_display(user_id):
+    """Returns formatted broker line for signal captions, e.g. '🏦 Broker: ⭐ Pocket Option'
+    Returns empty string if no broker selected."""
+    key = get_broker_selected(user_id)
+    if not key:
+        return ""
+    name = _BROKER_KEY_TO_NAME.get(key, key.replace("_", " ").title())
+    return "🏦 Broker: {}".format(name)
+
 def broker_selection_keyboard():
     """Build inline keyboard for broker selection — 2 per row."""
     rows = []
@@ -3449,9 +3460,9 @@ def _calc_indicators_from_df(df):
     v57_total      = v57_buy_score + v57_sell_score
     v57_direction  = None
     if v57_total > 0:
-        if v57_buy_score / v57_total >= 0.65:
+        if v57_buy_score / v57_total >= 0.60:   # v63: restored to v57 level (was 0.65 — too strict)
             v57_direction = "BUY"
-        elif v57_sell_score / v57_total >= 0.65:
+        elif v57_sell_score / v57_total >= 0.60:
             v57_direction = "SELL"
     # ── end v57 indicators ────────────────────────────────────────────────────
 
@@ -6222,8 +6233,10 @@ async def _send_nonotc_signal(context, chat, user_id, pair, direction, timeframe
     elif isinstance(strength, int) and strength < 90:
         strength = int(90 + (max(35, min(97, strength)) - 35) / 62 * 360)
     strength = max(90, min(450, int(strength)))
-    caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%".format(
-        pair, arrow, timeframe, strength)
+    _broker_line = get_broker_display(user_id)
+    caption  = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%{}".format(
+        pair, arrow, timeframe, strength,
+        "\n" + _broker_line if _broker_line else "")
     kb  = nonotc_signal_keyboard(pair, timeframe)
     img = get_buy_image() if ib else get_sell_image()
     try:
@@ -7298,7 +7311,7 @@ def _rescue_nonOTC_signal(pair: str) -> dict | None:
         "_rescued": True,
     }
 
-_SIGNAL_TIMEOUT = 15  # v62: reduced from 30 — faster fallback on slow data
+_SIGNAL_TIMEOUT = 20  # v63: parallel fetch max ~12s + processing ~5s
 
 async def animated_analyzing(bot, chat_id, pair: str):
     """
@@ -7637,14 +7650,27 @@ def _confluence_quality_gate(
     elif fd is not None and fd != direction:
         score -= 7   # v58: larger penalty (was -5)
 
-    # 6b. SuperTrend (max 18pts v58: was 12, penalty -12 v58: was -8)
-    _st_cq = real.get("supertrend_direction")
-    if _st_cq == direction:
-        score += 18
-        reasons.append("ST_{}".format(direction))
-    elif _st_cq is not None and _st_cq != direction:
-        score -= 12
-        reasons.append("ST_against")
+    # 6b. SuperTrend — v63: scaled by distance (trend strength)
+    # Weak trend (small distance) = small bonus; Strong trend (large distance) = max bonus
+    _st_cq     = real.get("supertrend_direction")
+    _st_cq_val = real.get("supertrend_val")
+    if _st_cq is not None:
+        _st_cq_bonus = 0
+        try:
+            _st_cq_price = real.get("current_price") or float(_st_cq_val or 0)
+            _st_cq_dist  = abs(_st_cq_price - float(_st_cq_val or _st_cq_price)) / (abs(float(_st_cq_val or _st_cq_price)) + 1e-9) * 100
+            if _st_cq_dist >= 0.20:   _st_cq_bonus = 25
+            elif _st_cq_dist >= 0.10: _st_cq_bonus = 15 + int((_st_cq_dist - 0.10) / 0.10 * 10)
+            elif _st_cq_dist >= 0.05: _st_cq_bonus = 8  + int((_st_cq_dist - 0.05) / 0.05 * 7)
+            else:                     _st_cq_bonus = int(_st_cq_dist / 0.05 * 8)
+        except Exception:
+            _st_cq_bonus = 12  # fallback
+        if _st_cq == direction:
+            score += _st_cq_bonus
+            reasons.append("ST_{}+{}".format(direction, _st_cq_bonus))
+        else:
+            score -= 14   # opposing strong trend = hard penalty
+            reasons.append("ST_against")
 
     # 6c. v57 Weighted Vote (max 20pts v58: was 15) — consensus of 21 indicators
     _v57_b = real.get("v57_buy_score", 0)
@@ -7714,7 +7740,7 @@ def _confluence_quality_gate(
         score -= 5
 
     score = max(0, min(100, score))
-    gate_pass = score >= 42   # v62: lowered from 55 → 42 for more signals
+    gate_pass = score >= 40   # v63: restored to v57 level
 
     reason_str = "cq={} [{}]".format(score, ",".join(reasons[:4]) if reasons else "none")
     logging.info("CONFLUENCE_GATE {}: dir={} score={} pass={}".format(
@@ -7742,33 +7768,41 @@ def generate_signal(pair):
                 "no_signal_reason": "⚠️ High-impact news in {} - signal paused for safety.".format(_news_name),
             }
 
-    if not is_otc:
+    # ── v63: Parallel fetch — all data sources run simultaneously ──────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
+    _fetch_results = {}
+
+    def _safe_fetch(name, fn, arg):
         try:
-            real = _fetch_real_indicators_mtf(pair)
-            if real is None:
-                yahoo_available = False
-        except Exception as e:
-            logging.warning("generate_signal real fetch failed {}: {}".format(pair, e))
-            real = None
-            yahoo_available = False
+            return name, fn(arg)
+        except Exception as _e:
+            logging.warning("generate_signal {} failed {}: {}".format(name, arg, _e))
+            return name, None
 
-    trend_1h = None
-    try:
-        trend_1h = _fetch_1h_trend(pair)
-    except Exception as e:
-        logging.warning("generate_signal 1H trend failed {}: {}".format(pair, e))
+    _ftasks = [
+        ("trend_1h",  _fetch_1h_trend,  pair),
+        ("vwap_data", _fetch_vwap_trend, pair),
+        ("mtf",       _fetch_mtf_score,  pair),
+    ]
+    if not is_otc:
+        _ftasks.append(("real", _fetch_real_indicators_mtf, pair))
 
-    vwap_data = None
-    try:
-        vwap_data = _fetch_vwap_trend(pair)
-    except Exception as e:
-        logging.warning("generate_signal vwap failed {}: {}".format(pair, e))
+    with ThreadPoolExecutor(max_workers=4) as _pool:
+        _futs = {_pool.submit(_safe_fetch, n, fn, p): n for n, fn, p in _ftasks}
+        for _fut in _asc(_futs, timeout=12):
+            try:
+                _n, _v = _fut.result()
+                _fetch_results[_n] = _v
+            except Exception:
+                pass
 
-    mtf = None
-    try:
-        mtf = _fetch_mtf_score(pair)
-    except Exception as e:
-        logging.warning("generate_signal mtf failed {}: {}".format(pair, e))
+    real      = _fetch_results.get("real", None)
+    trend_1h  = _fetch_results.get("trend_1h", None)
+    vwap_data = _fetch_results.get("vwap_data", None)
+    mtf       = _fetch_results.get("mtf", None)
+    if not is_otc and real is None:
+        yahoo_available = False
+    # ────────────────────────────────────────────────────────────────────────
 
     pattern_buy_bonus = 0
     pattern_sell_bonus = 0
@@ -8140,12 +8174,33 @@ def generate_signal(pair):
             s -= 8
             logging.info("v56 INDECISION_CANDLE {}: b/s penalised -8".format(pair))
 
-        # SuperTrend bonus (+25 v58: was +18 - very strong trend filter)
+        # SuperTrend bonus — v63: scaled by trend strength (distance from ST line)
+        # Small distance = weak/new trend = small bonus
+        # Large distance = strong established trend = large bonus
         _st_dir = _v56_real.get("supertrend_direction")
-        if _st_dir == "BUY":
-            b += 25
-        elif _st_dir == "SELL":
-            s += 25
+        _st_val = _v56_real.get("supertrend_val")
+        _st_bonus = 0
+        if _st_dir is not None and _st_val is not None:
+            try:
+                _cur_p = _v56_real.get("current_price") or float(_st_val)
+                _st_dist_pct = abs(_cur_p - float(_st_val)) / (float(_st_val) + 1e-9) * 100
+                # Scale: 0.05% → 10pts, 0.10% → 20pts, 0.20%+ → 35pts (max)
+                if _st_dist_pct >= 0.20:
+                    _st_bonus = 35
+                elif _st_dist_pct >= 0.10:
+                    _st_bonus = 20 + int((_st_dist_pct - 0.10) / 0.10 * 15)
+                elif _st_dist_pct >= 0.05:
+                    _st_bonus = 10 + int((_st_dist_pct - 0.05) / 0.05 * 10)
+                else:
+                    _st_bonus = int(_st_dist_pct / 0.05 * 10)  # 0–10 for tiny distance
+            except Exception:
+                _st_bonus = 15  # fallback if no price
+            if _st_dir == "BUY":
+                b += _st_bonus
+                logging.info("ST {}: BUY +{} (dist={:.4f}%)".format(pair, _st_bonus, _st_dist_pct if '_st_dist_pct' in dir() else 0))
+            elif _st_dir == "SELL":
+                s += _st_bonus
+                logging.info("ST {}: SELL +{} (dist={:.4f}%)".format(pair, _st_bonus, _st_dist_pct if '_st_dist_pct' in dir() else 0))
 
         # ── v57: Weighted indicator vote bonus ─────────────────────────────
         _v57_buy  = _v56_real.get("v57_buy_score",  0)
@@ -8356,11 +8411,24 @@ def generate_signal(pair):
             indicators_agree += 1 + min(2, _zz_ia_str)  # +1 weak, +2 moderate, +3 strong
         elif _zz_ia is not None and _zz_ia != direction:
             indicators_agree = max(0, indicators_agree - 2)  # ZigZag inapinga = penalize zaidi
-        # SuperTrend alignment (+2 if agrees — strong trend)
-        if _v56_real.get("supertrend_direction") == direction:
-            indicators_agree += 2
-        elif _v56_real.get("supertrend_direction") is not None and _v56_real.get("supertrend_direction") != direction:
-            indicators_agree = max(0, indicators_agree - 2)
+        # SuperTrend alignment — v63: scaled by trend strength
+        # Strong trend (large distance) = +3, moderate = +2, weak = +1
+        _st_ia_dir = _v56_real.get("supertrend_direction")
+        _st_ia_val = _v56_real.get("supertrend_val")
+        if _st_ia_dir is not None:
+            _st_ia_add = 1  # default weak
+            try:
+                _st_ia_p = _v56_real.get("current_price") or float(_st_ia_val or 0)
+                _st_ia_d = abs(_st_ia_p - float(_st_ia_val or _st_ia_p)) / (abs(float(_st_ia_val or _st_ia_p)) + 1e-9) * 100
+                if _st_ia_d >= 0.20:   _st_ia_add = 3   # strong trend
+                elif _st_ia_d >= 0.08: _st_ia_add = 2   # moderate
+                else:                  _st_ia_add = 1   # weak/new
+            except Exception:
+                _st_ia_add = 2
+            if _st_ia_dir == direction:
+                indicators_agree += _st_ia_add
+            else:
+                indicators_agree = max(0, indicators_agree - _st_ia_add)
 
     if mtf and trend_1h and mtf["total"] >= 3:
         mtf_dir = "BUY" if mtf["buy_tfs"] > mtf["sell_tfs"] else "SELL"
@@ -9408,11 +9476,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.warning("restart_fresh clear state failed: {}".format(e))
         inactivity_clear(user_id)
+        _rb = get_broker_display(user_id)
         await q.edit_message_text(
             "⚡ *EVALON WINNERS BOT*\n\n"
             "🏆 Smart AI Signal Analysis\n"
             "📊 100+ Trading Pairs\n\n"
-            "Choose how you want to get a signal:",
+            "{}"
+            "Choose how you want to get a signal:".format(
+                (_rb + "\n\n") if _rb else ""
+            ),
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(user_id)
         )
@@ -9434,8 +9506,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "✅ *Broker selected: {}*\n\n"
             "⚡ *EVALON WINNERS BOT*\n\n"
-            "👤 Plan: *{}*\n\n"
-            "Select how you want to trade:".format(broker_name, plan),
+            "👤 Plan: *{}*\n"
+            "🏦 Broker: {}\n\n"
+            "Select how you want to trade:".format(broker_name, plan, broker_name),
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(user_id)
         )
@@ -9891,8 +9964,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In {} min.\n📊 Signal strength: {}%\n🧠 AI Consensus: {} indicators".format(
-            pair, arrow, timeframe, strength, ind_agree if 'ind_agree' in dir() else "✓")
+        _bline = get_broker_display(user_id)
+        cap = "*{}* {}\n🕐 In {} min.\n📊 Signal strength: {}%\n🧠 AI Consensus: {} indicators{}".format(
+            pair, arrow, timeframe, strength, ind_agree if 'ind_agree' in dir() else "✓",
+            "\n" + _bline if _bline else "")
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
         inactivity_reset(user_id, chat, msg_id=sent_msg.message_id)
@@ -10125,7 +10200,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             arrow = "Up 🟢" if ib else "Down 🔴"
             await delete_last_signal(context.bot, chat, user_id)
 
-            cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, chosen_secs, strength)
+            _bline2 = get_broker_display(user_id)
+            cap = "*{}* {}\n⏱ In *{}s*\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators{}".format(
+                pair, arrow, chosen_secs, strength,
+                "\n" + _bline2 if _bline2 else "")
             sent_msg = await context.bot.send_photo(
                 chat_id=chat,
                 photo=img,
@@ -10383,7 +10461,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _str = max(90, min(450, int(_str)))
             if not is_licensed(user_id): use_free_signal(user_id)
             await delete_last_signal(context.bot, chat, user_id)
-            cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, timeframe, _str)
+            _bline3 = get_broker_display(user_id)
+            cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators{}".format(
+                pair, arrow, timeframe, _str,
+                "\n" + _bline3 if _bline3 else "")
             sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
             save_last_signal_msg(user_id, sent_msg.message_id)
 
@@ -10664,7 +10745,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
-        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators".format(pair, arrow, timeframe, _str2)
+        _bline4 = get_broker_display(user_id)
+        cap = "*{}* {}\n🕐 In *{}* min\n📊 Signal strength: {}%\n🧠 AI Consensus: 25+ indicators{}".format(
+            pair, arrow, timeframe, _str2,
+            "\n" + _bline4 if _bline4 else "")
         sent_msg = await context.bot.send_photo(chat_id=chat, photo=img, caption=cap, parse_mode="Markdown", reply_markup=signal_keyboard(pair))
         save_last_signal_msg(user_id, sent_msg.message_id)
 
@@ -10985,6 +11069,8 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                     entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
                     signal_count += 1
 
+                    _bscan1 = get_broker_display(uid)
+                    _bscan1_esc = _bscan1.replace("-", "\\-").replace(".", "\\.").replace("!", "\\!").replace("(", "\\(").replace(")", "\\)").replace("|", "\\|")
                     cap = (
                         "🏆 *EVALON WINNERS* 🏆\n\n"
                         "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n"
@@ -10994,7 +11080,9 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                         "{} DIRECTION : *{}*\n"
                         "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n\n"
                         "⚡ Open at next candle"
-                    ).format(pair.replace("/", "\/"), entry_str, dir_arrow, dir_label)
+                        "{}").format(
+                        pair.replace("/", "\/"), entry_str, dir_arrow, dir_label,
+                        "\n" + _bscan1_esc if _bscan1_esc else "")
 
                     entry_price = _fetch_current_price(pair)
                     save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
@@ -11260,6 +11348,8 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                     entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
                     signal_count += 1
 
+                    _bscan2 = get_broker_display(uid)
+                    _bscan2_esc = _bscan2.replace("-", "\\-").replace(".", "\\.").replace("!", "\\!").replace("(", "\\(").replace(")", "\\)").replace("|", "\\|")
                     cap = (
                         "🏆 *EVALON WINNERS* 🏆\n\n"
                         "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
@@ -11269,7 +11359,9 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                         "{} DIRECTION : *{}*\n"
                         "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
                         "⚡ Open at next candle"
-                    ).format(pair, entry_str, dir_arrow, dir_label)
+                        "{}").format(
+                        pair, entry_str, dir_arrow, dir_label,
+                        "\n" + _bscan2_esc if _bscan2_esc else "")
 
                     entry_price = _fetch_current_price(pair)
                     save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
@@ -11735,6 +11827,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
             entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
             signal_count += 1
 
+            _bscan3 = get_broker_display(uid)
+            _bscan3_esc = _bscan3.replace("-", "\\-").replace(".", "\\.").replace("!", "\\!").replace("(", "\\(").replace(")", "\\)").replace("|", "\\|")
             cap = (
                 "🏆 *EVALON WINNERS* 🏆\n\n"
                 "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
@@ -11745,9 +11839,11 @@ async def global_scan_and_send(bot, chat, user_id, context):
                 "📡 {}*\n"
                 "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
                 "✅ Trend\\-follow signal"
+                "{}"
             ).format(
                 pair, entry_str, dir_arrow, dir_label,
-                trend_txt.replace("-","\\-").replace(">","\\>")
+                trend_txt.replace("-","\\-").replace(">","\\>"),
+                "\n" + _bscan3_esc if _bscan3_esc else ""
             )
 
             entry_price = _fetch_current_price(pair)
@@ -12553,10 +12649,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        _mb = get_broker_display(user_id)
         await update.message.reply_text(
             "⚡ *EVALON WINNERS BOT*\n\n"
-            "👤 Plan: *{}*\n\n"
-            "Select how you want to trade:".format(plan),
+            "👤 Plan: *{}*\n"
+            "{}\n\n"
+            "Select how you want to trade:".format(plan, _mb if _mb else ""),
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(user_id)
         )
