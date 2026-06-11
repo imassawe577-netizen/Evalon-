@@ -7688,14 +7688,14 @@ def generate_signal(pair):
             else:
                 candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
         else:
-            # v59d: Non-OTC pair without real data — try Deriv ticks first,
-            # kisha jaribu tena Yahoo/Finnhub. Loop haisimami mpaka data ipatikane.
+            # Non-OTC pair bila data — jaribu mara 3 tu, kisha rudisha flat
             import time as _t
 
             _real_retry = None
             _attempt = 0
+            _MAX_ATTEMPTS = 3  # ← limit — usijaribu zaidi ya mara 3
 
-            while _real_retry is None:
+            while _real_retry is None and _attempt < _MAX_ATTEMPTS:
                 _attempt += 1
 
                 # First: try Deriv ticks as fast source
@@ -7742,7 +7742,7 @@ def generate_signal(pair):
                     _real_retry = _deriv_live
                     break
 
-                # Pili: jaribu Yahoo/Finnhub tena
+                # Pili: jaribu Yahoo/Finnhub
                 try:
                     _fetched = _fetch_real_indicators_mtf(pair)
                     if _fetched is not None:
@@ -7753,7 +7753,13 @@ def generate_signal(pair):
                     logging.warning("nonOTC {} fetch attempt {}: {}".format(pair, _attempt, _re))
 
                 logging.info("nonOTC {} attempt {}: no data yet — retrying in 1s".format(pair, _attempt))
-                _t.sleep(1)
+                await asyncio.sleep(1)  # async sleep — haiblock thread nyingine
+
+            # Data haikupatikana baada ya attempts 3 — rudisha flat (ruka pair hii)
+            if _real_retry is None:
+                logging.warning("nonOTC {} no data after {} attempts — skip".format(pair, _MAX_ATTEMPTS))
+                return {"flat": True, "direction": None, "timeframe": 0,
+                        "strength": 0, "indicators_agree": 0, "pair": pair}
 
             # Data available (Deriv or Yahoo/Finnhub) — proceed with real indicators
             rsi     = _real_retry["rsi"]
