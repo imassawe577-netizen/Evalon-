@@ -3711,7 +3711,7 @@ def _yf_download_cached(symbol, period, interval):
     This prevents the yfinance→Finnhub→TwelveData rate-limit spam seen in logs.
     """
     key = (symbol, period, interval)
-    fail_key = (symbol, interval)  # blacklist key (period-agnostic per symbol+TF)
+    fail_key = (symbol,)  # v66: symbol-level — one failure blacklists ALL intervals for this symbol
     now = time.time()
 
     # ── 0. Cache hit ──────────────────────────────────────────────────────────
