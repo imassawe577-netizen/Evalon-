@@ -10596,20 +10596,18 @@ def _confirm_real_candle_direction(pair, expected_direction):
 
 async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
     """
-    MULTI SCAN ENGINE (v59):
-    Scan pairs ZILIZOCHAGULIWA (4 au 6) kwa wakati mmoja.
-    Send signals for EVERY pair that gets a good signal — combined scan.
+    MULTI SCAN ENGINE (v60 - Sequential):
+    Scan pairs ZILIZOCHAGULIWA moja kwa moja — pair 1 → pair 2 → ... → pair N → rudia.
 
-    Tofauti na Global Scan:
-      - Pairs ni chache (4 au 6) zinazochaguliwa na mtumiaji
-      - Signals zote zinazopita threshold zinatumwa (si moja tu bora)
-      - Kila signal ina jina la pair ili user ajue
+    Mabadiliko v60 (OOM fix):
+      - Hapo awali (v59): asyncio.gather → pairs ZOTE kwa wakati mmoja → OOM crash
+      - Sasa (v60): pair moja kwa wakati → signal inatumwa mara moja ikipata → pair inayofuata
+      - RAM inatumika x1 tu (si x6) → hakuna OOM
+      - Round moja (pairs zote) inaisha ndani ya sekunde ~30-60 → inaanza tena
     """
-    SCAN_INTERVAL  = 45
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
     FIXED_TF       = 1
-    COOLDOWN_SECS  = 75
 
     uid = int(user_id)
     n   = len(pairs_to_scan)
@@ -10630,17 +10628,15 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
         except asyncio.TimeoutError:
             pass
 
-    pairs_display = ", ".join(pairs_to_scan[:3]) + ("..." if n > 3 else "")
-
     try:
         scan_msg = await bot.send_message(
             chat_id=chat,
             text=(
                 "🎯 *Multi Scan Started* — {} pairs\n\n"
                 "📡 Pairs: *{}*\n"
-                "⚡ Signals za pairs zote zinazopata entry nzuri zitatumwa\.\n\n"
+                "⚡ Kila pair itascaniwa moja kwa moja\.\n\n"
                 "_Tap Stop to end the session\._"
-            ).format(n, ", ".join(pairs_to_scan)),
+            ).format(n, ", ".join(pairs_to_scan).replace("/", "\/")),
             parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
@@ -10649,8 +10645,8 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
         logging.warning("multi_scan: start msg failed: {}".format(e))
         return
 
-    scan_count    = 0
-    signal_count  = 0
+    round_count     = 0
+    signal_count    = 0
     scan_wins_ref   = [0]
     scan_losses_ref = [0]
 
@@ -10671,14 +10667,6 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                     )
                 except: pass
                 return
-
-            if scan_count > 0:
-                await _wait(SCAN_INTERVAL)
-                if _is_cancelled():
-                    continue
-
-            scan_count += 1
-            anim = ["🎯", "📡", "🔍", "⚡"][scan_count % 4]
 
             if is_market_closed():
                 try:
@@ -10701,34 +10689,45 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                 await _wait(60)
                 continue
 
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat,
-                    message_id=scan_msg.message_id,
-                    text=(
-                        "{} *Multi Scanning* — {} pairs\n\n"
-                        "Scan \#{} \| Signals sent: {}\n\n"
-                        "_Analysing: {}_"
-                    ).format(anim, n, scan_count, signal_count,
-                             ", ".join(active_pairs).replace("-", "\-").replace("/", "\/")),
-                    parse_mode="MarkdownV2",
-                    reply_markup=stop_kb
-                )
-            except: pass
+            round_count += 1
+            anim = ["🎯", "📡", "🔍", "⚡"][round_count % 4]
 
-            # Scan all selected pairs kwa wakati mmoja
-            scan_tasks = [safe_generate_signal_cached(p) for p in active_pairs]
-            results    = await asyncio.gather(*scan_tasks, return_exceptions=True)
-
-            for i, result in enumerate(results):
+            # ── SEQUENTIAL SCAN: pair moja kwa wakati ──────────────────────────
+            for pair_idx, pair in enumerate(active_pairs):
                 if _is_cancelled():
                     break
-                pair = active_pairs[i]
+
+                # Update status message — inaonyesha pair inayoscaniwa sasa
                 try:
-                    if isinstance(result, Exception):
-                        continue
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "{} *Multi Scanning* — {}/{} pairs\n\n"
+                            "Round \#{} \| Signals: {}\n\n"
+                            "🔍 _Scanning: {}_"
+                        ).format(
+                            anim, pair_idx + 1, len(active_pairs),
+                            round_count, signal_count,
+                            pair.replace("/", "\/")
+                        ),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
+
+                # ── Scan pair moja (sequential — RAM x1 tu) ──
+                try:
+                    result = await safe_generate_signal_cached(pair)
+                except Exception as _ge:
+                    logging.warning("multi_scan gather {}: {}".format(pair, _ge))
+                    await _wait(PAIR_DELAY)
+                    continue
+
+                try:
                     sig, _ = result if isinstance(result, tuple) else (result, None)
                     if sig is None:
+                        await _wait(PAIR_DELAY)
                         continue
 
                     is_flat   = sig.get("flat", False)
@@ -10739,11 +10738,8 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                     trend_1h  = sig.get("trend_1h")
                     micro_htf = sig.get("micro_htf")
 
-                    if is_flat or tf == 0:
-                        continue
-                    if ind_agree < MIN_INDICATORS:
-                        continue
-                    if not direction:
+                    if is_flat or tf == 0 or not direction or ind_agree < MIN_INDICATORS:
+                        await _wait(PAIR_DELAY)
                         continue
 
                     # Normalise strength
@@ -10754,6 +10750,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                     strength = max(90, min(450, int(strength)))
 
                     if strength < MIN_STRENGTH:
+                        await _wait(PAIR_DELAY)
                         continue
 
                     # Trend-follow check
@@ -10761,6 +10758,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                         if trend_1h in ("BUY", "SELL") and direction != trend_1h:
                             logging.info("MULTI_SCAN {}: trend-follow skip dir={} trend={}".format(
                                 pair, direction, trend_1h))
+                            await _wait(PAIR_DELAY)
                             continue
                         elif trend_1h not in ("BUY", "SELL") and micro_htf:
                             micro_dirs = [
@@ -10774,13 +10772,15 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                                 if direction != micro_trend:
                                     logging.info("MULTI_SCAN {}: micro-trend skip dir={} micro={}".format(
                                         pair, direction, micro_trend))
+                                    await _wait(PAIR_DELAY)
                                     continue
 
                     candle_ok = _confirm_real_candle_direction(pair, direction)
                     if not candle_ok:
+                        await _wait(PAIR_DELAY)
                         continue
 
-                    # ── Send signal for this pair ──────────────────────────────
+                    # ── Signal ipatikana — tuma mara moja ─────────────────────
                     ib        = direction == "BUY"
                     img       = get_buy_image() if ib else get_sell_image()
                     dir_arrow = "📈" if ib else "📉"
@@ -10832,8 +10832,25 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                     logging.warning("multi_scan pair {} failed: {}".format(pair, _pe))
                     continue
 
+            # Round imekwisha — onyesha status na anza round mpya mara moja
             if not _is_cancelled():
-                await _wait(COOLDOWN_SECS)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "✅ *Round \#{} Done* — {} pairs scanned\n\n"
+                            "🏆 Won: *{}*   💔 Lost: *{}*\n"
+                            "📊 Signals: *{}*\n\n"
+                            "🔄 _Starting next round\.\.\._"
+                        ).format(
+                            round_count, len(active_pairs),
+                            scan_wins_ref[0], scan_losses_ref[0], signal_count
+                        ),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
 
     finally:
         if _ACTIVE_SCANS.get(uid) is cancel_ev:
@@ -11361,17 +11378,20 @@ async def global_scan_and_send(bot, chat, user_id, context):
                 )
             except: pass
 
-            # ── Scan all pairs, collect candidates ──────────────────────────
+            # ── Scan pairs sequentially — moja kwa wakati (OOM fix v60) ────────
             candidates = []
+            results    = []
+            for _sp in active_pairs:
+                if _is_cancelled():
+                    break
+                try:
+                    _sr = await safe_generate_signal_cached(_sp)
+                    results.append((_sp, _sr))
+                except Exception as _sge:
+                    results.append((_sp, _sge))
+                await asyncio.sleep(0.5)
 
-            scan_tasks = []
-            for p in active_pairs:
-                scan_tasks.append(safe_generate_signal_cached(p))
-
-            results = await asyncio.gather(*scan_tasks, return_exceptions=True)
-
-            for i, result in enumerate(results):
-                pair = active_pairs[i]
+            for pair, result in results:
                 try:
                     if isinstance(result, Exception):
                         continue
