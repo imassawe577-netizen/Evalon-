@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
 EVALON WINNERS BOT - Telegram Bot v3.10
-Upgraded: v59e - All messages English, new admin commands (/users, /history, /userchart)
+Upgraded: v66 - More signals: MIN_INDICATORS 4→3, MIN_STRENGTH 120→100, min_confluence 4→3
+
+KEY CHANGES (v66):
+  - MIN_INDICATORS: 4 → 3 (all scan engines)
+  - MIN_STRENGTH:   120 → 100 (all scan engines)
+  - min_confluence (non-OTC): 4 → 3 (generate_signal)
+  - min_confluence (OTC):     3 → 2
+  - All indicators_agree < 4 checks lowered to < 3
+  - CQ gate stays at >= 40 (v63 restored level)
+  - Voting threshold stays at 0.60 (v63 restored level)
+  EXPECTED: More signals generated, especially in quieter sessions
 
 KEY CHANGES (v58):
   1. ZigZag Trend (NEW):
@@ -8501,7 +8511,7 @@ def generate_signal(pair):
         if mtf_dir != trend_1h:
             direction = "BUY" if b > s else "SELL"
 
-    min_confluence = 4 if not is_otc else 3   # v62: lowered non-OTC 6→4, OTC 4→3
+    min_confluence = 3 if not is_otc else 2   # v66: lowered non-OTC 4→3, OTC 3→2 (more signals)
     if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
@@ -8637,7 +8647,7 @@ def generate_signal(pair):
             {k: round(v, 1) for k, v in _micro_scores.items()}
         ))
 
-    if not is_otc and is_filter_on("confluence") and indicators_agree < 4 and vte_tf is None and timeframe > 0:
+    if not is_otc and is_filter_on("confluence") and indicators_agree < 3 and vte_tf is None and timeframe > 0:
         if trend_1h is not None:
             direction = trend_1h  # Fuata 1H - si kupingana nayo
         elif not yahoo_available:
@@ -9972,7 +9982,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if trend is not None:
                 direction = trend
-            elif sig.get("indicators_agree", 7) < 4 and is_non_otc:
+            elif sig.get("indicators_agree", 7) < 3 and is_non_otc:
                 try: await cm.delete()
                 except: pass
                 await delete_last_signal(context.bot, chat, user_id)
@@ -10246,7 +10256,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trend_dir = get_trend_direction(pair)
             if trend_dir is not None:
                 direction = trend_dir
-            elif sig.get("indicators_agree", 7) < 4 and "OTC" not in pair:
+            elif sig.get("indicators_agree", 7) < 3 and "OTC" not in pair:
                 await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
@@ -10480,7 +10490,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gm_is_non_otc_check = "OTC" not in pair and pair in YAHOO_SYMBOLS
             if trend_dir is not None:
                 direction = trend_dir
-            elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 4):
+            elif gm_is_non_otc_check and is_filter_on("confluence") and (sig.get("flat") or sig.get("indicators_agree", 10) < 3):
                 await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
@@ -10492,7 +10502,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
-            elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 4:
+            elif "OTC" not in pair and is_filter_on("confluence") and sig.get("indicators_agree", 7) < 3:
                 await delete_last_signal(context.bot, chat, user_id)
                 _nsm = await context.bot.send_message(
                     chat_id=chat,
@@ -10951,8 +10961,8 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
       - RAM inatumika x1 tu (si x6) → hakuna OOM
       - Round moja (pairs zote) inaisha ndani ya sekunde ~30-60 → inaanza tena
     """
-    MIN_INDICATORS = 4
-    MIN_STRENGTH   = 120
+    MIN_INDICATORS = 3   # v66: 4→3 (more signals, less filtering)
+    MIN_STRENGTH   = 100  # v66: 120→100
     FIXED_TF       = 1
 
     uid = int(user_id)
@@ -11211,8 +11221,8 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m only
     FIXED_TF       = 1
     SCAN_INTERVAL  = 8   # v62: reduced from 15 for faster scanning
-    MIN_INDICATORS = 4
-    MIN_STRENGTH   = 120
+    MIN_INDICATORS = 3   # v66: 4→3 (more signals)
+    MIN_STRENGTH   = 100  # v66: 120→100
     COOLDOWN_SECS  = 0
 
     # Fix #1: Tumia int(user_id) consistently
@@ -11624,8 +11634,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
       3. Pair moja tu inatumwa kila scan cycle
     """
     SCAN_INTERVAL  = 8    # v62: reduced from 15 for faster scanning
-    MIN_INDICATORS = 4
-    MIN_STRENGTH   = 120
+    MIN_INDICATORS = 3   # v66: 4→3 (more signals)
+    MIN_STRENGTH   = 100  # v66: 120→100
     FIXED_TF       = 1
     COOLDOWN_SECS  = 0   # no cooldown after signal
 
