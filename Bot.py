@@ -3690,12 +3690,11 @@ def _td_candles_as_df(symbol, interval, outputsize=200):
 
 def _yf_download_cached(symbol, period, interval):
     """
-    v63.2: Data source priority:
+    v64: Data source priority (restored to v54 order):
       1. Cache (dakika 2) — haraka zaidi
-      2. Finnhub — primary (hakuna rate-limit ya ndani, OANDA real-time data)
-      3. Twelve Data — fallback (free tier 7 req/min — tunaihifadhi kwa
-         pairs/timeframes ambazo Finnhub haziwezi)
-      4. yfinance — last resort
+      2. yfinance — primary
+      3. Finnhub — fallback (yfinance ikishindwa)
+      4. Twelve Data — last resort (hifadhi rate-limit credits)
     """
     key = (symbol, period, interval)
     now = time.time()
@@ -3707,44 +3706,56 @@ def _yf_download_cached(symbol, period, interval):
 
     df = None
 
-    # ── 1. Finnhub (primary) ──────────────────────────────────────────────────
-    _fh_sym = None
+    # ── 1. yfinance (primary) ─────────────────────────────────────────────────
     try:
-        _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
-        if _pair_name2:
-            _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
-    except Exception:
-        pass
-
-    if _fh_sym and FINNHUB_KEY:
-        _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
-        _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
-        df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
-        if df is not None and len(df) >= 5:
-            logging.info("FH OK (primary): {} {} {} ({} rows)".format(
-                symbol, period, interval, len(df)))
-        else:
+        df = yf.download(symbol, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 5:
             df = None
-            logging.warning("FH primary failed: {} {} {}".format(
+        else:
+            logging.info("yfinance OK (primary): {} {} {}".format(
                 symbol, period, interval))
+    except Exception as _ye:
+        logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
+            symbol, period, interval, _ye))
+        df = None
 
-    # ── 2. Twelve Data (fallback) ─────────────────────────────────────────────
+    # ── 2. Finnhub (fallback) ─────────────────────────────────────────────────
+    if df is None:
+        _fh_sym = None
+        try:
+            _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
+            if _pair_name2:
+                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
+        except Exception:
+            pass
+
+        if _fh_sym and FINNHUB_KEY:
+            _fh_res   = _YF_TO_FH_RESOLUTION.get(interval, "5")
+            _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
+            df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
+            if df is not None and len(df) >= 5:
+                logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
+                    symbol, period, interval, len(df)))
+            else:
+                df = None
+                logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
+                    symbol, period, interval))
+
+    # ── 3. Twelve Data (last resort — hifadhi rate-limit) ────────────────────
     if df is None and TWELVE_DATA_KEY:
         try:
-            # Pata pair name kutoka Yahoo symbol
             _pair_name = _YF_SYM_TO_PAIR.get(symbol)
             _td_sym    = None
 
             if _pair_name and "/" in _pair_name:
-                # Forex pair — tumia moja kwa moja e.g. EUR/USD
                 _td_sym = _pair_name
             elif symbol in _TD_INDEX_SYMBOLS:
-                # Index — tumia TD symbol e.g. NDX
                 _td_sym = _TD_INDEX_SYMBOLS[symbol]
 
             if _td_sym:
-                _td_interval  = _YF_TO_TD_INTERVAL.get(interval, "5min")
-                _td_outsize   = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
+                _td_interval = _YF_TO_TD_INTERVAL.get(interval, "5min")
+                _td_outsize  = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
                 df = _td_candles_as_df(_td_sym, _td_interval, _td_outsize)
                 if df is not None and len(df) < 5:
                     df = None
@@ -3754,21 +3765,6 @@ def _yf_download_cached(symbol, period, interval):
         except Exception as _tde:
             logging.warning("TwelveData fetch failed ({} {} {}): {}".format(
                 symbol, period, interval, _tde))
-            df = None
-
-    # ── 3. yfinance last resort ───────────────────────────────────────────────
-    if df is None:
-        try:
-            df = yf.download(symbol, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
-            if df is None or len(df) < 5:
-                df = None
-            else:
-                logging.info("yfinance OK (last resort): {} {} {}".format(
-                    symbol, period, interval))
-        except Exception as _ye:
-            logging.warning("yfinance also failed ({} {} {}): {}".format(
-                symbol, period, interval, _ye))
             df = None
 
     if df is not None and len(df) > 0:
