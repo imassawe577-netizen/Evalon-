@@ -3483,11 +3483,105 @@ def _fh_candles_as_df(fh_sym, resolution, count=200):
         logging.warning("_fh_candles_as_df {} res={} failed: {}".format(fh_sym, resolution, _fe))
         return None
 
+# ── Twelve Data symbols (pair name → TD symbol) ──────────────────────────────
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY", "")
+
+# Interval mapping: yfinance format → Twelve Data format
+_YF_TO_TD_INTERVAL = {
+    "1m": "1min", "2m": "2min", "5m": "5min", "15m": "15min",
+    "30m": "30min", "1h": "1h", "1H": "1h", "4h": "4h",
+}
+
+# Period → outputsize (candles count) for Twelve Data
+_YF_PERIOD_TO_TD_SIZE = {
+    "1d": 390, "2d": 780, "3d": 1170, "5d": 1950, "7d": 2730,
+}
+
+# Yahoo symbol → pair name (reverse of YAHOO_SYMBOLS)
+_YF_SYM_TO_PAIR = {v: k for k, v in {
+    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "USDJPY=X",
+    "USD/CHF": "USDCHF=X", "AUD/USD": "AUDUSD=X", "USD/CAD": "USDCAD=X",
+    "NZD/USD": "NZDUSD=X", "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X", "AUD/JPY": "AUDJPY=X", "EUR/AUD": "EURAUD=X",
+    "EUR/CAD": "EURCAD=X", "GBP/AUD": "GBPAUD=X", "GBP/CAD": "GBPCAD=X",
+    "AUD/CAD": "AUDCAD=X", "AUD/CHF": "AUDCHF=X", "NZD/JPY": "NZDJPY=X",
+    "EUR/CHF": "EURCHF=X", "CHF/JPY": "CHFJPY=X", "CAD/JPY": "CADJPY=X",
+    "CAD/CHF": "CADCHF=X", "GBP/CHF": "GBPCHF=X", "USD/MXN": "USDMXN=X",
+    "AUD/NZD": "AUDNZD=X", "EUR/NZD": "EURNZD=X", "GBP/NZD": "GBPNZD=X",
+    "NZD/CAD": "NZDCAD=X", "NZD/CHF": "NZDCHF=X",
+    "USD/NOK": "USDNOK=X", "USD/SEK": "USDSEK=X", "USD/DKK": "USDDKK=X",
+    "USD/TRY": "USDTRY=X", "USD/ZAR": "USDZAR=X", "USD/SGD": "USDSGD=X",
+    "EUR/NOK": "EURNOK=X", "EUR/SEK": "EURSEK=X", "EUR/PLN": "EURPLN=X",
+    "EUR/TRY": "EURTRY=X", "GBP/NOK": "GBPNOK=X", "GBP/SEK": "GBPSEK=X",
+    "US100": "^NDX", "SP500": "^GSPC", "CAC 40": "^FCHI",
+    "SMI 20": "^SSMI", "E35EUR": "^STOXX",
+    "US30": "^DJI", "GER40": "^GDAXI", "UK100": "^FTSE",
+    "JPN225": "^N225", "AUS200": "^AXJO",
+}.items()}
+
+# Indices mapping kwa Twelve Data (symbols tofauti)
+_TD_INDEX_SYMBOLS = {
+    "^NDX": "NDX", "^GSPC": "SPX", "^FCHI": "CAC40",
+    "^DJI": "DJI", "^GDAXI": "DAX", "^FTSE": "FTSE100",
+    "^N225": "N225", "^AXJO": "AXJO", "^SSMI": "SMI",
+    "^STOXX": "SX5E",
+}
+
+def _td_candles_as_df(symbol, interval, outputsize=200):
+    """
+    Fetch candles kutoka Twelve Data API.
+    Forex: symbol = 'EUR/USD', interval = '1min', '5min', '1h' nk.
+    Returns DataFrame au None.
+    Free tier: 800 credits/siku, 8 requests/dakika.
+    """
+    if not TWELVE_DATA_KEY:
+        return None
+    try:
+        # Twelve Data forex inatumia EUR/USD format moja kwa moja
+        url = (
+            "https://api.twelvedata.com/time_series"
+            "?symbol={}&interval={}&outputsize={}&apikey={}&format=JSON".format(
+                symbol, interval, min(outputsize, 500), TWELVE_DATA_KEY
+            )
+        )
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            logging.warning("TwelveData HTTP {} for {}".format(r.status_code, symbol))
+            return None
+        d = r.json()
+        if d.get("status") == "error" or "values" not in d:
+            logging.warning("TwelveData error {}: {}".format(symbol, d.get("message", "")))
+            return None
+        values = d["values"]
+        if not values:
+            return None
+        df = pd.DataFrame(values)
+        df = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume", "datetime": "Datetime"
+        })
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime").sort_index()
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "Volume" in df.columns:
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+        else:
+            df["Volume"] = 0.0
+        logging.info("TwelveData OK: {} {} {} rows".format(symbol, interval, len(df)))
+        return df
+    except Exception as _te:
+        logging.warning("TwelveData failed {} {}: {}".format(symbol, interval, _te))
+        return None
+
+
 def _yf_download_cached(symbol, period, interval):
     """
-    yfinance download na cache ya dakika 2.
-    v53: kama yfinance inashindwa, jaribu Finnhub kama fallback.
-    Hii inashughulikia kila call site yote mara moja.
+    v60: Data source priority:
+      1. Cache (dakika 2) — haraka zaidi
+      2. Twelve Data — primary source (inafanya kazi vizuri na Render)
+      3. Finnhub — fallback
+      4. yfinance — last resort
     """
     key = (symbol, period, interval)
     now = time.time()
@@ -3499,23 +3593,38 @@ def _yf_download_cached(symbol, period, interval):
 
     df = None
 
-    try:
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df is None or len(df) < 5:
-            df = None
-    except Exception as _ye:
-        logging.warning("yfinance failed ({} {} {}): {} — trying Finnhub".format(
-            symbol, period, interval, _ye))
-        df = None
+    # ── 1. Twelve Data (primary) ──────────────────────────────────────────────
+    if TWELVE_DATA_KEY:
+        try:
+            # Pata pair name kutoka Yahoo symbol
+            _pair_name = _YF_SYM_TO_PAIR.get(symbol)
+            _td_sym    = None
 
+            if _pair_name and "/" in _pair_name:
+                # Forex pair — tumia moja kwa moja e.g. EUR/USD
+                _td_sym = _pair_name
+            elif symbol in _TD_INDEX_SYMBOLS:
+                # Index — tumia TD symbol e.g. NDX
+                _td_sym = _TD_INDEX_SYMBOLS[symbol]
+
+            if _td_sym:
+                _td_interval  = _YF_TO_TD_INTERVAL.get(interval, "5min")
+                _td_outsize   = _YF_PERIOD_TO_TD_SIZE.get(period, 200)
+                df = _td_candles_as_df(_td_sym, _td_interval, _td_outsize)
+                if df is not None and len(df) < 5:
+                    df = None
+        except Exception as _tde:
+            logging.warning("TwelveData fetch failed ({} {} {}): {}".format(
+                symbol, period, interval, _tde))
+            df = None
+
+    # ── 2. Finnhub fallback ───────────────────────────────────────────────────
     if df is None:
         _fh_sym = None
         try:
-            _yf_to_pair = {v: k for k, v in YAHOO_SYMBOLS.items()}
-            _pair_name  = _yf_to_pair.get(symbol)
-            if _pair_name:
-                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name)
+            _pair_name2 = _YF_SYM_TO_PAIR.get(symbol)
+            if _pair_name2:
+                _fh_sym = FINNHUB_FOREX_SYMBOLS.get(_pair_name2)
         except Exception:
             pass
 
@@ -3524,12 +3633,27 @@ def _yf_download_cached(symbol, period, interval):
             _fh_count = _YF_PERIOD_TO_CANDLES.get(period, 200)
             df = _fh_candles_as_df(_fh_sym, _fh_res, _fh_count)
             if df is not None and len(df) >= 5:
-                logging.info("YF_FALLBACK→FH: {} {} {} → Finnhub OK ({} rows)".format(
+                logging.info("FALLBACK→FH: {} {} {} OK ({} rows)".format(
                     symbol, period, interval, len(df)))
             else:
                 df = None
-                logging.warning("YF_FALLBACK→FH: {} {} {} → Finnhub also failed".format(
+                logging.warning("FALLBACK→FH: {} {} {} also failed".format(
                     symbol, period, interval))
+
+    # ── 3. yfinance last resort ───────────────────────────────────────────────
+    if df is None:
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            if df is None or len(df) < 5:
+                df = None
+            else:
+                logging.info("yfinance OK (last resort): {} {} {}".format(
+                    symbol, period, interval))
+        except Exception as _ye:
+            logging.warning("yfinance also failed ({} {} {}): {}".format(
+                symbol, period, interval, _ye))
+            df = None
 
     if df is not None and len(df) > 0:
         with _YF_CACHE_LOCK:
