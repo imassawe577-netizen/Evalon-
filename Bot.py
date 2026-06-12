@@ -1387,7 +1387,7 @@ def pg_predict(pair, direction, rsi=50.0, sto=50.0, bb_pos=0.5,
       4. Trend dominance - % ya wins wiki iliyopita kwa direction hii
 
     Returns: (win_prob: float 0.0-1.0, source: str, should_flip: bool)
-    - win_prob >= 0.72 = high confidence (match NN threshold ya zamani)
+    - win_prob >= 0.80 = high confidence (match NN threshold ya zamani)
     - should_flip = True kama opposite direction ina win_prob >= 0.75
     """
     try:
@@ -3484,15 +3484,12 @@ def _yf_download_cached(symbol, period, interval):
     """
     yfinance download na cache ya dakika 2.
     v53: kama yfinance inashindwa, jaribu Finnhub kama fallback.
-    Hii inashughulikia kila call site yote mara moja.
     """
     key = (symbol, period, interval)
-    now = time.time()
-    with _YF_CACHE_LOCK:
-        if key in _YF_CACHE:
-            ts, df = _YF_CACHE[key]
-            if now - ts < _YF_CACHE_TTL:
-                return df
+
+    cached = _yf_cache_get(key)
+    if cached is not None:
+        return cached
 
     df = None
 
@@ -3529,8 +3526,7 @@ def _yf_download_cached(symbol, period, interval):
                     symbol, period, interval))
 
     if df is not None and len(df) > 0:
-        with _YF_CACHE_LOCK:
-            _YF_CACHE[key] = (now, df)
+        _yf_cache_set(key, df)
     return df
 
 OTC_TO_REAL = {
@@ -4861,7 +4857,7 @@ def _check_pip_movement(pair):
     except Exception:
         return 0.08, "MEDIUM"
 
-_ATR_DEAD_THRESHOLD = 0.015  # % - below this = dead market, no signal
+_ATR_DEAD_THRESHOLD = 0.0010  # % - below this = dead market, no signal
 _FORCE_PAIRS = set()  # Admin-forced pairs - bypass flat/dead market filter
 
 _FILTER_FLAGS = {
@@ -6604,7 +6600,7 @@ _NN_GLOBAL_FILE      = "/tmp/evalon_nn_models/global_model.pkl"
 _NN_SCALER_FILE      = "/tmp/evalon_nn_models/global_scaler.pkl"
 _NN_MIN_SAMPLES      = 40
 _NN_MIN_PAIR_SAMPLES = 25
-_NN_CONFIDENCE_THRESHOLD = 0.72
+_NN_CONFIDENCE_THRESHOLD = 0.80
 _NN_RETRAIN_HOURS    = 6
 
 _nn_global_model  = None
@@ -8054,7 +8050,7 @@ def generate_signal(pair):
         if mtf_dir != trend_1h:
             direction = "BUY" if b > s else "SELL"
 
-    min_confluence = 4 if not is_otc else 3   # Lowered: was 6/5 - less blocking
+    min_confluence = 4 if not is_otc else 4   # Set to 4 for all
     if is_filter_on("confluence") and indicators_agree < min_confluence:
         alt_dir = "SELL" if direction == "BUY" else "BUY"
         alt_agree = 0
@@ -10787,8 +10783,8 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m tu
     FIXED_TF       = 1
     SCAN_INTERVAL  = 45
-    MIN_INDICATORS = 5
-    MIN_STRENGTH   = 150
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
 
     # Fix #1: Tumia int(user_id) consistently
     uid = int(user_id)
@@ -11158,8 +11154,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
       3. Pair moja tu inatumwa kila scan cycle
     """
     SCAN_INTERVAL  = 45
-    MIN_INDICATORS = 5
-    MIN_STRENGTH   = 150
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
     FIXED_TF       = 1
 
     uid = int(user_id)
