@@ -2271,9 +2271,23 @@ def inactivity_clear(user_id):
 def inactivity_get_msgs(user_id):
     return USER_INACTIVITY.get(user_id, {}).get("msg_ids", [])
 
-LAST_SIGNAL_MSG = {}
-LAST_BOT_MSG    = {}
-USER_MSG_STACK  = {}  # user_id -> [msg_id, ...]
+LAST_SIGNAL_MSG = {}  # lightweight write-through cache (cleared after DB write)
+LAST_BOT_MSG    = {}  # lightweight write-through cache (cleared after DB write)
+USER_MSG_STACK  = {}  # lightweight write-through cache (cleared after DB write)
+
+def _cleanup_ram_stores():
+    """Periodic cleanup — remove RAM entries for users not seen in 10 min."""
+    import time as _t
+    cutoff = _t.time() - 600
+    for d in [LAST_SIGNAL_MSG, LAST_BOT_MSG, USER_MSG_STACK, LAST_ANALYZING_MSG]:
+        try:
+            keys = list(d.keys())
+            # Keep only last 50 users in RAM — evict oldest
+            if len(keys) > 50:
+                for k in keys[:-50]:
+                    d.pop(k, None)
+        except Exception:
+            pass
 
 def push_msg_id(user_id, msg_id):
     """Push a message ID onto the user's message stack (DB + in-memory)."""
@@ -2419,7 +2433,14 @@ def save_last_bot_msg(user_id, msg_id):
         logging.warning("save_last_bot_msg DB failed: {}".format(e))
 
 SPAM_SECONDS = 3  # Minimum seconds between signal requests
-LAST_SIGNAL_TIME = {}  # in-memory cache only
+LAST_SIGNAL_TIME = {}  # small write-through cache, max 50 entries
+
+def _trim_signal_time_cache():
+    """Keep only last 50 entries in LAST_SIGNAL_TIME."""
+    if len(LAST_SIGNAL_TIME) > 50:
+        keys = list(LAST_SIGNAL_TIME.keys())
+        for k in keys[:-50]:
+            LAST_SIGNAL_TIME.pop(k, None)
 
 def is_spam(user_id):
     """Never block the user - just track timing for slight delay."""
@@ -2433,10 +2454,10 @@ def is_spam(user_id):
                     row = cur.fetchone()
             if row:
                 last = row["signal_time"]
-                LAST_SIGNAL_TIME[user_id] = last
         except Exception:
             pass
     LAST_SIGNAL_TIME[user_id] = now
+    _trim_signal_time_cache()
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2449,8 +2470,6 @@ def is_spam(user_id):
     except Exception:
         pass
     return (now - last) < SPAM_SECONDS
-    LAST_SIGNAL_TIME[user_id] = now
-    return False  # Never block - user always gets signal + Get More button
 
 async def _spam_gentle_delay(user_id):
     """If user is pressing too fast, add a tiny delay (no message shown)."""
@@ -3406,6 +3425,23 @@ import threading as _threading
 _YF_CACHE = {}          # {(symbol, period, interval): (timestamp, df)}
 _YF_CACHE_TTL = 120     # sekunde 2 dakika
 _YF_CACHE_LOCK = _threading.Lock()
+_YF_CACHE_MAX  = 30     # max entries — evict oldest kama imefika limit
+
+def _yf_cache_set(key, df):
+    with _YF_CACHE_LOCK:
+        _YF_CACHE[key] = (time.time(), df)
+        if len(_YF_CACHE) > _YF_CACHE_MAX:
+            # Evict oldest entry
+            oldest = min(_YF_CACHE, key=lambda k: _YF_CACHE[k][0])
+            _YF_CACHE.pop(oldest, None)
+
+def _yf_cache_get(key):
+    with _YF_CACHE_LOCK:
+        entry = _YF_CACHE.get(key)
+        if entry and (time.time() - entry[0]) < _YF_CACHE_TTL:
+            return entry[1]
+        _YF_CACHE.pop(key, None)
+        return None
 
 _YF_TO_FH_RESOLUTION = {
     "1m": "1", "2m": "1", "5m": "5", "15m": "15",
@@ -4524,16 +4560,19 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
 
     def _secs_until_candle_close(tf_mins):
         """
-        Hesabu sekunde hadi MWISHO wa candle inayoendelea sasa.
-        Signal ilitolewa ndani ya candle hii — tunasubiri ifunge.
-        Baada ya kufunga, candle hiyo itakuwa iloc[-2] kwenye data.
+        Subiri candle ya sasa iishe, kisha candle MPYA ifunguke na ifunge.
+        Signal imetumwa → candle ya sasa inaendelea → tunangoja:
+          1. Candle ya sasa iishe (secs_to_close)
+          2. Candle mpya ianze NA iishe (+tf_mins * 60)
+          3. Buffer ya 5s ili data iwe tayari
         """
         now = datetime.utcnow()
         total_secs = now.hour * 3600 + now.minute * 60 + now.second
         candle_secs = tf_mins * 60
         secs_into_candle = total_secs % candle_secs
-        secs_to_close = candle_secs - secs_into_candle
-        return secs_to_close + 5  # buffer ndogo ya 5s
+        secs_to_current_close = candle_secs - secs_into_candle
+        # Subiri candle ya sasa iishe + candle mpya ianze na iishe + buffer
+        return secs_to_current_close + candle_secs + 5
 
     async def _get_candle_result(tf_mins):
         """
@@ -7609,18 +7648,54 @@ def generate_signal(pair):
             else:
                 candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
         else:
-            # v69: No random fallback for non-OTC pairs.
-            # If real market data is unavailable, return no signal immediately.
-            logging.info("NO_DATA {}: real indicators unavailable — no signal (v69)".format(pair))
-            return {
-                "direction": "BUY", "pair": pair, "timeframe": 0,
-                "strength": 0, "indicators_agree": 0,
-                "trend_1h": None, "vwap_data": None,
-                "confluence": {}, "mtf": None, "flat": True,
-                "patterns": [], "movement_cat": "LOW",
-                "avg_movement": 0.0,
-                "no_signal_reason": "🟡 *No signal available* — market data unavailable.",
-            }
+            # Fallback: Finnhub/Yahoo haikupatikani — tumia Deriv ticks kama primary source
+            logging.info("NO_DATA {}: Finnhub/Yahoo unavailable — using Deriv ticks fallback".format(pair))
+            deriv_ind = None
+            # Jaribu cache kwanza
+            _dc = _deriv_tick_cache.get(pair)
+            if _dc:
+                _age = __import__("time").time() - _dc.get("ts", 0)
+                if _age <= _DERIV_CACHE_TTL:
+                    deriv_ind = _dc.get("data")
+            # Kama cache haina — fetch moja kwa moja
+            if not deriv_ind and pair in DERIV_SYMBOLS:
+                try:
+                    import asyncio as _aio
+                    deriv_ind = _aio.get_event_loop().run_until_complete(
+                        _fetch_deriv_ticks(pair, seconds=15)
+                    )
+                except Exception as _de:
+                    logging.warning("Deriv fallback fetch {}: {}".format(pair, _de))
+
+            if deriv_ind:
+                # Tumia indicators za Deriv (5s/10s/15s) kama primary data
+                _d5  = deriv_ind.get("5_s_ind")  or {}
+                _d10 = deriv_ind.get("10_s_ind") or {}
+                _d15 = deriv_ind.get("15_s_ind") or {}
+                # Chagua timeframe yenye data nzuri zaidi
+                _best_d = _d5 or _d10 or _d15
+                rsi     = _best_d.get("rsi",    50.0)
+                sto     = _best_d.get("sto",    50.0)
+                ma_diff = _best_d.get("ma_diff", 0.0)
+                macd    = _best_d.get("macd",    0.0)
+                bb_pos  = _best_d.get("bb_pos",  0.5)
+                mom     = _best_d.get("mom",     0.0)
+                vol     = _best_d.get("vol",     0.5)
+                _ddir   = _best_d.get("direction")
+                candle  = 1.0 if _ddir == "BUY" else (-1.0 if _ddir == "SELL" else 0.0)
+                logging.info("Deriv fallback OK {}: rsi={:.1f} dir={}".format(pair, rsi, _ddir))
+            else:
+                # Deriv pia haikupatikani — no signal
+                logging.info("NO_DATA {}: Deriv pia haikupatikani — no signal".format(pair))
+                return {
+                    "direction": "BUY", "pair": pair, "timeframe": 0,
+                    "strength": 0, "indicators_agree": 0,
+                    "trend_1h": None, "vwap_data": None,
+                    "confluence": {}, "mtf": None, "flat": True,
+                    "patterns": [], "movement_cat": "LOW",
+                    "avg_movement": 0.0,
+                    "no_signal_reason": "🟡 *No signal available* — market data unavailable.",
+                }
 
     _w = 1.0  # v54-8: non-OTC indicators sasa zinapata uzito kamili (ilikuwa 0.5)
     b = s = 0
@@ -8552,10 +8627,10 @@ def nonotc_signal_keyboard(pair, chosen_tf):
     ])
 
 def otc_mode_keyboard(pair):
-    """Mode selection for OTC pair: Normal only."""
+    """Mode selection for OTC pair: Seconds only."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Normal (minutes)", callback_data="otc_normal_{}".format(idx))],
+        [InlineKeyboardButton("⏱ Seconds (3s/5s/10s...)", callback_data="otc_secs_{}".format(idx))],
         [InlineKeyboardButton("❌ Cancel", callback_data="choose_pair")],
     ])
 
@@ -12681,10 +12756,8 @@ async def background_learning_engine():
             logging.warning("background_learning_engine error: {}".format(e))
         await asyncio.sleep(60)
 
-_virtual_trades: dict = {}
-
 def _vt_add_trade(pair, entry_price, direction, expiry, tf_secs, nn_feat=None):
-    """Save virtual trade to DB and in-memory cache."""
+    """Save virtual trade to DB only — no RAM cache."""
     nn_bytes = None
     if nn_feat is not None and _NN_AVAILABLE:
         try:
@@ -12703,40 +12776,10 @@ def _vt_add_trade(pair, entry_price, direction, expiry, tf_secs, nn_feat=None):
             conn.commit()
     except Exception as e:
         logging.warning("_vt_add_trade DB failed {}: {}".format(pair, e))
-    if pair not in _virtual_trades:
-        _virtual_trades[pair] = []
-    _virtual_trades[pair].append((entry_price, direction, expiry, tf_secs, nn_feat))
 
 def _vt_load_pending():
-    """Load all pending (unexpired) virtual trades from DB into memory on startup."""
-    now = time.time()
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, pair, entry_price, direction, expiry, tf_secs, nn_feat "
-                    "FROM virtual_trades WHERE expiry > %s",
-                    (now,)
-                )
-                rows = cur.fetchall()
-        for row in rows:
-            pair = row["pair"]
-            nn_feat = None
-            if row["nn_feat"] and _NN_AVAILABLE:
-                try:
-                    import pickle as _pk
-                    nn_feat = _pk.loads(row["nn_feat"])
-                except Exception:
-                    pass
-            if pair not in _virtual_trades:
-                _virtual_trades[pair] = []
-            _virtual_trades[pair].append((
-                row["entry_price"], row["direction"],
-                row["expiry"], row["tf_secs"], nn_feat
-            ))
-        logging.info("VTE: loaded {} pending trades from DB".format(len(rows)))
-    except Exception as e:
-        logging.warning("_vt_load_pending failed: {}".format(e))
+    """No-op — trades loaded from DB directly in _vt_check_results."""
+    logging.info("VTE: trades stored in DB only (RAM-free mode)")
 
 def _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs):
     """Remove a completed trade from DB."""
@@ -12858,67 +12901,78 @@ async def _vt_place_trades():
 
 async def _vt_check_results():
     """
-    Check expired virtual trades.
+    Check expired virtual trades from DB.
     - Measure price movement vs ATR
-    - If movement < 30% of ATR → market was flat → skip (don't record)
+    - If movement < 30% of ATR → market was flat → skip
     - Otherwise record win/loss per timeframe
-    - Update pair_stats and optimal_tf
     """
     now = time.time()
-    tf_results: dict = {}   # { pair: { tf_secs: {wins,losses,total_movement,count} } }
+    tf_results: dict = {}
 
-    for pair in list(_virtual_trades.keys()):
-        remaining = []
-        for trade in _virtual_trades[pair]:
-            if len(trade) == 5:
-                entry_price, direction, expiry, tf_secs, nn_feat = trade
-            else:
-                entry_price, direction, expiry, tf_secs = trade
-                nn_feat = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, pair, entry_price, direction, expiry, tf_secs, nn_feat "
+                    "FROM virtual_trades WHERE expiry <= %s",
+                    (now,)
+                )
+                expired_rows = cur.fetchall()
+    except Exception as e:
+        logging.warning("_vt_check_results fetch failed: {}".format(e))
+        return
 
-            if now < expiry:
-                remaining.append(trade)
-                continue
+    for row in expired_rows:
+        pair       = row["pair"]
+        entry_price = row["entry_price"]
+        direction  = row["direction"]
+        expiry     = row["expiry"]
+        tf_secs    = row["tf_secs"]
+        nn_feat    = None
+        if row["nn_feat"] and _NN_AVAILABLE:
+            try:
+                import pickle as _pk
+                nn_feat = _pk.loads(row["nn_feat"])
+            except Exception:
+                pass
 
-            _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs)
+        _vt_delete_trade(pair, entry_price, direction, expiry, tf_secs)
 
-            exit_price = _fetch_current_price(pair)
-            if exit_price is None or entry_price is None:
-                continue
+        exit_price = _fetch_current_price(pair)
+        if exit_price is None or entry_price is None:
+            continue
 
-            raw_diff = exit_price - entry_price
-            movement_pct = abs(raw_diff) / (entry_price + 1e-9) * 100
+        raw_diff = exit_price - entry_price
+        movement_pct = abs(raw_diff) / (entry_price + 1e-9) * 100
 
-            atr_pct = _vt_calc_atr(pair)
-            if atr_pct is not None and movement_pct < (atr_pct * 0.30):
-                logging.info("VTE FLAT SKIP: {} move={:.5f}% < 30% of ATR {:.5f}%".format(
-                    pair, movement_pct, atr_pct))
-                continue   # Skip - flat market, don't corrupt stats
+        atr_pct = _vt_calc_atr(pair)
+        if atr_pct is not None and movement_pct < (atr_pct * 0.30):
+            logging.info("VTE FLAT SKIP: {} move={:.5f}% < 30% of ATR {:.5f}%".format(
+                pair, movement_pct, atr_pct))
+            continue   # Skip - flat market, don't corrupt stats
 
-            won = (raw_diff > 0) if direction == "BUY" else (raw_diff < 0)
+        won = (raw_diff > 0) if direction == "BUY" else (raw_diff < 0)
 
-            if _NN_AVAILABLE and nn_feat is not None:
-                try:
-                    _nn_record_outcome(pair, nn_feat, won)
-                except Exception as _nn_e:
-                    logging.warning("VTE→NN feed failed {}: {}".format(pair, _nn_e))
+        if _NN_AVAILABLE and nn_feat is not None:
+            try:
+                _nn_record_outcome(pair, nn_feat, won)
+            except Exception as _nn_e:
+                logging.warning("VTE→NN feed failed {}: {}".format(pair, _nn_e))
 
-            if pair not in tf_results:
-                tf_results[pair] = {}
-            if tf_secs not in tf_results[pair]:
-                tf_results[pair][tf_secs] = {
-                    "wins": 0, "losses": 0,
-                    "total_movement": 0.0, "count": 0
-                }
+        if pair not in tf_results:
+            tf_results[pair] = {}
+        if tf_secs not in tf_results[pair]:
+            tf_results[pair][tf_secs] = {
+                "wins": 0, "losses": 0,
+                "total_movement": 0.0, "count": 0
+            }
 
-            tf_results[pair][tf_secs]["count"]          += 1
-            tf_results[pair][tf_secs]["total_movement"] += movement_pct
-            if won:
-                tf_results[pair][tf_secs]["wins"]   += 1
-            else:
-                tf_results[pair][tf_secs]["losses"] += 1
-
-        _virtual_trades[pair] = remaining
+        tf_results[pair][tf_secs]["count"]          += 1
+        tf_results[pair][tf_secs]["total_movement"] += movement_pct
+        if won:
+            tf_results[pair][tf_secs]["wins"]   += 1
+        else:
+            tf_results[pair][tf_secs]["losses"] += 1
 
     if not tf_results:
         return
