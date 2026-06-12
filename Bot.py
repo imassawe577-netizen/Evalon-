@@ -2084,6 +2084,68 @@ def get_expiry_text(user_id):
 def free_signals_used(user_id):
     return get_user(user_id).get("free_used", 0)
 
+BROKER_LIST = [
+    # ⭐ TIER 1 — Maarufu sana
+    ("⭐ Quotex",          "quotex"),
+    ("⭐ Pocket Option",   "pocket_option"),
+    ("⭐ IQ Option",       "iq_option"),
+    ("⭐ Binolla",         "binolla"),
+    ("⭐ Olymp Trade",     "olymp_trade"),
+    ("⭐ Deriv",           "deriv"),
+    # 🔥 TIER 2 — Maarufu
+    ("🔥 Binomo",          "binomo"),
+    ("🔥 ExpertOption",    "expertoption"),
+    ("🔥 IQCent",          "iqcent"),
+    ("🔥 Raceoption",      "raceoption"),
+    ("🔥 Binarycent",      "binarycent"),
+    ("🔥 Videforex",       "videforex"),
+    ("🔥 Binarymate",      "binarymate"),
+    # 💼 TIER 3 — Zingine
+    ("💼 Bullex",          "bullex"),
+    ("💼 Finmax",          "finmax"),
+    ("💼 BinaryCom",       "binarycom"),
+    ("💼 Capitalcore",     "capitalcore"),
+    ("💼 Nadex",           "nadex"),
+    ("💼 Binaryx",         "binaryx"),
+    ("💼 Spectre",         "spectre"),
+]
+
+def get_broker_selected(user_id):
+    """Returns broker string or None if not yet selected."""
+    return get_user(user_id).get("broker_selected", None)
+
+def set_broker_selected(user_id, broker):
+    """Save user's chosen broker to DB."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET broker_selected = %s WHERE user_id = %s",
+                (broker, user_id)
+            )
+        conn.commit()
+
+_BROKER_KEY_TO_NAME = {cb: name for name, cb in BROKER_LIST}
+
+def get_broker_display(user_id):
+    """Returns formatted broker line for signal captions, e.g. '🏦 Broker: ⭐ Pocket Option'
+    Returns empty string if no broker selected."""
+    key = get_broker_selected(user_id)
+    if not key:
+        return ""
+    name = _BROKER_KEY_TO_NAME.get(key, key.replace("_", " ").title())
+    return "🏦 Broker: {}".format(name)
+
+def broker_selection_keyboard():
+    """Build inline keyboard for broker selection — 2 per row."""
+    rows = []
+    buttons = [InlineKeyboardButton(name, callback_data="broker_select_{}".format(cb))
+               for name, cb in BROKER_LIST]
+    # Pack 2 per row
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i+2])
+    return InlineKeyboardMarkup(rows)
+# ───────────────────────────────────────────────────────────────────────────
+
 def use_free_signal(user_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
