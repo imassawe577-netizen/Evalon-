@@ -13,7 +13,8 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -25,8 +26,8 @@ PORT       = int(os.environ.get("PORT", 8080))
 SCAN_SECS  = 60
 COOLDOWN_SECS = 180   # dakika 3
 
-BUY_IMAGE  = "AgACAgQAAxkBAAICImoJRV1p8boUWCqbwbFQw5ZGFKi0AAJgDmsbgwZJUEAvhDh1tBD2AQADAgADeAADOwQ"
-SELL_IMAGE = "AgACAgQAAxkBAAICJGoJRZxn3w0clOl57ozxypDEUij0AAJhDmsbgwZJUBAZYceshO6HAQADAgADeAADOwQ"
+BUY_IMAGE  = os.environ.get("BUY_IMAGE",  "")
+SELL_IMAGE = os.environ.get("SELL_IMAGE", "")
 
 PAIRS = {
     "EUR/USD": "EURUSD=X",
@@ -243,33 +244,50 @@ async def check_result(bot, pair, symbol, direction, entry_price, wait_secs):
     except TelegramError as e:
         logging.warning("Result send failed {}: {}".format(pair, e))
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-async def main():
-    if not BOT_TOKEN:
-        logging.error("BOT_TOKEN haijawekwa kwenye env vars.")
-        return
-
-    bot = Bot(token=BOT_TOKEN)
-
-    try:
-        me = await bot.get_me()
-        logging.info("Bot connected: @{}".format(me.username))
-    except Exception as e:
-        logging.error("Bot connection failed: {}".format(e))
-        return
-
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text=(
-            "\u2705 *EVALON Signal Bot Started*\n"
-            "\U0001f4e1 Scanning {} pairs...\n"
-            "_SuperTrend + Fractal_"
-        ).format(len(PAIRS)),
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ *EVALON Signal Bot*\n\n"
+        "📡 Bot inafanya kazi — inascan pairs zote.\n"
+        "⚡ Signal itatumwa moja kwa moja ukifika.\n\n"
+        "📌 Commands:\n"
+        "/start — maelezo\n"
+        "/status — hali ya pairs\n"
+        "/getid — tuma picha upate file\\_id yake",
         parse_mode="Markdown"
     )
 
-    logging.info("Scan loop started.")
+async def cmd_getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📸 Tuma picha yako sasa — nitakurudishia file\\_id yake.",
+        parse_mode="Markdown"
+    )
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mtumiaji anapotuma picha, rudisha file_id yake."""
+    photo = update.message.photo[-1]  # Pata resolution kubwa zaidi
+    file_id = photo.file_id
+    await update.message.reply_text(
+        "✅ *File ID yako:*\n\n`{}`\n\n"
+        "Copy hii uweke kwenye Render Environment Variables kama `BUY_IMAGE` au `SELL_IMAGE`.".format(file_id),
+        parse_mode="Markdown"
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs_ready = []
+    for pair in PAIRS:
+        last = _COOLDOWN.get(pair, 0)
+        remaining = COOLDOWN_SECS - (time.time() - last)
+        if remaining <= 0:
+            pairs_ready.append("🟢 {}".format(pair))
+        else:
+            pairs_ready.append("🔴 {} ({}s)".format(pair, int(remaining)))
+    text = "📊 *Bot Status*\n\n" + "\n".join(pairs_ready)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ─── SCAN LOOP (runs as background task) ──────────────────────────────────────
+async def scan_loop(bot: Bot):
+    logging.info("Scan loop started.")
     while True:
         if not is_market_open():
             logging.info("Market closed — waiting 5min...")
@@ -279,7 +297,6 @@ async def main():
         for pair, symbol in PAIRS.items():
             if time.time() - _COOLDOWN.get(pair, 0) < COOLDOWN_SECS:
                 continue
-
             try:
                 df = fetch_candles(symbol)
                 if df is None or len(df) < 30:
@@ -287,7 +304,6 @@ async def main():
 
                 st_dir   = calc_supertrend(df)
                 frac_dir = calc_fractal(df)
-
                 logging.info("{} ST={} Fractal={}".format(pair, st_dir, frac_dir))
 
                 if not st_dir or not frac_dir or st_dir != frac_dir:
@@ -298,36 +314,41 @@ async def main():
                 entry_str, secs_to_open, secs_to_close = next_candle_info()
 
                 ib        = direction == "BUY"
-                dir_arrow = "\U0001f4c8" if ib else "\U0001f4c9"
-                dir_label = "BUY \U0001f7e2" if ib else "SELL \U0001f534"
+                dir_arrow = "📈" if ib else "📉"
+                dir_label = "BUY 🟢" if ib else "SELL 🔴"
                 img       = BUY_IMAGE if ib else SELL_IMAGE
 
                 caption = (
-                    "\U0001f3c6 *EVALON WINNERS* \U0001f3c6\n\n"
-                    "\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\n"
-                    "\U0001f4ca PAIR      : *{}*\n"
-                    "\u23f1 EXPIRY    : *1 MIN*\n"
-                    "\U0001f550 ENTRY     : *{}*\n"
+                    "🏆 *EVALON WINNERS* 🏆\n\n"
+                    "──────────────\n"
+                    "📊 PAIR      : *{}*\n"
+                    "⏱ EXPIRY    : *1 MIN*\n"
+                    "🕐 ENTRY     : *{}*\n"
                     "{} DIRECTION : *{}*\n"
-                    "\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\n\n"
-                    "\u26a1 Open at next candle\n"
-                    "_SuperTrend + Fractal confirmed_"
+                    "──────────────\n\n"
+                    "⚡ Open at next candle\n"
+                    "Signal confirmed_"
                 ).format(pair, entry_str, dir_arrow, dir_label)
 
-                await bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=img,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
+                if img:
+                    await bot.send_photo(
+                        chat_id=CHAT_ID,
+                        photo=img,
+                        caption=caption,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=caption,
+                        parse_mode="Markdown"
+                    )
                 _COOLDOWN[pair] = time.time()
                 logging.info("SIGNAL: {} {} @ {}".format(pair, direction, entry_price))
 
-                # Result check background task
                 asyncio.create_task(
                     check_result(bot, pair, symbol, direction, entry_price, secs_to_close + 5)
                 )
-
                 await asyncio.sleep(2)
 
             except TelegramError as te:
@@ -336,6 +357,43 @@ async def main():
                 logging.warning("Error {}: {}".format(pair, e))
 
         await asyncio.sleep(SCAN_SECS)
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+async def main():
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN haijawekwa kwenye env vars.")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("getid",  cmd_getid))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=["message"])
+
+    me = await app.bot.get_me()
+    logging.info("Bot connected: @{}".format(me.username))
+
+    await app.bot.send_message(
+        chat_id=CHAT_ID,
+        text=(
+            "✅ *EVALON Signal Bot Started*\n"
+            "📡 Scanning {} pairs...\n"
+            "_SuperTrend + Fractal_"
+        ).format(len(PAIRS)),
+        parse_mode="Markdown"
+    )
+
+    # Anza scan loop background
+    asyncio.create_task(scan_loop(app.bot))
+
+    # Keep alive
+    while True:
+        await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
