@@ -4433,7 +4433,7 @@ def get_user_signal_state(user_id, pair):
         logging.warning("get_user_signal_state failed: {}".format(e))
         return None
 
-def save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None):
+def save_user_signal_state(user_id, pair, direction, timeframe, flip_count=0, entry_price=None):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -4487,75 +4487,84 @@ def get_cooldown_remaining(user_id, pair):
         cooldown_until = datetime.fromisoformat(cooldown_until)
     return max(0, int((cooldown_until - datetime.utcnow()).total_seconds()))
 
+def check_signal_request(user_id, pair):
+    state = get_user_signal_state(user_id, pair)
+    if state is None:
+        return {"action": "fresh"}
+    signal_time = state["signal_time"]
+    if isinstance(signal_time, str):
+        signal_time = datetime.fromisoformat(signal_time)
+    elapsed    = (datetime.utcnow() - signal_time).total_seconds()
+    threshold  = state["last_timeframe"] * 60
+    flip_count = state["flip_count"]
+    if elapsed >= threshold:
+        clear_user_signal_state(user_id, pair)
+        return {"action": "fresh"}
+    flipped = "SELL" if state["last_direction"] == "BUY" else "BUY"
+    if flip_count == 0:
+        return {"action": "flip", "direction": flipped}
+    else:
+        return {"action": "same", "direction": flipped}
+
+
+
 async def schedule_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price):
     """
-    v54-8: Candle-Close Result Tracker.
+    Candle-Close Result Tracker — non-OTC only.
 
-    Mantiki sahihi ya binary options:
-      - Subiri candle IFUNGE kabisa (siyo tu dakika 1 baada ya signal)
-      - Angalia open vs close ya candle iliyofungwa (iloc[-2])
-      - Green candle = BUY win, Red candle = SELL win
-      - Timing: hesabu sekunde hadi mwisho wa dakika inayofuata
-
-    Kwa TF 1m: subiri candle 1 ifunge
-    Kwa TF 2m: subiri candles 2 zifunge
-    Kwa TF 3m: subiri candles 3 zifunge
+    - Subiri candle ya TF iliyotajwa IFUNGE KWANZA baada ya signal
+    - Angalia open vs close ya candle hiyo
+    - Green = BUY win, Red = SELL win, Doji = DOJI (tuma kama doji)
+    - Hifadhi matokeo kwenye DB
     """
     if entry_price is None:
         return
 
     _ep = entry_price
 
-    def _secs_until_next_candle_close(tf_mins):
+    def _secs_until_candle_close(tf_mins):
         """
-        Hesabu sekunde hadi candle INAYOFUATA ifunge.
-
-        Mfano: signal 14:32:40, expiry 1m
-          Trade inaanza  14:32:40
-          Expiry         14:33:40
-          Candle ifunge  14:34:00  ← hapa ndio tunasubiri
-          (siyo 14:33:00 ambayo ni candle ya sasa tu)
-
-        Formula:
-          secs_to_end_current = candle_secs - (now % candle_secs)
-          secs_to_next_close  = secs_to_end_current + candle_secs + 5s buffer
+        Hesabu sekunde hadi MWISHO wa candle inayoendelea sasa.
+        Signal ilitolewa ndani ya candle hii — tunasubiri ifunge.
+        Baada ya kufunga, candle hiyo itakuwa iloc[-2] kwenye data.
         """
         now = datetime.utcnow()
         total_secs = now.hour * 3600 + now.minute * 60 + now.second
         candle_secs = tf_mins * 60
         secs_into_candle = total_secs % candle_secs
-        secs_to_end_current = candle_secs - secs_into_candle
-        # Subiri candle ya sasa iishe + candle inayofuata iishe + buffer 5s
-        return secs_to_end_current + candle_secs + 5
+        secs_to_close = candle_secs - secs_into_candle
+        return secs_to_close + 5  # buffer ndogo ya 5s
 
     async def _get_candle_result(tf_mins):
         """
-        Angalia candle iliyofungwa hivi karibuni.
-        Returns: True (won), False (lost), None (data haikupatikana)
+        Angalia candle iliyofungwa hivi karibuni (iloc[-2]).
+        Returns: True (win), False (loss), "doji" (doji), None (data haikupatikana)
         """
         real_pair = OTC_TO_REAL.get(pair, pair)
         yf_sym    = YAHOO_SYMBOLS.get(real_pair)
         fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
 
-        # Jaribu mara 3 kwa interval ya 5s kama data haipo bado
         for attempt in range(3):
-            # Jaribu Finnhub 1m kwanza (haraka zaidi)
+            # Finnhub kwanza (haraka zaidi, 1m tu)
             if fh_sym and FINNHUB_KEY and tf_mins == 1:
                 try:
                     df = _mtf_fh_candles(fh_sym, "1", 5)
                     if df is not None and len(df) >= 2:
-                        closed_open  = float(df["Open"].iloc[-2])
-                        closed_close = float(df["Close"].iloc[-2])
-                        is_green = closed_close > closed_open
-                        is_red   = closed_close < closed_open
-                        logging.info("CANDLE RESULT Finnhub {}: open={:.5f} close={:.5f} green={} dir={}".format(
-                            pair, closed_open, closed_close, is_green, direction))
-                        if is_green == is_red:  # wote ni False = doji, skip
-                            await asyncio.sleep(5)
-                            continue
-                        return (direction == "BUY" and is_green) or (direction == "SELL" and is_red)
+                        c_open  = float(df["Open"].iloc[-2])
+                        c_close = float(df["Close"].iloc[-2])
+                        body    = abs(c_close - c_open)
+                        c_range = float(df["High"].iloc[-2]) - float(df["Low"].iloc[-2])
+                        logging.info("RESULT Finnhub {}: open={:.5f} close={:.5f} dir={}".format(
+                            pair, c_open, c_close, direction))
+                        # Doji: body < 10% ya range
+                        if c_range > 1e-8 and body / c_range < 0.10:
+                            return "doji"
+                        if c_close == c_open:
+                            return "doji"
+                        is_green = c_close > c_open
+                        return (direction == "BUY" and is_green) or (direction == "SELL" and not is_green)
                 except Exception as _fe:
-                    logging.warning("Finnhub candle result {} failed: {}".format(pair, _fe))
+                    logging.warning("Finnhub result {} attempt {}: {}".format(pair, attempt, _fe))
 
             # Yahoo Finance fallback
             if yf_sym:
@@ -4563,23 +4572,27 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                     interval = "1m" if tf_mins == 1 else ("2m" if tf_mins == 2 else "5m")
                     df = _yf_download_cached(yf_sym, "1d", interval)
                     if df is not None and len(df) >= 2:
-                        closed_open  = float(df["Open"].squeeze().iloc[-2])
-                        closed_close = float(df["Close"].squeeze().iloc[-2])
-                        is_green = closed_close > closed_open
-                        is_red   = closed_close < closed_open
-                        logging.info("CANDLE RESULT Yahoo {}: open={:.5f} close={:.5f} green={} dir={}".format(
-                            pair, closed_open, closed_close, is_green, direction))
-                        if is_green == is_red:  # doji - jaribu tena
-                            await asyncio.sleep(5)
-                            continue
-                        return (direction == "BUY" and is_green) or (direction == "SELL" and is_red)
+                        c_open  = float(df["Open"].squeeze().iloc[-2])
+                        c_close = float(df["Close"].squeeze().iloc[-2])
+                        c_high  = float(df["High"].squeeze().iloc[-2])
+                        c_low   = float(df["Low"].squeeze().iloc[-2])
+                        body    = abs(c_close - c_open)
+                        c_range = c_high - c_low
+                        logging.info("RESULT Yahoo {}: open={:.5f} close={:.5f} dir={}".format(
+                            pair, c_open, c_close, direction))
+                        if c_range > 1e-8 and body / c_range < 0.10:
+                            return "doji"
+                        if c_close == c_open:
+                            return "doji"
+                        is_green = c_close > c_open
+                        return (direction == "BUY" and is_green) or (direction == "SELL" and not is_green)
                 except Exception as _ye:
-                    logging.warning("Yahoo candle result {} failed: {}".format(pair, _ye))
+                    logging.warning("Yahoo result {} attempt {}: {}".format(pair, attempt, _ye))
 
             await asyncio.sleep(5)
 
-        # Fallback wa mwisho: tumia price diff kama candle data haikupatikana
-        logging.warning("CANDLE RESULT {}: fallback to price diff".format(pair))
+        # Fallback wa mwisho: price diff
+        logging.warning("RESULT {}: fallback to price diff".format(pair))
         exit_p = _fetch_current_price(pair)
         if exit_p is not None and _ep is not None:
             diff = exit_p - _ep
@@ -4587,9 +4600,9 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                 return (diff > 0) if direction == "BUY" else (diff < 0)
         return None
 
-    def _record_outcome(tf, won):
-        """Hifadhi matokeo kwenye DB tables zote."""
-        if won is None:
+    def _record_outcome(won):
+        """Hifadhi matokeo kwenye DB. won: True/False/None ('doji' haihifadhiwi)."""
+        if won is None or won == "doji":
             return
         try:
             session = _get_session().get("name", "Unknown")
@@ -4604,131 +4617,93 @@ async def schedule_result_check(bot, chat_id, user_id, pair, direction, timefram
                         VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (pair, session, tf_mins) DO UPDATE
                             SET {} = tf_session_stats.{} + 1
-                    """.format(col, col), (pair, session, tf, 1 if won else 0, 0 if won else 1))
+                    """.format(col, col), (pair, session, timeframe_mins, 1 if won else 0, 0 if won else 1))
                 conn.commit()
         except Exception as _e:
-            logging.warning("result tf_session_stats tf={} {}: {}".format(tf, pair, _e))
+            logging.warning("result tf_session_stats {}: {}".format(pair, _e))
         try:
-            update_signal_combo_stats(pair=pair, direction=direction, tf_mins=tf,
+            update_signal_combo_stats(pair=pair, direction=direction, tf_mins=timeframe_mins,
                                       won=won, session=session)
         except Exception as _e:
-            logging.warning("result combo_stats tf={} {}: {}".format(tf, pair, _e))
-        if tf == timeframe_mins:
-            try:
-                update_pair_stats(pair, won)
-            except Exception as _e:
-                logging.warning("result pair_stats tf={} {}: {}".format(tf, pair, _e))
-        logging.info("RESULT_RECORDED {}: dir={} tf={}m won={}".format(pair, direction, tf, won))
-
-    # ── Mzunguko wa TFs 1m, 2m, 3m ──
-    for check_tf in [1, 2, 3]:
-
-        # Hesabu muda wa kusubiri hadi candle ya check_tf ifunge
-        wait_secs = _secs_until_next_candle_close(check_tf)
-        logging.info("RESULT WAIT {}: tf={}m sleeping {:.0f}s".format(pair, check_tf, wait_secs))
-        await asyncio.sleep(wait_secs)
-
-        # Angalia kama user amebadilisha signal (signal mpya)
+            logging.warning("result combo_stats {}: {}".format(pair, _e))
         try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT entry_price FROM user_signal_state "
-                        "WHERE user_id=%s AND pair=%s", (user_id, pair))
-                    row = cur.fetchone()
-            if row and row.get("entry_price") is not None:
-                _ep2 = float(row["entry_price"])
-                if abs(_ep2 - _ep) > 1e-6:
-                    logging.info("RESULT {}: entry changed ({} vs {}), stopping".format(
-                        pair, _ep, _ep2))
-                    return
+            update_pair_stats(pair, won)
+        except Exception as _e:
+            logging.warning("result pair_stats {}: {}".format(pair, _e))
+        try:
+            nn_feedback_from_vte(user_id, pair, won)
         except Exception:
             pass
+        logging.info("RESULT_RECORDED {}: dir={} tf={}m won={}".format(pair, direction, timeframe_mins, won))
 
-        # Angalia candle iliyofungwa
-        won = await _get_candle_result(check_tf)
-        _record_outcome(check_tf, won)
+    # Subiri candle ya TF iliyotajwa ifunge
+    wait_secs = _secs_until_candle_close(timeframe_mins)
+    logging.info("RESULT WAIT {}: tf={}m sleeping {:.0f}s".format(pair, timeframe_mins, wait_secs))
+    await asyncio.sleep(wait_secs)
 
-        # Tuma result kwa mtumiaji (TF yao tu)
-        if check_tf == timeframe_mins:
-            try:
-                nn_feedback_from_vte(user_id, pair, won)
-            except Exception:
-                pass
-
-            if not is_results_enabled() or "OTC" in pair or won is None:
+    # Angalia kama user amebadilisha signal (signal mpya)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT entry_price FROM user_signal_state "
+                    "WHERE user_id=%s AND pair=%s", (user_id, pair))
+                row = cur.fetchone()
+        if row and row.get("entry_price") is not None:
+            _ep2 = float(row["entry_price"])
+            if abs(_ep2 - _ep) > 1e-6:
+                logging.info("RESULT {}: entry changed, signal replaced — stopping".format(pair))
                 return
+    except Exception:
+        pass
 
-            won_label  = "WIN ✅" if won else "LOSS ❌"
-            dir_label  = "BUY 🟢" if direction == "BUY" else "SELL 🔴"
-            dir_arrow  = "📈" if direction == "BUY" else "📉"
-            won_footer = (
-                "💰 Congratulations\\! Another profit secured\\!\n"
-                "🔥 Stay focused — more signals coming\\!\n"
-                "💎 VVIP MEMBERS ONLY"
-            ) if won else (
-                "📉 Not every trade wins — stay disciplined\\!\n"
-                "🔁 Next signal coming soon\\.\n"
-                "💎 VVIP MEMBERS ONLY"
-            )
-            result_text = (
-                "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
-                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-                "📊 PAIR      : *{}*\n"
-                "⏱ EXPIRY    : *{} MIN*\n"
-                "{} DIRECTION : *{}*\n"
-                "🏆 RESULT    : *{}*\n"
-                "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
-                "{}"
-            ).format(pair, timeframe_mins, dir_arrow, dir_label, won_label, won_footer)
-            try:
-                sent = await bot.send_message(chat_id=chat_id, text=result_text,
-                                              parse_mode="Markdown")
-                push_msg_id(user_id, sent.message_id)
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE user_signal_state SET result_sent=TRUE, result_msg_id=%s "
-                            "WHERE user_id=%s AND pair=%s",
-                            (sent.message_id, user_id, pair))
-                    conn.commit()
-            except Exception as e:
-                logging.warning("schedule_result_check send failed: {}".format(e))
-            return  # Tumekwisha — toka baada ya TF ya mtumiaji
+    # Angalia candle iliyofungwa
+    won = await _get_candle_result(timeframe_mins)
+    _record_outcome(won)
 
-        if check_tf == 3:
-            break
+    if not is_results_enabled() or "OTC" in pair:
+        return
 
-def check_signal_request(user_id, pair):
-    """
-    Returns:
-      {"action": "fresh"}
-      {"action": "flip",   "direction": X}  -- first quick return, flip direction
-      {"action": "same",   "direction": X}  -- 2nd+ quick return, keep flipped (warning baada ya 4th press)
-      {"action": "cooldown"}                -- still in cooldown
-    """
-
-    state = get_user_signal_state(user_id, pair)
-    if state is None:
-        return {"action": "fresh"}
-
-    signal_time = state["signal_time"]
-    if isinstance(signal_time, str):
-        signal_time = datetime.fromisoformat(signal_time)
-    elapsed    = (datetime.utcnow() - signal_time).total_seconds()
-    threshold  = state["last_timeframe"] * 60
-    flip_count = state["flip_count"]
-
-    if elapsed >= threshold:
-        clear_user_signal_state(user_id, pair)
-        return {"action": "fresh"}
-
-    flipped = "SELL" if state["last_direction"] == "BUY" else "BUY"
-
-    if flip_count == 0:
-        return {"action": "flip", "direction": flipped}
+    # Andika label ya matokeo
+    if won == "doji":
+        result_label  = "DOJI 〰️"
+        result_footer = "〰️ Candle closed as a Doji — no clear winner\\.\n🔁 Try the next signal\\.\n💎 VVIP MEMBERS ONLY"
+        result_emoji  = "〰️"
+    elif won is True:
+        result_label  = "WIN ✅"
+        result_footer = "💰 Congratulations\\! Another profit secured\\!\n🔥 Stay focused — more signals coming\\!\n💎 VVIP MEMBERS ONLY"
+        result_emoji  = "📈" if direction == "BUY" else "📉"
+    elif won is False:
+        result_label  = "LOSS ❌"
+        result_footer = "📉 Not every trade wins — stay disciplined\\!\n🔁 Next signal coming soon\\.\n💎 VVIP MEMBERS ONLY"
+        result_emoji  = "📈" if direction == "BUY" else "📉"
     else:
-        return {"action": "same", "direction": flipped}
+        return  # None — data haikupatikana kabisa
+
+    dir_label = "BUY 🟢" if direction == "BUY" else "SELL 🔴"
+    result_text = (
+        "🏆 *EVALON VVIP WINNERS* 🏆\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+        "📊 PAIR      : *{}*\n"
+        "⏱ EXPIRY    : *{} MIN*\n"
+        "{} DIRECTION : *{}*\n"
+        "🏆 RESULT    : *{}*\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
+        "{}"
+    ).format(pair, timeframe_mins, result_emoji, dir_label, result_label, result_footer)
+
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
+        push_msg_id(user_id, sent.message_id)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE user_signal_state SET result_sent=TRUE, result_msg_id=%s "
+                    "WHERE user_id=%s AND pair=%s",
+                    (sent.message_id, user_id, pair))
+            conn.commit()
+    except Exception as e:
+        logging.warning("schedule_result_check send failed: {}".format(e))
 
 def _detect_candlestick_patterns(df):
     """
@@ -7634,38 +7609,18 @@ def generate_signal(pair):
             else:
                 candle = 0.5 if mom > 0 else (-0.5 if mom < 0 else 0.0)
         else:
-            sess  = _get_session()
-            ptype = _pair_type(pair)
-            if trend_1h == "BUY":
-                rsi_w = [25, 20, 25, 18, 12]
-            elif trend_1h == "SELL":
-                rsi_w = [12, 18, 25, 20, 25]
-            elif sess["name"] in ("London Open", "NY/London"):
-                rsi_w = [20, 18, 24, 18, 20]
-            elif sess["name"] in ("Asian", "Dead Hours"):
-                rsi_w = [10, 20, 40, 20, 10]
-            else:
-                rsi_w = [15, 20, 30, 20, 15]
-
-            rsi_zone = random.choices(
-                ["oversold","neutral_low","neutral","neutral_high","overbought"], weights=rsi_w)[0]
-            rsi = {"oversold": random.uniform(10,28), "neutral_low": random.uniform(28,44),
-                   "neutral": random.uniform(44,56), "neutral_high": random.uniform(56,72),
-                   "overbought": random.uniform(72,92)}[rsi_zone]
-            sto = {"oversold": random.uniform(5,25), "neutral_low": random.uniform(20,45),
-                   "neutral": random.uniform(35,65), "neutral_high": random.uniform(55,80),
-                   "overbought": random.uniform(75,95)}[rsi_zone]
-            if sess["name"] in ("London Open", "NY Session"):
-                ma_diff = random.choice([-1,1]) * random.uniform(0.2, 0.9)
-            else:
-                ma_diff = random.uniform(-0.4, 0.4)
-            if trend_1h == "BUY"  and ma_diff < 0: ma_diff = abs(ma_diff) * 0.5
-            if trend_1h == "SELL" and ma_diff > 0: ma_diff = -abs(ma_diff) * 0.5
-            macd   = max(-1.0, min(1.0, ma_diff * random.uniform(0.6, 1.2)))
-            bb_pos = random.uniform(0.0,0.25) if rsi < 35 else (random.uniform(0.75,1.0) if rsi > 65 else random.uniform(0.3,0.7))
-            mom    = random.uniform(-1.0,1.0) if ptype == "crypto" else (random.uniform(-0.8,0.8) if sess["name"] in ("London Open","NY/London") else random.uniform(-0.5,0.5))
-            vol    = random.uniform(0.55,1.0) if sess["name"] in ("London Open","NY/London","NY Session") else (random.uniform(0.15,0.55) if sess["name"] in ("Dead Hours","Asian") else random.uniform(0.35,0.80))
-            candle = random.choices([-1,-0.5,0,0.5,1], weights=[12,18,40,18,12] if sess["name"] in ("London Open","NY Session") else [8,12,60,12,8])[0]
+            # v69: No random fallback for non-OTC pairs.
+            # If real market data is unavailable, return no signal immediately.
+            logging.info("NO_DATA {}: real indicators unavailable — no signal (v69)".format(pair))
+            return {
+                "direction": "BUY", "pair": pair, "timeframe": 0,
+                "strength": 0, "indicators_agree": 0,
+                "trend_1h": None, "vwap_data": None,
+                "confluence": {}, "mtf": None, "flat": True,
+                "patterns": [], "movement_cat": "LOW",
+                "avg_movement": 0.0,
+                "no_signal_reason": "🟡 *No signal available* — market data unavailable.",
+            }
 
     _w = 1.0  # v54-8: non-OTC indicators sasa zinapata uzito kamili (ilikuwa 0.5)
     b = s = 0
@@ -9496,7 +9451,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
         check = check_signal_request(user_id, pair)
-        clear_user_signal_state(user_id, pair)  # Force fresh always
+        clear_user_signal_state(user_id, pair)
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
         if cm: push_msg_id(user_id, cm.message_id)
@@ -9505,7 +9460,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
           if check["action"] == "fresh":
-            sig = await safe_generate_signal(pair)  # guaranteed - OTC always signals
+            sig = await safe_generate_signal(pair)
             _anim_stop.set()
             direction = sig["direction"]
             timeframe = sig["timeframe"]
@@ -9577,7 +9532,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if cm: await cm.delete()
             except: pass
 
-        save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=None)
+        save_user_signal_state(user_id, pair, direction, timeframe, flip_count)
         if check["action"] != "fresh":
             record_signal(pair, direction)
 
@@ -9694,7 +9649,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 timeframe = chosen_tf  # Pair haipo Deriv - tumia chosen_tf
 
-            save_user_signal_state(user_id, pair, direction, timeframe, 0)
+            save_user_signal_state(user_id, pair, direction, timeframe)
             context.user_data["_nonotc_sig"]   = sig
             context.user_data["_nonotc_dir"]   = direction
             context.user_data["_nonotc_tf"]    = timeframe
@@ -9824,7 +9779,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
 
-            save_user_signal_state(user_id, pair, direction, 1, 0)
+            save_user_signal_state(user_id, pair, direction, 1)
 
             ib    = direction == "BUY"
             img   = get_buy_image() if ib else get_sell_image()
@@ -9908,8 +9863,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         state = get_user_signal_state(user_id, pair)
-        press_count = state.get("flip_count", 0) if state else 0
-        expiry_finished = True   # Always treat as fresh - no blocking
         clear_user_signal_state(user_id, pair)
 
         def _pick_tf_by_pips(pair, fallback_tf):
@@ -9923,35 +9876,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if row and row["avg_movement"]:
                     avg_mov = float(row["avg_movement"])
                     if avg_mov >= 0.10:
-                        return 1   # Moves fast - 1m is enough
+                        return 1
                     elif avg_mov >= 0.06:
-                        return 2   # Medium movement - 2m
+                        return 2
                     else:
-                        return 3   # Slow pair - needs 3m for clear close
+                        return 3
                 if row and row["optimal_tf"]:
                     return int(row["optimal_tf"])
             except Exception:
                 pass
             return fallback_tf
 
-        if True:  # Always fresh - regenerate on every tap
-            if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
-                bonus = get_bonus_signals(user_id)
-                refs  = count_referrals(user_id)
-                extra = "\n\n🎁 *You have {} referrals* - invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
-                await context.bot.send_message(
-                    chat_id=chat,
-                    text="🔒 *Free Trial Ended*\n\nYou have used all your *{} free trial signals*.{}\n\n✅ Unlimited signals\n✅ AI-powered smart analysis\n✅ 100+ trading pairs\n\n_Contact admin to unlock full access._".format(total_free_allowed(user_id), extra),
-                    parse_mode="Markdown",
-                    reply_markup=unlock_keyboard()
-                )
-                return
-            if is_weekend() and "OTC" not in pair:
-                await context.bot.send_message(chat_id=chat, text="⚠️ *Market Closed (Weekend)*\n\nThis pair is not available on weekends.\nPlease select an *OTC* pair instead.", parse_mode="Markdown", reply_markup=pairs_keyboard())
-                return
+        if not is_licensed(user_id) and free_signals_used(user_id) >= total_free_allowed(user_id):
+            bonus = get_bonus_signals(user_id)
+            refs  = count_referrals(user_id)
+            extra = "\n\n🎁 *You have {} referrals* - invite more to unlock extra signals!".format(refs) if refs > 0 else "\n\n🎁 *Invite 3+ friends* to get free bonus signals!"
+            await context.bot.send_message(
+                chat_id=chat,
+                text="🔒 *Free Trial Ended*\n\nYou have used all your *{} free trial signals*.{}\n\n✅ Unlimited signals\n✅ AI-powered smart analysis\n✅ 100+ trading pairs\n\n_Contact admin to unlock full access._".format(total_free_allowed(user_id), extra),
+                parse_mode="Markdown",
+                reply_markup=unlock_keyboard()
+            )
+            return
+        if is_weekend() and "OTC" not in pair:
+            await context.bot.send_message(chat_id=chat, text="⚠️ *Market Closed (Weekend)*\n\nThis pair is not available on weekends.\nPlease select an *OTC* pair instead.", parse_mode="Markdown", reply_markup=pairs_keyboard())
+            return
 
-            inactivity_reset(user_id, chat)
-            clear_user_signal_state(user_id, pair)
+        inactivity_reset(user_id, chat)
+        clear_user_signal_state(user_id, pair)
 
         cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
         if cm: push_msg_id(user_id, cm.message_id)
@@ -10070,16 +10022,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_last_bot_msg(user_id, _nsm.message_id)
                 return
 
-            new_flip_count = 0  # Always fresh signal - reset flip count
+            save_user_signal_state(user_id, pair, direction, timeframe)
 
             gm_is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
-
-            save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count)
 
             gm_entry_price = None
             if gm_is_non_otc:
                 gm_entry_price = _fetch_current_price(pair)
-                save_user_signal_state(user_id, pair, direction, timeframe, new_flip_count, entry_price=gm_entry_price)
+                save_user_signal_state(user_id, pair, direction, timeframe, entry_price=gm_entry_price)
 
             ib    = direction == "BUY"
             img   = get_buy_image() if ib else get_sell_image()
@@ -10251,13 +10201,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_non_otc  = "OTC" not in pair and pair in YAHOO_SYMBOLS
         entry_price = None
         trend       = get_trend_direction(pair)
-        check       = check_signal_request(user_id, pair)
         clear_user_signal_state(user_id, pair)
 
         _cache_warm = is_signal_prefetched(pair)
         if _cache_warm:
             cm, _anim_stop = None, asyncio.Event()
-            _anim_stop.set()  # hakuna animation - tayari imekamilika
+            _anim_stop.set()
         else:
             cm, _anim_stop = await animated_analyzing(context.bot, chat, pair)
             if cm: push_msg_id(user_id, cm.message_id)
@@ -10265,11 +10214,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction  = "BUY"
         timeframe  = 1
         strength   = 180
-        flip_count = 0
         sig        = None
 
         try:
-          if check["action"] == "fresh":
             sig, _from_cache = await safe_generate_signal_cached(pair)
             if _from_cache:
                 logging.info("PREFETCH HIT {}: signal served from cache".format(pair))
@@ -10277,7 +10224,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction  = sig["direction"]
             timeframe  = sig["timeframe"]
             strength   = sig["strength"]
-            flip_count = 0
             if sig.get("flat") and timeframe == 0:
                 try: await cm.delete()
                 except: pass
@@ -10315,21 +10261,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.info("Deriv non-OTC: best_tf={} dir={} str={} - {}".format(
                         _best_tf, _micro_dir, _best_str, _best_reason))
                     if _best_tf is not None and _micro_dir is not None:
-                        direction = _micro_dir   # micro-seconds decide direction
-                        timeframe = _best_tf     # micro-seconds decide TF
+                        direction = _micro_dir
+                        timeframe = _best_tf
                     else:
-                        logging.info("Deriv FLAT for {} (sel_ handler) - falling back to MTF direction".format(pair))
+                        logging.info("Deriv FLAT for {} - falling back to MTF direction".format(pair))
                 except Exception as _de:
                     logging.warning("Deriv TF confirmation failed {}: {} - falling back to MTF".format(pair, _de))
-
-          else:
-            sig2       = await safe_generate_signal(pair)
-            _anim_stop.set()
-            direction  = sig2["direction"]
-            timeframe  = sig2["timeframe"] if sig2["timeframe"] > 0 else 1
-            strength   = sig2["strength"]
-            flip_count = 0
-            sig        = sig2  # use fresh sig for display details
 
         except Exception as _sel_err:
             logging.warning("sel_ signal generation failed {}: {}".format(pair, _sel_err))
@@ -10354,14 +10291,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_non_otc = "OTC" not in pair and pair in YAHOO_SYMBOLS
 
-        # Get entry price BEFORE sending signal (for result tracking)
         if is_non_otc:
             entry_price = _fetch_current_price(pair)
             logging.info("ENTRY PRICE {}: {}".format(pair, entry_price))
 
-        save_user_signal_state(user_id, pair, direction, timeframe, flip_count, entry_price=entry_price)
-        if check["action"] != "fresh":
-            record_signal(pair, direction)
+        save_user_signal_state(user_id, pair, direction, timeframe, entry_price=entry_price)
+        record_signal(pair, direction)
 
         ib    = direction == "BUY"
         img   = get_buy_image() if ib else get_sell_image()
@@ -10717,7 +10652,7 @@ async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
                         "\n" + _bscan1_esc if _bscan1_esc else "")
 
                     entry_price = _fetch_current_price(pair)
-                    save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+                    save_user_signal_state(uid, pair, direction, FIXED_TF, entry_price=entry_price)
                     if not is_licensed(uid): use_free_signal(uid)
 
                     sent_msg = await bot.send_photo(
@@ -10779,7 +10714,6 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
     SCAN_INTERVAL  = 45
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
-    COOLDOWN_SECS  = 75  # subiri sekunde 75 baada ya signal (ni > 1m expiry)
 
     # Fix #1: Tumia int(user_id) consistently
     uid = int(user_id)
@@ -10959,7 +10893,7 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                     ).format(pair, entry_str, dir_arrow, dir_label)
 
                     entry_price = _fetch_current_price(pair)
-                    save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+                    save_user_signal_state(uid, pair, direction, FIXED_TF, entry_price=entry_price)
                     if not is_licensed(uid): use_free_signal(uid)
 
                     sent_msg = await bot.send_photo(
@@ -11148,11 +11082,10 @@ async def global_scan_and_send(bot, chat, user_id, context):
       2. Ubora: indicators_agree × strength × trend confirmation
       3. Pair moja tu inatumwa kila scan cycle
     """
-    SCAN_INTERVAL  = 45   # sekunde kati ya scans
+    SCAN_INTERVAL  = 45
     MIN_INDICATORS = 5
     MIN_STRENGTH   = 150
     FIXED_TF       = 1
-    COOLDOWN_SECS  = 75   # subiri baada ya signal
 
     uid = int(user_id)
 
@@ -11412,7 +11345,7 @@ async def global_scan_and_send(bot, chat, user_id, context):
             )
 
             entry_price = _fetch_current_price(pair)
-            save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+            save_user_signal_state(uid, pair, direction, FIXED_TF, entry_price=entry_price)
             if not is_licensed(uid): use_free_signal(uid)
 
             sent_msg = await bot.send_photo(
@@ -11437,7 +11370,7 @@ async def global_scan_and_send(bot, chat, user_id, context):
                 )
 
             # Subiri expiry + buffer kabla ya scan inayofuata
-            await _wait(secs_to_close + COOLDOWN_SECS)
+            await _wait(secs_to_close + 5)
 
     finally:
         if _ACTIVE_SCANS.get(uid) is cancel_ev:
