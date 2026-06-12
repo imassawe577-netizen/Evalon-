@@ -2560,7 +2560,7 @@ def get_bonus_signals(user_id):
     return u.get("bonus_signals", 0)
 
 def total_free_allowed(user_id):
-    return 3 + get_bonus_signals(user_id)
+    return 15 + get_bonus_signals(user_id)
 
 ALL_PAIRS = [
     "EUR/USD OTC", "EUR/USD", "GBP/USD OTC", "GBP/USD",
@@ -8401,8 +8401,8 @@ def _market_closed_reason():
     """Return short text explaining why market is closed."""
     now = datetime.utcnow()
     if now.weekday() >= 5:
-        return "Weekend"
-    return "Night Hours"
+        return "Weekend — OTC pairs available"
+    return "Night Hours — OTC pairs available"
 
 def _session_header_text():
     """Return current session line for display above pair keyboard."""
@@ -8597,10 +8597,9 @@ def nonotc_signal_keyboard(pair, chosen_tf):
     ])
 
 def otc_mode_keyboard(pair):
-    """Mode selection for OTC pair: Seconds or Normal (minutes)."""
+    """Mode selection for OTC pair: Normal only."""
     idx = pair_to_idx(pair)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱ Seconds (3s/5s/10s...)", callback_data="otc_secs_{}".format(idx))],
         [InlineKeyboardButton("📊 Normal (minutes)", callback_data="otc_normal_{}".format(idx))],
         [InlineKeyboardButton("❌ Cancel", callback_data="choose_pair")],
     ])
@@ -9205,6 +9204,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
+    if data == "check_join":
+        is_member = await is_channel_member(context.bot, user_id)
+        has_request = has_join_request(user_id)
+        if is_member or has_request:
+            await q.edit_message_text(
+                "✅ *Welcome to EVALON WINNERS BOT!*\n\nSelect your trading pair:",
+                parse_mode="Markdown", reply_markup=pairs_keyboard()
+            )
+        else:
+            await q.answer("⚠️ Please send a join request to the channel first.", show_alert=True)
+        return
+
+    if data == "set_buy_img":
+        if user_id != ADMIN_ID: return
+        context.user_data["awaiting_image"] = "buy"
+        await q.edit_message_text(
+            "📈 *Set BUY Image*\n\nSend me the BUY signal image now.\n\n_Forward or send any photo - I will save it._",
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "set_sell_img":
+        if user_id != ADMIN_ID: return
+        context.user_data["awaiting_image"] = "sell"
+        await q.edit_message_text(
+            "📉 *Set SELL Image*\n\nSend me the SELL signal image now.\n\n_Forward or send any photo - I will save it._",
+            parse_mode="Markdown"
+        )
+        return
+
+    if data=="noop":
+        try: await q.answer()
+        except: pass
+        return
+
     if data == "cancel_scan":
         ev = _ACTIVE_SCANS.get(int(user_id))
         if ev is not None:
@@ -9406,7 +9440,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ *EVALON WINNERS BOT - Help*\n\n"
             "🌐 *Global Scan* - Scan all pairs and send the best combined signal\n"
             "📊 *Select Pair* - Manually select a single pair\n"
-            "🎯 *Multi Scan* - Scan 4 or 6 pairs at once\n"
+            "🎯 *Multi Scan* - Scan multiple pairs at once\n"
             "📊 *My Stats* - View your account status\n"
             "💎 *Upgrade* - Purchase monthly or lifetime licence\n\n"
             "📌 *How to use:*\n"
@@ -9423,19 +9457,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("otcback_"):
         idx_str = data[8:]
-        pair = PAIR_INDEX.get(idx_str)
-        if not pair:
-            await context.bot.send_message(chat_id=chat, text="❌ Pair not found.", reply_markup=pairs_keyboard())
-            return
         await delete_last_signal(context.bot, chat, user_id)
         try: await q.message.delete()
         except: pass
+        await context.bot.send_message(
+            chat_id=chat,
+            text="⚡ *EVALON WINNERS BOT*\n\nSelect a pair:",
+            parse_mode="Markdown",
+            reply_markup=pairs_keyboard()
+        )
+        return
         _m = await context.bot.send_message(
             chat_id=chat,
             text=(
                 "⚡ *{}*\n\n"
-                "Choose signal type:\n\n"
-                "⏱ *Seconds* - 3s/5s/10s/15s/30s signals _(subscribers only)_\n"
                 "📊 *Normal* - minute-based signal"
             ).format(pair),
             parse_mode="Markdown",
@@ -9550,6 +9585,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img   = get_buy_image() if ib else get_sell_image()
         arrow = "Up 🟢" if ib else "Down 🔴"
         if not is_licensed(user_id): use_free_signal(user_id)
+        # Trial: min TF = 15 minutes
+        if not is_licensed(user_id) and timeframe < 15:
+            timeframe = 15
         try: await cm.delete()
         except: pass
         await delete_last_signal(context.bot, chat, user_id)
@@ -9765,6 +9803,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _anim_stop.set()
             direction = sig["direction"]
             strength  = sig["strength"]
+
+            # OTC reverse logic: strength > 200 → flip direction
+            if strength > 200:
+                direction = "SELL" if direction == "BUY" else "BUY"
 
             trend_dir = get_trend_direction(pair)
             if trend_dir is not None:
@@ -10464,6 +10506,273 @@ def _confirm_real_candle_direction(pair, expected_direction):
         return True  # Usiblock signal kwa sababu ya error
 
 
+async def multi_scan_and_send(bot, chat, user_id, pairs_to_scan, context):
+    """
+    MULTI SCAN ENGINE (v60 - Sequential):
+    Scan pairs ZILIZOCHAGULIWA moja kwa moja — pair 1 → pair 2 → ... → pair N → rudia.
+
+    Mabadiliko v60 (OOM fix):
+      - Hapo awali (v59): asyncio.gather → pairs ZOTE kwa wakati mmoja → OOM crash
+      - Sasa (v60): pair moja kwa wakati → signal inatumwa mara moja ikipata → pair inayofuata
+      - RAM inatumika x1 tu (si x6) → hakuna OOM
+      - Round moja (pairs zote) inaisha ndani ya sekunde ~30-60 → inaanza tena
+    """
+    MIN_INDICATORS = 4
+    MIN_STRENGTH   = 120
+    FIXED_TF       = 1
+
+    uid = int(user_id)
+    n   = len(pairs_to_scan)
+
+    cancel_ev = asyncio.Event()
+    _ACTIVE_SCANS[uid] = cancel_ev
+
+    stop_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
+    ])
+
+    def _is_cancelled():
+        return cancel_ev.is_set() or _ACTIVE_SCANS.get(uid) is not cancel_ev
+
+    async def _wait(secs):
+        try:
+            await asyncio.wait_for(cancel_ev.wait(), timeout=secs)
+        except asyncio.TimeoutError:
+            pass
+
+    try:
+        scan_msg = await bot.send_message(
+            chat_id=chat,
+            text=(
+                "🎯 *Multi Scan Started*\n\n"
+                "📡 Scanning market continuously\\.\n"
+                "⚡ Every strong signal will be sent automatically\\.\n\n"
+                "_Tap Stop to end the session\\._"
+            ),
+            parse_mode="MarkdownV2",
+            reply_markup=stop_kb
+        )
+        save_last_bot_msg(uid, scan_msg.message_id)
+    except Exception as e:
+        logging.warning("multi_scan: start msg failed: {}".format(e))
+        return
+
+    round_count     = 0
+    signal_count    = 0
+    dot_tick        = 0   # v62: fast dot counter
+    scan_wins_ref   = [0]
+    scan_losses_ref = [0]
+
+    try:
+        while True:
+            if _is_cancelled():
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "⏹ *Multi Scan Stopped* — {} pairs\n\n"
+                            "🏆 Won: *{}*   💔 Lost: *{}*\n"
+                            "📊 Total signals: *{}*"
+                        ).format(n, scan_wins_ref[0], scan_losses_ref[0],
+                                 scan_wins_ref[0] + scan_losses_ref[0]),
+                        parse_mode="Markdown"
+                    )
+                except: pass
+                return
+
+            if is_market_closed():
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "🔒 *Market Closed*\n\nMulti Scan works with non\-OTC pairs only\.\n"
+                            "Wait for market to open\.\n\n_Tap Stop to end\._"
+                        ),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
+                await _wait(60)
+                continue
+
+            active_pairs = [p for p in pairs_to_scan if p in YAHOO_SYMBOLS]
+            if not active_pairs:
+                await _wait(60)
+                continue
+
+            round_count += 1
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][round_count % 8]
+
+            # ── SEQUENTIAL SCAN: pair moja kwa wakati ──────────────────────────
+            for pair_idx, pair in enumerate(active_pairs):
+                if _is_cancelled():
+                    break
+                dot_tick += 1
+                anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
+                _pemoji = PAIR_EMOJIS.get(pair, "📊")
+
+                # Update status message — inaonyesha pair inayoscaniwa sasa
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "{} *Multi Scanning*\n\n"
+                            "🔍 *{}* {}\n\n"
+                            "_Analysing market\\.\\.\\._"
+                        ).format(anim, pair.replace("/", "\\/"), _pemoji),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
+
+                # ── Scan pair moja (sequential — RAM x1 tu) ──
+                try:
+                    result = await safe_generate_signal_cached(pair)
+                except Exception as _ge:
+                    logging.warning("multi_scan gather {}: {}".format(pair, _ge))
+                    await _wait(PAIR_DELAY)
+                    continue
+
+                try:
+                    sig, _ = result if isinstance(result, tuple) else (result, None)
+                    if sig is None:
+                        await _wait(PAIR_DELAY)
+                        continue
+
+                    is_flat   = sig.get("flat", False)
+                    tf        = sig.get("timeframe", 0)
+                    ind_agree = sig.get("indicators_agree", 0)
+                    strength  = sig.get("strength", 0)
+                    direction = sig.get("direction")
+                    trend_1h  = sig.get("trend_1h")
+                    micro_htf = sig.get("micro_htf")
+
+                    if is_flat or tf == 0 or not direction or ind_agree < MIN_INDICATORS:
+                        await _wait(PAIR_DELAY)
+                        continue
+
+                    # Normalise strength
+                    if isinstance(strength, (int, float)) and strength > 450:
+                        strength = int(90 + (min(500, max(300, strength)) - 300) / 200 * 360)
+                    elif isinstance(strength, (int, float)) and strength < 90:
+                        strength = int(90 + (max(35, min(97, strength)) - 35) / 62 * 360)
+                    strength = max(90, min(450, int(strength)))
+
+                    if strength < MIN_STRENGTH:
+                        await _wait(PAIR_DELAY)
+                        continue
+
+                    # Trend-follow check
+                    if is_filter_on("trend_follow"):
+                        if trend_1h in ("BUY", "SELL") and direction != trend_1h:
+                            logging.info("MULTI_SCAN {}: trend-follow skip dir={} trend={}".format(
+                                pair, direction, trend_1h))
+                            await _wait(PAIR_DELAY)
+                            continue
+                        elif trend_1h not in ("BUY", "SELL") and micro_htf:
+                            micro_dirs = [
+                                micro_htf.get("5_s",  {}).get("direction"),
+                                micro_htf.get("10_s", {}).get("direction"),
+                                micro_htf.get("15_s", {}).get("direction"),
+                            ]
+                            micro_dirs = [d for d in micro_dirs if d in ("BUY", "SELL")]
+                            if len(micro_dirs) >= 2:
+                                micro_trend = "BUY" if micro_dirs.count("BUY") > micro_dirs.count("SELL") else "SELL"
+                                if direction != micro_trend:
+                                    logging.info("MULTI_SCAN {}: micro-trend skip dir={} micro={}".format(
+                                        pair, direction, micro_trend))
+                                    await _wait(PAIR_DELAY)
+                                    continue
+
+                    candle_ok = _confirm_real_candle_direction(pair, direction)
+                    if not candle_ok:
+                        await _wait(PAIR_DELAY)
+                        continue
+
+                    # ── Signal ipatikana — tuma mara moja ─────────────────────
+                    ib        = direction == "BUY"
+                    img       = get_buy_image() if ib else get_sell_image()
+                    dir_arrow = "📈" if ib else "📉"
+                    dir_label = "BUY 🟢" if ib else "SELL 🔴"
+
+                    entry_str, secs_to_open, secs_to_close = _get_next_candle_open(uid)
+                    signal_count += 1
+
+                    _bscan1 = get_broker_display(uid)
+                    _bscan1_esc = _bscan1.replace("-", "\\-").replace(".", "\\.").replace("!", "\\!").replace("(", "\\(").replace(")", "\\)").replace("|", "\\|")
+                    cap = (
+                        "🏆 *EVALON WINNERS* 🏆\n\n"
+                        "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n"
+                        "📊 PAIR      : *{}*\n"
+                        "⏱ EXPIRY    : *1 MIN*\n"
+                        "🕐 ENTRY     : *{}*\n"
+                        "{} DIRECTION : *{}*\n"
+                        "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n\n"
+                        "⚡ Open at next candle"
+                        "{}").format(
+                        pair.replace("/", "\/"), entry_str, dir_arrow, dir_label,
+                        "\n" + _bscan1_esc if _bscan1_esc else "")
+
+                    entry_price = _fetch_current_price(pair)
+                    save_user_signal_state(uid, pair, direction, FIXED_TF, 0, entry_price=entry_price)
+                    if not is_licensed(uid): use_free_signal(uid)
+
+                    sent_msg = await bot.send_photo(
+                        chat_id=chat,
+                        photo=img,
+                        caption=cap,
+                        parse_mode="MarkdownV2",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⏹  Stop", callback_data="cancel_scan")]
+                        ])
+                    )
+                    save_last_signal_msg(uid, sent_msg.message_id)
+                    record_signal(pair, direction)
+
+                    if entry_price is not None:
+                        asyncio.create_task(
+                            auto_scan_result_check(
+                                bot, chat, uid, pair, direction, FIXED_TF,
+                                entry_price, secs_to_close,
+                                scan_wins_ref, scan_losses_ref
+                            )
+                        )
+
+                    logging.info("MULTI_SCAN signal sent: {} {} str={}".format(
+                        pair, direction, strength))
+
+                except Exception as _pe:
+                    logging.warning("multi_scan pair {} failed: {}".format(pair, _pe))
+                    continue
+
+            # Round imekwisha — onyesha status na anza round mpya mara moja
+            if not _is_cancelled():
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat,
+                        message_id=scan_msg.message_id,
+                        text=(
+                            "✅ *Round \#{} Done* — {} pairs scanned\n\n"
+                            "🏆 Won: *{}*   💔 Lost: *{}*\n"
+                            "📊 Signals: *{}*\n\n"
+                            "🔄 _Starting next round\.\.\._"
+                        ).format(
+                            round_count, len(active_pairs),
+                            scan_wins_ref[0], scan_losses_ref[0], signal_count
+                        ),
+                        parse_mode="MarkdownV2",
+                        reply_markup=stop_kb
+                    )
+                except: pass
+
+    finally:
+        if _ACTIVE_SCANS.get(uid) is cancel_ev:
+            _ACTIVE_SCANS.pop(uid, None)
+
+
 async def auto_scan_and_send(bot, chat, user_id, pair, context):
     # Fix #5: 1m tu
     FIXED_TF       = 1
@@ -10521,6 +10830,7 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
         return
 
     scan_count    = 0
+    dot_tick      = 0
     signal_count  = 0
     scan_wins_ref    = [0]  # list ili iwe mutable ndani ya nested function
     scan_losses_ref  = [0]
@@ -10550,17 +10860,18 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
                     continue
 
             scan_count += 1
-            anim = ["🔍", "🔎", "📡", "🔍"][scan_count % 4]
+            dot_tick   += 1
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
 
             try:
                 await bot.edit_message_text(
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "{} *Scanning* — {} {}\n\n"
-                        "Scan \\#{} \\| Signals: {}\n\n"
+                        "{} *Scanning*\n\n"
+                        "🔍 *{}* {}\n\n"
                         "_Analysing market\\.\\.\\._"
-                    ).format(anim, pair, emoji, scan_count, signal_count),
+                    ).format(anim, pair.replace("/", "\\/"), emoji),
                     parse_mode="MarkdownV2",
                     reply_markup=stop_kb
                 )
@@ -10684,69 +10995,142 @@ async def auto_scan_and_send(bot, chat, user_id, pair, context):
 
 
 async def auto_scan_result_check(bot, chat_id, user_id, pair, direction, timeframe_mins, entry_price, secs_to_close=65, wins_ref=None, losses_ref=None):
+    """
+    Thin wrapper — delegates to schedule_result_check which has the full
+    candle-close logic (Finnhub + Yahoo, doji detection, DB recording).
+    Also updates scan-session win/loss counters for the scan summary message.
+    """
     if entry_price is None:
         return
 
-    # Subiri candle ifunge
-    await asyncio.sleep(max(60, secs_to_close) + 5)
+    # Subiri mpaka candle ifunge — tumia secs_to_close iliyopitishwa kutoka auto_scan
+    # Ongeza buffer 8s baada ya close ili data iwe tayari
+    wait_secs = max(10, secs_to_close + 8)
+    await asyncio.sleep(wait_secs)
 
-    # Angalia candle iliyofungwa — green au red?
+    # Determine result from closed candle (same logic as schedule_result_check)
     won = None
-    try:
-        real_pair = OTC_TO_REAL.get(pair, pair)
-        symbol    = YAHOO_SYMBOLS.get(real_pair)
-        if symbol:
-            df = _yf_download_cached(symbol, "1d", "1m")
-            if df is not None and len(df) >= 2:
-                # Candle iliyofungwa kabla ya ya sasa (iloc[-2])
-                closed_open  = float(df["Open"].squeeze().iloc[-2])
-                closed_close = float(df["Close"].squeeze().iloc[-2])
-                is_green = closed_close > closed_open
-                is_red   = closed_close < closed_open
+    is_doji = False
+    c_open = c_close = c_high = c_low = None
 
-                logging.info("CANDLE RESULT {}: open={} close={} green={} dir={}".format(
-                    pair, closed_open, closed_close, is_green, direction))
+    real_pair = OTC_TO_REAL.get(pair, pair)
+    symbol    = YAHOO_SYMBOLS.get(real_pair)
+    fh_sym    = FINNHUB_FOREX_SYMBOLS.get(real_pair)
+
+    for _attempt in range(4):
+        try:
+            df = None
+            if fh_sym and FINNHUB_KEY:
+                try:
+                    df = _mtf_fh_candles(fh_sym, "1", 10)
+                except Exception:
+                    df = None
+            if df is None and symbol:
+                try:
+                    _YF_CACHE.pop((symbol, "1d", "1m"), None)
+                except Exception:
+                    pass
+                df = _yf_download_cached(symbol, "1d", "1m")
+
+            if df is not None and len(df) >= 3:
+                c_open  = float(df["Open"].squeeze().iloc[-2])
+                c_close = float(df["Close"].squeeze().iloc[-2])
+                c_high  = float(df["High"].squeeze().iloc[-2])
+                c_low   = float(df["Low"].squeeze().iloc[-2])
+
+                body         = abs(c_close - c_open)
+                candle_range = c_high - c_low if c_high != c_low else 0.0001
+                body_ratio   = body / candle_range
+                is_doji      = body_ratio <= 0.10
+
+                is_green = c_close > c_open
+                is_red   = c_close < c_open
 
                 if direction == "BUY":
-                    won = is_green
+                    won = True if is_green else (None if is_doji else False)
                 else:
-                    won = is_red
-    except Exception as e:
-        logging.warning("auto_scan_result candle check failed {}: {}".format(pair, e))
+                    won = True if is_red  else (None if is_doji else False)
 
-    # Kama candle haikupatikana — fallback kwa price diff
-    if won is None:
+                logging.info("AUTO_SCAN RESULT {} attempt {}: open={:.5f} close={:.5f} body_ratio={:.2f} doji={} dir={} won={}".format(
+                    pair, _attempt + 1, c_open, c_close, body_ratio, is_doji, direction, won))
+                break
+
+        except Exception as e:
+            logging.warning("auto_scan_result candle check failed {} attempt {}: {}".format(pair, _attempt + 1, e))
+
+        await asyncio.sleep(5)
+
+    # Price fallback if candle data unavailable
+    if won is None and not is_doji:
         exit_price = None
-        for _ in range(5):
+        for _ in range(4):
             exit_price = _fetch_current_price(pair)
             if exit_price is not None:
                 break
             await asyncio.sleep(4)
         if exit_price is not None and entry_price is not None:
             diff = exit_price - entry_price
-            won = (diff > 0) if direction == "BUY" else (diff < 0)
+            won  = (diff > 0) if direction == "BUY" else (diff < 0)
+            logging.info("AUTO_SCAN RESULT {}: price fallback entry={} exit={} won={}".format(
+                pair, entry_price, exit_price, won))
         else:
             won = False
-        logging.info("CANDLE RESULT {}: fallback price diff won={}".format(pair, won))
 
-    if wins_ref is not None and losses_ref is not None:
+    # Update scan session counters
+    if not is_doji and wins_ref is not None and losses_ref is not None:
         if won: wins_ref[0] += 1
         else:   losses_ref[0] += 1
 
-    try: update_pair_stats(pair, won)
-    except Exception as _e: logging.warning("auto_scan_result pair_stats: {}".format(_e))
-    try:
-        sess = _get_session().get("name", "Unknown")
-        update_signal_combo_stats(pair=pair, direction=direction,
-                                  tf_mins=timeframe_mins, won=won, session=sess)
-    except Exception as _e: logging.warning("auto_scan_result combo_stats: {}".format(_e))
-    try: nn_feedback_from_vte(user_id, pair, won)
-    except Exception: pass
+    # Record to DB
+    if not is_doji and won is not None:
+        try: update_pair_stats(pair, won)
+        except Exception as _e: logging.warning("auto_scan_result pair_stats: {}".format(_e))
+        try:
+            sess = _get_session().get("name", "Unknown")
+            update_signal_combo_stats(pair=pair, direction=direction,
+                                      tf_mins=timeframe_mins, won=won, session=sess)
+        except Exception as _e: logging.warning("auto_scan_result combo_stats: {}".format(_e))
+        try: nn_feedback_from_vte(user_id, pair, won)
+        except Exception: pass
 
-    result_text = "WIN 🏆" if won else "LOSS 💔"
+    # Send result message — always
+    dir_arrow = "📈" if direction == "BUY" else "📉"
+
+    if is_doji:
+        header     = "〰️ *DOJI*"
+        result_note = "No result — candle closed as indecision. Win/loss not counted."
+        result_emoji = "〰️"
+    elif won:
+        header      = "✅ *WIN*"
+        result_note = "Candle closed in your direction. Well traded!"
+        result_emoji = "🏆"
+    else:
+        header      = "❌ *LOSS*"
+        result_note = "Candle closed against your direction. Stay disciplined, next signal coming."
+        result_emoji = "💔"
+
+    candle_detail = ""
+    if c_open is not None and c_close is not None:
+        candle_detail = "\n📊 *Open:* `{:.5f}`  ➜  *Close:* `{:.5f}`".format(c_open, c_close)
+
+    text = (
+        "{} *EVALON WINNERS*\n"
+        "━━━━━━━━━━━━━━\n"
+        "📌 *Pair:* {}\n"
+        "{} *Direction:* {}\n"
+        "{}\n"
+        "━━━━━━━━━━━━━━\n"
+        "{}\n"
+        "{}"
+    ).format(
+        result_emoji, pair,
+        dir_arrow, direction,
+        candle_detail,
+        header, result_note,
+    )
 
     try:
-        sent = await bot.send_message(chat_id=chat_id, text=result_text)
+        sent = await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         push_msg_id(user_id, sent.message_id)
     except Exception as e:
         logging.warning("auto_scan_result send failed: {}".format(e))
@@ -10793,11 +11177,10 @@ async def global_scan_and_send(bot, chat, user_id, context):
             chat_id=chat,
             text=(
                 "🌐 *Global Scan Started*\n\n"
-                "📡 Scanning *{}* pairs simultaneously\\.\n"
-                "⚡ Best trend\\-follow signal will be sent automatically\\.\n\n"
-                "_Only trend\\-following signals \\(BUY with uptrend / SELL with downtrend\\)\\._\n\n"
+                "📡 Scanning all pairs simultaneously\\.\n"
+                "⚡ Best signal will be sent automatically\\.\n\n"
                 "_Tap Stop to end the session\\._"
-            ).format(len(GLOBAL_SCAN_PAIRS)),
+            ),
             parse_mode="MarkdownV2",
             reply_markup=stop_kb
         )
@@ -10807,6 +11190,7 @@ async def global_scan_and_send(bot, chat, user_id, context):
         return
 
     scan_count    = 0
+    dot_tick      = 0
     signal_count  = 0
     scan_wins_ref   = [0]
     scan_losses_ref = [0]
@@ -10845,7 +11229,8 @@ async def global_scan_and_send(bot, chat, user_id, context):
                     continue
 
             scan_count += 1
-            anim = ["🌐", "📡", "🔍", "⚡"][scan_count % 4]
+            dot_tick   += 1
+            anim = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚪", "🟤"][dot_tick % 8]
 
             active_pairs = _get_active_pairs()
             if not active_pairs:
@@ -10871,10 +11256,9 @@ async def global_scan_and_send(bot, chat, user_id, context):
                     chat_id=chat,
                     message_id=scan_msg.message_id,
                     text=(
-                        "{} *Global Scanning* — {} pairs\n\n"
-                        "Scan \\#{} \\| Signals sent: {}\n\n"
+                        "{} *Global Scanning*\n\n"
                         "_Analysing all pairs\\.\\.\\. picking best trend signal\\._"
-                    ).format(anim, len(active_pairs), scan_count, signal_count),
+                    ).format(anim),
                     parse_mode="MarkdownV2",
                     reply_markup=stop_kb
                 )
