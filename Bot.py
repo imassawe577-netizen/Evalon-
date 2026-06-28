@@ -16,7 +16,9 @@ import logging
 import os
 import random
 import websockets
-import asyncpg
+import psycopg2
+import psycopg2.extras
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -40,172 +42,141 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-# DATABASE
+# DATABASE  (psycopg2-binary — no gcc needed)
 # ══════════════════════════════════════════════════════════════
-_pool = None
+def _conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-async def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    return _pool
+def _run(sql, params=(), fetch="none"):
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(sql, params)
+            if fetch == "one":  return cur.fetchone()
+            if fetch == "all":  return cur.fetchall()
+            con.commit()
+
+async def _db(sql, params=(), fetch="none"):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _run(sql, params, fetch))
 
 async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                license_status TEXT DEFAULT 'trial',
-                trial_tokens INTEGER DEFAULT 20,
-                deriv_token TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
-                contract_type TEXT DEFAULT 'rise_fall',
-                pair TEXT DEFAULT '',
-                market_type TEXT DEFAULT 'real',
-                timeframe TEXT DEFAULT '1',
-                stake NUMERIC DEFAULT 1.0,
-                martingale_enabled BOOLEAN DEFAULT FALSE,
-                martingale_multiplier NUMERIC DEFAULT 2.0,
-                martingale_max_steps INTEGER DEFAULT 5,
-                compound_enabled BOOLEAN DEFAULT FALSE,
-                tp_amount NUMERIC DEFAULT 50.0,
-                sl_amount NUMERIC DEFAULT 30.0,
-                multiplier_value INTEGER DEFAULT 40,
-                accumulator_growth NUMERIC DEFAULT 0.03,
-                pair_mode TEXT DEFAULT 'single',
-                multi_pairs TEXT DEFAULT '',
-                auto_restart BOOLEAN DEFAULT TRUE,
-                updated_at TIMESTAMP DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS trade_sessions (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                contract_type TEXT,
-                pair TEXT,
-                direction TEXT,
-                stake NUMERIC,
-                result TEXT,
-                profit NUMERIC DEFAULT 0,
-                step INTEGER DEFAULT 1,
-                cycle INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS active_sessions (
-                user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
-                is_running BOOLEAN DEFAULT FALSE,
-                current_direction TEXT,
-                current_stake NUMERIC,
-                current_step INTEGER DEFAULT 1,
-                current_cycle INTEGER DEFAULT 1,
-                total_profit NUMERIC DEFAULT 0,
-                contract_id TEXT,
-                started_at TIMESTAMP DEFAULT NOW()
-            );
-        """)
+    await _db("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            license_status TEXT DEFAULT 'trial',
+            trial_tokens INTEGER DEFAULT 20,
+            deriv_token TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await _db("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
+            contract_type TEXT DEFAULT 'rise_fall',
+            pair TEXT DEFAULT '',
+            market_type TEXT DEFAULT 'real',
+            timeframe TEXT DEFAULT '1',
+            stake NUMERIC DEFAULT 1.0,
+            martingale_enabled BOOLEAN DEFAULT FALSE,
+            martingale_multiplier NUMERIC DEFAULT 2.0,
+            martingale_max_steps INTEGER DEFAULT 5,
+            compound_enabled BOOLEAN DEFAULT FALSE,
+            tp_amount NUMERIC DEFAULT 50.0,
+            sl_amount NUMERIC DEFAULT 30.0,
+            multiplier_value INTEGER DEFAULT 40,
+            accumulator_growth NUMERIC DEFAULT 0.03,
+            pair_mode TEXT DEFAULT 'single',
+            multi_pairs TEXT DEFAULT '',
+            auto_restart BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await _db("""
+        CREATE TABLE IF NOT EXISTS trade_sessions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(user_id),
+            contract_type TEXT, pair TEXT, direction TEXT,
+            stake NUMERIC, result TEXT, profit NUMERIC DEFAULT 0,
+            step INTEGER DEFAULT 1, cycle INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await _db("""
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id),
+            is_running BOOLEAN DEFAULT FALSE,
+            current_direction TEXT, current_stake NUMERIC,
+            current_step INTEGER DEFAULT 1, current_cycle INTEGER DEFAULT 1,
+            total_profit NUMERIC DEFAULT 0, contract_id TEXT,
+            started_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
     logger.info("✅ Database initialized")
 
 async def get_user(user_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+    return await _db("SELECT * FROM users WHERE user_id=%s", (user_id,), fetch="one")
 
 async def create_user(user_id: int, username: str, full_name: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, username, full_name)
-            VALUES ($1,$2,$3) ON CONFLICT (user_id) DO NOTHING
-        """, user_id, username, full_name)
-        await conn.execute("""
-            INSERT INTO user_settings (user_id)
-            VALUES ($1) ON CONFLICT (user_id) DO NOTHING
-        """, user_id)
+    await _db("""
+        INSERT INTO users (user_id,username,full_name)
+        VALUES (%s,%s,%s) ON CONFLICT (user_id) DO NOTHING
+    """, (user_id, username, full_name))
+    await _db("""
+        INSERT INTO user_settings (user_id)
+        VALUES (%s) ON CONFLICT (user_id) DO NOTHING
+    """, (user_id,))
 
 async def update_user(user_id: int, **kwargs):
-    pool = await get_pool()
-    fields = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE users SET {fields} WHERE user_id=$1",
-            user_id, *kwargs.values()
-        )
+    sets = ", ".join(f"{k}=%s" for k in kwargs)
+    vals = list(kwargs.values()) + [user_id]
+    await _db(f"UPDATE users SET {sets} WHERE user_id=%s", vals)
 
 async def get_settings(user_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM user_settings WHERE user_id=$1", user_id)
+    return await _db("SELECT * FROM user_settings WHERE user_id=%s", (user_id,), fetch="one")
 
 async def update_settings(user_id: int, **kwargs):
-    pool = await get_pool()
-    fields = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE user_settings SET {fields}, updated_at=NOW() WHERE user_id=$1",
-            user_id, *kwargs.values()
-        )
+    sets = ", ".join(f"{k}=%s" for k in kwargs)
+    vals = list(kwargs.values()) + [user_id]
+    await _db(f"UPDATE user_settings SET {sets}, updated_at=NOW() WHERE user_id=%s", vals)
 
 async def get_active_session(user_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM active_sessions WHERE user_id=$1", user_id)
+    return await _db("SELECT * FROM active_sessions WHERE user_id=%s", (user_id,), fetch="one")
 
 async def upsert_active_session(user_id: int, **kwargs):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id FROM active_sessions WHERE user_id=$1", user_id)
-        if row:
-            fields = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
-            await conn.execute(
-                f"UPDATE active_sessions SET {fields} WHERE user_id=$1",
-                user_id, *kwargs.values()
-            )
-        else:
-            kwargs["user_id"] = user_id
-            cols  = ", ".join(kwargs.keys())
-            vals  = ", ".join(f"${i+1}" for i in range(len(kwargs)))
-            await conn.execute(
-                f"INSERT INTO active_sessions ({cols}) VALUES ({vals})",
-                *kwargs.values()
-            )
+    row = await _db("SELECT user_id FROM active_sessions WHERE user_id=%s", (user_id,), fetch="one")
+    if row:
+        sets = ", ".join(f"{k}=%s" for k in kwargs)
+        vals = list(kwargs.values()) + [user_id]
+        await _db(f"UPDATE active_sessions SET {sets} WHERE user_id=%s", vals)
+    else:
+        kwargs["user_id"] = user_id
+        cols = ", ".join(kwargs.keys())
+        phs  = ", ".join(["%s"] * len(kwargs))
+        await _db(f"INSERT INTO active_sessions ({cols}) VALUES ({phs})", list(kwargs.values()))
 
 async def save_trade(user_id, contract_type, pair, direction, stake, result, profit, step, cycle):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO trade_sessions
-              (user_id,contract_type,pair,direction,stake,result,profit,step,cycle)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        """, user_id, contract_type, pair, direction, stake, result, profit, step, cycle)
+    await _db("""
+        INSERT INTO trade_sessions
+          (user_id,contract_type,pair,direction,stake,result,profit,step,cycle)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (user_id, contract_type, pair, direction, stake, result, profit, step, cycle))
 
 async def get_trade_history(user_id: int, limit: int = 10):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch("""
-            SELECT * FROM trade_sessions WHERE user_id=$1
-            ORDER BY created_at DESC LIMIT $2
-        """, user_id, limit)
+    return await _db("""
+        SELECT * FROM trade_sessions WHERE user_id=%s
+        ORDER BY created_at DESC LIMIT %s
+    """, (user_id, limit), fetch="all")
 
 async def deduct_trial_token(user_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE users SET trial_tokens=trial_tokens-1
-            WHERE user_id=$1 AND trial_tokens>0
-        """, user_id)
+    await _db("""
+        UPDATE users SET trial_tokens=trial_tokens-1
+        WHERE user_id=%s AND trial_tokens>0
+    """, (user_id,))
 
 async def get_all_users():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM users ORDER BY created_at DESC")
+    return await _db("SELECT * FROM users ORDER BY created_at DESC", fetch="all")
 
 # ══════════════════════════════════════════════════════════════
 # DERIV CLIENT
