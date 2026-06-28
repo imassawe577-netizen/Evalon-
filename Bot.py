@@ -16,8 +16,7 @@ import logging
 import os
 import random
 import websockets
-import psycopg2
-import psycopg2.extras
+import pg8000.native
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,22 +41,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-# DATABASE  (psycopg2-binary — no gcc needed)
+# DATABASE  (pg8000 — pure Python, works on any Python version)
 # ══════════════════════════════════════════════════════════════
-def _conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+import urllib.parse as _urlparse
+
+def _get_conn_params():
+    """Parse DATABASE_URL into pg8000 params"""
+    u = _urlparse.urlparse(DATABASE_URL)
+    return {
+        "host":     u.hostname,
+        "port":     u.port or 5432,
+        "database": u.path.lstrip("/"),
+        "user":     u.username,
+        "password": u.password,
+        "ssl_context": True,
+    }
 
 def _run(sql, params=(), fetch="none"):
-    with _conn() as con:
-        with con.cursor() as cur:
-            cur.execute(sql, params)
-            if fetch == "one":  return cur.fetchone()
-            if fetch == "all":  return cur.fetchall()
-            con.commit()
+    p = _get_conn_params()
+    con = pg8000.native.Connection(**p)
+    try:
+        result = con.run(sql, **{f"p{i+1}": v for i, v in enumerate(params)}) if params else con.run(sql)
+        if fetch == "one":
+            cols = [c["name"] for c in con.columns]
+            return dict(zip(cols, result[0])) if result else None
+        if fetch == "all":
+            cols = [c["name"] for c in con.columns]
+            return [dict(zip(cols, row)) for row in result]
+    finally:
+        con.close()
 
 async def _db(sql, params=(), fetch="none"):
+    # pg8000 uses :p1 :p2 style — convert %s to :p1, :p2...
+    idx = 0
+    new_sql = ""
+    for ch in sql:
+        if ch == "%":
+            new_sql += f":p{idx+1}"
+            idx += 1
+        elif ch == "s" and new_sql.endswith(f":p{idx}"):
+            pass  # already replaced
+        else:
+            new_sql += ch
+    # Actually easier: just replace %s sequentially
+    count = sql.count("%s")
+    new_sql = sql
+    for i in range(count):
+        new_sql = new_sql.replace("%s", f":p{i+1}", 1)
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: _run(sql, params, fetch))
+    return await loop.run_in_executor(None, lambda: _run(new_sql, params, fetch))
 
 async def init_db():
     await _db("""
