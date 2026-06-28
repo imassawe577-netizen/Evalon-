@@ -1344,14 +1344,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
-async def main():
+def main():
+    import asyncio
+    asyncio.run(_main())
+
+async def _main():
     await init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
     app.add_handler(CommandHandler(["start","menu"], cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     logger.info("🤖 EVALON Bot started!")
-    await app.run_polling(drop_pending_updates=True)
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        logger.info("✅ Polling started")
+        await asyncio.Event().wait()  # run forever
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
