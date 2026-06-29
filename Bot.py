@@ -18,6 +18,7 @@ import random
 import websockets
 import pg8000.native
 import urllib.parse as _urlparse
+from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1787,10 +1788,28 @@ async def cmd_clearvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(update.effective_user.id, "✅ Tutorial video removed.")
 
 # ══════════════════════════════════════════════════════════════
+# HEALTH CHECK (Render requires HTTP server)
+# ══════════════════════════════════════════════════════════════
+async def _health(request):
+    return web.Response(text="EVALON OK")
+
+async def _start_web():
+    wa = web.Application()
+    wa.router.add_get("/", _health)
+    runner = web.AppRunner(wa)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check running on port {port}")
+
+# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 async def _main():
     await init_db()
+    await _start_web()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "menu"], cmd_start))
     app.add_handler(CommandHandler("setvideo",   cmd_setvideo))
