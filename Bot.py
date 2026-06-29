@@ -278,7 +278,7 @@ class DerivClient:
 
     async def connect(self):
         self.ws = await asyncio.wait_for(
-            websockets.connect(DERIV_WS_URL), timeout=15
+            websockets.connect(DERIV_WS_URL), timeout=10
         )
 
     async def disconnect(self):
@@ -293,19 +293,26 @@ class DerivClient:
         await self.ws.send(json.dumps(payload))
 
     async def _recv(self):
-        return json.loads(await asyncio.wait_for(self.ws.recv(), timeout=15))
+        return json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10))
 
     async def authorize(self):
-        await self.connect()
-        await self._send({"authorize": self.token})
-        resp = await self._recv()
-        if "error" in resp:
+        try:
+            await asyncio.wait_for(self.connect(), timeout=10)
+            await self._send({"authorize": self.token})
+            resp = await asyncio.wait_for(self._recv(), timeout=10)
+            if "error" in resp:
+                await self.disconnect()
+                return False, resp["error"]["message"]
+            self.authorized   = True
+            acc = resp.get("authorize", {})
+            self.account_type = "demo" if acc.get("is_virtual") else "real"
+            return True, acc
+        except asyncio.TimeoutError:
             await self.disconnect()
-            return False, resp["error"]["message"]
-        self.authorized   = True
-        acc = resp.get("authorize", {})
-        self.account_type = "demo" if acc.get("is_virtual") else "real"
-        return True, acc
+            return False, "Connection timed out. Try again."
+        except Exception as e:
+            await self.disconnect()
+            return False, f"Connection error: {str(e)}"
 
     async def validate_pair(self, pair):
         try:
@@ -1022,6 +1029,14 @@ Set your stake. Define your risk. Let it run.
 # ══════════════════════════════════════════════════════════════
 # /start
 # ══════════════════════════════════════════════════════════════
+async def _reply(query, text, **kw):
+    """Delete old message and send fresh one — keeps chat clean."""
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await query.message.answer(text, **kw) if hasattr(query.message, 'answer') else None
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await create_user(u.id, u.username or "", u.full_name or "")
@@ -1053,6 +1068,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     d   = q.data
 
+    # Delete previous bot message before sending new one
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
     # MENU
     if d == "menu":
         await cmd_start(update, context)
@@ -1064,7 +1085,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ct = s["contract_type"]
         tp_label = f"{s['tp_value']}%" if s['tp_type'] == 'percent' else f"${s['tp_value']}"
         sl_label = f"{s['sl_value']}%" if s['sl_type'] == 'percent' else f"${s['sl_value']}"
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"⚙️ *Settings*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Contract  : `{ct.replace('_',' ').title()}`\n"
@@ -1086,7 +1107,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "trade_start":
         session = await get_active_session(uid)
         if session and session["is_running"]:
-            await q.edit_message_text(
+            await context.bot.send_message(chat_id=uid, text=
                 "⚠️ Bot is already running. Press Stop first.",
                 reply_markup=kb_main()
             )
@@ -1096,7 +1117,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         engine = TradingEngine(uid, send_fn)
         task   = asyncio.create_task(engine.start())
         active_tasks[uid] = (engine, task)
-        await q.edit_message_text("🚀 Starting...", reply_markup=kb_main())
+        await context.bot.send_message(chat_id=uid, text="🚀 Starting...", reply_markup=kb_main())
         return
 
     # TRADE STOP
@@ -1109,7 +1130,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session = await get_active_session(uid)
             if session:
                 await upsert_active_session(uid, is_running=False)
-        await q.edit_message_text("🛑 *Bot stopped.*", parse_mode="Markdown", reply_markup=kb_main())
+        await context.bot.send_message(chat_id=uid, text="🛑 *Bot stopped.*", parse_mode="Markdown", reply_markup=kb_main())
         return
 
     # CONNECT DERIV
@@ -1132,24 +1153,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         parse_mode="Markdown", reply_markup=kb_back("menu"))
             await q.message.delete()
         else:
-            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_back("menu"))
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=kb_back("menu"))
         return
 
     # BALANCE
     if d == "balance":
         user = await get_user(uid)
         if not user or not user["deriv_token"]:
-            await q.edit_message_text("❌ Connect Deriv first.", reply_markup=kb_back("menu"))
+            await context.bot.send_message(chat_id=uid, text="❌ Connect Deriv first.", reply_markup=kb_back("menu"))
             return
         client = DerivClient(user["deriv_token"])
         ok, _  = await client.authorize()
         if not ok:
-            await q.edit_message_text("❌ Token error. Reconnect.", reply_markup=kb_back("menu"))
+            await context.bot.send_message(chat_id=uid, text="❌ Token error. Reconnect.", reply_markup=kb_back("menu"))
             await client.disconnect()
             return
         bal = await client.get_balance()
         await client.disconnect()
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"💰 *Balance*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Amount  : `{bal.get('balance','N/A')} {bal.get('currency','USD')}`\n"
@@ -1162,7 +1183,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "history":
         trades = await get_trade_history(uid)
         if not trades:
-            await q.edit_message_text("📊 No trades yet.", reply_markup=kb_back("menu"))
+            await context.bot.send_message(chat_id=uid, text="📊 No trades yet.", reply_markup=kb_back("menu"))
             return
         wins  = sum(1 for t in trades if t["result"] == "win")
         total = sum(float(t["profit"]) for t in trades)
@@ -1175,7 +1196,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for t in trades[:5]:
             e = "✅" if t["result"] == "win" else "❌"
             text += f"{e} `{t['contract_type']}` | `{t['pair']}` | `${float(t['profit']):.2f}`\n"
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_back("menu"))
+        await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=kb_back("menu"))
         return
 
     # TOKENS
@@ -1192,7 +1213,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = "🎮 *Demo License* — Unlimited demo trading."
         else:
             msg = "💰 *Real License* — Full access."
-        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb_back("menu"))
+        await context.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown", reply_markup=kb_back("menu"))
         return
 
     # SETTINGS — PAIR
@@ -1200,7 +1221,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = await get_settings(uid)
         if s["pair_mode"] == "multi":
             await set_user_state(uid, "awaiting_multi_pairs")
-            await q.edit_message_text(
+            await context.bot.send_message(chat_id=uid, text=
                 "🌐 *Multi Pair*\n"
                 "━━━━━━━━━━━━━━━\n"
                 "Enter pairs separated by commas:\n\n"
@@ -1209,7 +1230,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await set_user_state(uid, "awaiting_pair")
-            await q.edit_message_text(
+            await context.bot.send_message(chat_id=uid, text=
                 "💱 *Enter Pair*\n"
                 "━━━━━━━━━━━━━━━\n"
                 "Type the pair name:\n\n"
@@ -1220,13 +1241,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # SETTINGS — CONTRACT
     if d == "set_contract":
-        await q.edit_message_text("📊 *Select Contract Type:*", parse_mode="Markdown", reply_markup=kb_contract())
+        await context.bot.send_message(chat_id=uid, text="📊 *Select Contract Type:*", parse_mode="Markdown", reply_markup=kb_contract())
         return
 
     if d.startswith("ct_"):
         ct = d[3:]
         await update_settings(uid, contract_type=ct)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"✅ Contract: `{ct.replace('_',' ').title()}`",
             parse_mode="Markdown", reply_markup=kb_settings(ct)
         )
@@ -1235,20 +1256,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — TIMEFRAME
     if d == "set_timeframe":
         s = await get_settings(uid)
-        await q.edit_message_text("⏱ *Select Timeframe:*", parse_mode="Markdown",
+        await context.bot.send_message(chat_id=uid, text="⏱ *Select Timeframe:*", parse_mode="Markdown",
                                    reply_markup=kb_timeframe(s["contract_type"]))
         return
 
     if d.startswith("tf_"):
         tf = d[3:]
         await update_settings(uid, timeframe=tf)
-        await q.edit_message_text(f"✅ Timeframe: `{tf}`", parse_mode="Markdown", reply_markup=kb_back())
+        await context.bot.send_message(chat_id=uid, text=f"✅ Timeframe: `{tf}`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — STAKE
     if d == "set_stake":
         await set_user_state(uid, "awaiting_stake")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "💰 *Stake Amount*\n\nEnter amount in USD (e.g. `10`, `0.5`, `100`):",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1258,7 +1279,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "set_tp":
         s = await get_settings(uid)
         tp_label = f"{s['tp_value']}%" if s['tp_type'] == 'percent' else f"${s['tp_value']}"
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"🎯 *Take Profit*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Current: `{tp_label}`\n\n"
@@ -1270,7 +1291,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "tp_type_percent":
         await update_settings(uid, tp_type="percent")
         await set_user_state(uid, "awaiting_tp")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🎯 Enter Take Profit as *% of stake*\n(e.g. `110` = 110% of stake):",
             parse_mode="Markdown", reply_markup=kb_back("set_tp")
         )
@@ -1279,7 +1300,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "tp_type_fixed":
         await update_settings(uid, tp_type="fixed")
         await set_user_state(uid, "awaiting_tp")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🎯 Enter Take Profit as *fixed USD amount*\n(e.g. `50`):",
             parse_mode="Markdown", reply_markup=kb_back("set_tp")
         )
@@ -1289,7 +1310,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "set_sl":
         s = await get_settings(uid)
         sl_label = f"{s['sl_value']}%" if s['sl_type'] == 'percent' else f"${s['sl_value']}"
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"🛑 *Stop Loss*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Current: `{sl_label}`\n\n"
@@ -1301,7 +1322,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "sl_type_percent":
         await update_settings(uid, sl_type="percent")
         await set_user_state(uid, "awaiting_sl")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🛑 Enter Stop Loss as *% of stake*\n(e.g. `100` = 100% of stake):",
             parse_mode="Markdown", reply_markup=kb_back("set_sl")
         )
@@ -1310,7 +1331,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "sl_type_fixed":
         await update_settings(uid, sl_type="fixed")
         await set_user_state(uid, "awaiting_sl")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🛑 Enter Stop Loss as *fixed USD amount*\n(e.g. `30`):",
             parse_mode="Markdown", reply_markup=kb_back("set_sl")
         )
@@ -1319,7 +1340,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — MARTINGALE
     if d == "set_martingale":
         s = await get_settings(uid)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"📈 *Martingale*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Status     : `{'ON ✅' if s['martingale_enabled'] else 'OFF'}`\n"
@@ -1335,7 +1356,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = not s["martingale_enabled"]
         await update_settings(uid, martingale_enabled=val)
         s   = await get_settings(uid)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"📈 *Martingale* — `{'ON ✅' if val else 'OFF'}`",
             parse_mode="Markdown",
             reply_markup=kb_martingale(val, s["martingale_multiplier"], s["martingale_max_steps"])
@@ -1346,7 +1367,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mul = float(d[3:])
         await update_settings(uid, martingale_multiplier=mul)
         s   = await get_settings(uid)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"✅ Multiplier: `×{mul}`",
             parse_mode="Markdown",
             reply_markup=kb_martingale(s["martingale_enabled"], mul, s["martingale_max_steps"])
@@ -1357,7 +1378,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         steps = int(d[4:])
         await update_settings(uid, martingale_max_steps=steps)
         s = await get_settings(uid)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"✅ Max Steps: `{steps}`",
             parse_mode="Markdown",
             reply_markup=kb_martingale(s["martingale_enabled"], s["martingale_multiplier"], steps)
@@ -1367,7 +1388,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — COMPOUND
     if d == "set_compound":
         s = await get_settings(uid)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"🔄 *Compound*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Status: `{'ON ✅' if s['compound_enabled'] else 'OFF'}`\n\n"
@@ -1388,7 +1409,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s   = await get_settings(uid)
         val = not s["compound_enabled"]
         await update_settings(uid, compound_enabled=val)
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"✅ Compound: `{'ON ✅' if val else 'OFF'}`",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1396,7 +1417,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # SETTINGS — PAIR MODE
     if d == "set_pair_mode":
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🌍 *Pair Mode*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -1410,14 +1431,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d.startswith("pm_"):
         mode = d[3:]
         await update_settings(uid, pair_mode=mode)
-        await q.edit_message_text(f"✅ Pair Mode: `{mode.title()}`", parse_mode="Markdown", reply_markup=kb_back())
+        await context.bot.send_message(chat_id=uid, text=f"✅ Pair Mode: `{mode.title()}`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — AUTO RESTART
     if d == "set_auto_restart":
         s = await get_settings(uid)
         val = s["auto_restart"]
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"🔁 *Auto Restart after TP/SL*\nCurrent: `{'ON' if val else 'OFF'}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -1431,35 +1452,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s   = await get_settings(uid)
         val = not s["auto_restart"]
         await update_settings(uid, auto_restart=val)
-        await q.edit_message_text(f"✅ Auto Restart: `{'ON' if val else 'OFF'}`",
+        await context.bot.send_message(chat_id=uid, text=f"✅ Auto Restart: `{'ON' if val else 'OFF'}`",
                                    parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — MULTIPLIER VALUE
     if d == "set_multiplier_value":
-        await q.edit_message_text("✖️ *Multiplier Value:*", parse_mode="Markdown", reply_markup=kb_multiplier_val())
+        await context.bot.send_message(chat_id=uid, text="✖️ *Multiplier Value:*", parse_mode="Markdown", reply_markup=kb_multiplier_val())
         return
 
     if d.startswith("mv_"):
         val = int(d[3:])
         await update_settings(uid, multiplier_value=val)
-        await q.edit_message_text(f"✅ Multiplier: `×{val}`", parse_mode="Markdown", reply_markup=kb_back())
+        await context.bot.send_message(chat_id=uid, text=f"✅ Multiplier: `×{val}`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — ACCUMULATOR GROWTH
     if d == "set_accumulator_growth":
-        await q.edit_message_text("📊 *Growth Rate:*", parse_mode="Markdown", reply_markup=kb_acc_growth())
+        await context.bot.send_message(chat_id=uid, text="📊 *Growth Rate:*", parse_mode="Markdown", reply_markup=kb_acc_growth())
         return
 
     if d.startswith("ag_"):
         val = float(d[3:])
         await update_settings(uid, accumulator_growth=val)
-        await q.edit_message_text(f"✅ Growth Rate: `{val}%`", parse_mode="Markdown", reply_markup=kb_back())
+        await context.bot.send_message(chat_id=uid, text=f"✅ Growth Rate: `{val}%`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — DIGIT BARRIER
     if d == "set_digit_barrier":
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🔢 *Digit Barrier*\n\nSelect digit (Over/Under this digit):",
             parse_mode="Markdown", reply_markup=kb_digit_barrier()
         )
@@ -1468,13 +1489,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d.startswith("db_"):
         val = d[3:]
         await update_settings(uid, digit_barrier=val)
-        await q.edit_message_text(f"✅ Digit Barrier: `{val}`", parse_mode="Markdown", reply_markup=kb_back())
+        await context.bot.send_message(chat_id=uid, text=f"✅ Digit Barrier: `{val}`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     # SETTINGS — DIGIT TARGET (Match/Diff)
     if d == "set_digit_target":
         await set_user_state(uid, "awaiting_digit_target")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🎯 *Target Digit*\n\nEnter digit 0–9:",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1483,7 +1504,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — TURBO
     if d == "set_turbo":
         await set_user_state(uid, "awaiting_turbo")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🌀 *Turbo Settings*\n\nEnter: `duration barrier_pct`\nExample: `1 0.1` (1min, 0.1% barrier)",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1492,7 +1513,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — TOUCH
     if d == "set_touch":
         await set_user_state(uid, "awaiting_touch")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "👆 *Touch Settings*\n\nEnter: `duration barrier_pct`\nExample: `5 0.2`",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1501,7 +1522,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # SETTINGS — VANILLA
     if d == "set_vanilla":
         await set_user_state(uid, "awaiting_vanilla")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🏛 *Vanilla Settings*\n\nEnter: `duration barrier_pct`\nExample: `5 0.0`",
             parse_mode="Markdown", reply_markup=kb_back()
         )
@@ -1511,7 +1532,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "admin_panel":
         if uid != ADMIN_ID: return
         users = await get_all_users()
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             f"🔐 *Admin Panel*\n━━━━━━━━━━━━━━━\n👥 Total Users: `{len(users)}`",
             parse_mode="Markdown", reply_markup=kb_admin()
         )
@@ -1523,13 +1544,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text  = "👥 *Users:*\n━━━━━━━━━━━━━━━\n"
         for u in users[:20]:
             text += f"• `{u['user_id']}` {u['full_name']} — `{u['license_status']}` — 🎟{u['trial_tokens']}\n"
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_back("admin_panel"))
+        await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=kb_back("admin_panel"))
         return
 
     if d == "admin_license":
         if uid != ADMIN_ID: return
         await set_user_state(uid, "admin_license")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🔑 Send: `USER_ID LICENSE`\nLicenses: `trial` `demo` `real`\nExample: `123456789 real`",
             parse_mode="Markdown", reply_markup=kb_back("admin_panel")
         )
@@ -1538,7 +1559,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "admin_tokens":
         if uid != ADMIN_ID: return
         await set_user_state(uid, "admin_tokens")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "🎟 Send: `USER_ID AMOUNT`\nExample: `123456789 50`",
             parse_mode="Markdown", reply_markup=kb_back("admin_panel")
         )
@@ -1547,7 +1568,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "admin_broadcast":
         if uid != ADMIN_ID: return
         await set_user_state(uid, "admin_broadcast")
-        await q.edit_message_text(
+        await context.bot.send_message(chat_id=uid, text=
             "📢 Type your broadcast message:",
             reply_markup=kb_back("admin_panel")
         )
